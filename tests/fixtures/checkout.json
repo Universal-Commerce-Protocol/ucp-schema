@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.com/schemas/checkout.json",
+  "type": "object",
+  "required": ["id", "line_items", "status"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Unique identifier",
+      "ucp_request": {
+        "create": "omit",
+        "update": "required",
+        "read": "required"
+      }
+    },
+    "line_items": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/line_item"
+      },
+      "ucp_request": {
+        "create": "required",
+        "update": "optional",
+        "read": "omit"
+      }
+    },
+    "buyer": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "format": "email",
+          "ucp_request": {
+            "create": "optional",
+            "update": "optional"
+          }
+        },
+        "name": {
+          "type": "string",
+          "ucp_request": "optional"
+        }
+      },
+      "ucp_request": {
+        "create": "optional",
+        "update": "optional",
+        "read": "omit"
+      }
+    },
+    "status": {
+      "type": "string",
+      "enum": ["pending", "completed", "cancelled"],
+      "ucp_request": "omit"
+    },
+    "totals": {
+      "type": "object",
+      "properties": {
+        "subtotal": { "type": "number" },
+        "tax": { "type": "number" },
+        "total": { "type": "number" }
+      },
+      "ucp_request": "omit"
+    }
+  },
+  "$defs": {
+    "line_item": {
+      "type": "object",
+      "required": ["sku", "quantity"],
+      "properties": {
+        "sku": {
+          "type": "string",
+          "ucp_request": "required"
+        },
+        "quantity": {
+          "type": "integer",
+          "minimum": 1,
+          "ucp_request": "required"
+        },
+        "price": {
+          "type": "number",
+          "ucp_request": "omit"
+        }
+      }
+    }
+  }
+}

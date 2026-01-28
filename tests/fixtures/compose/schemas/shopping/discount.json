@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/shopping/discount.json",
+  "name": "dev.ucp.shopping.discount",
+  "version": "2026-01-11",
+  "title": "Discount Extension",
+  "description": "Extends Checkout with discount code support.",
+  "$defs": {
+    "dev.ucp.shopping.checkout": {
+      "title": "Checkout with Discount",
+      "description": "Checkout extended with discount capability.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "ucp_response": "required" },
+        "status": { "type": "string", "ucp_response": "required" },
+        "line_items": { "type": "array" },
+        "ucp": { "type": "object", "additionalProperties": true },
+        "discounts": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "codes": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "applied": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "code": { "type": "string" },
+                  "title": { "type": "string" },
+                  "amount": { "type": "integer", "minimum": 0 }
+                },
+                "required": ["title", "amount"]
+              }
+            }
+          },
+          "ucp_request": {
+            "create": "optional",
+            "update": "optional"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,39 @@
+[package]
+name = "ucp-schema"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Runtime resolution of UCP schema annotations"
+keywords = ["ucp", "json-schema", "validation"]
+categories = ["development-tools", "web-programming"]
+rust-version = "1.70"
+readme = "README.md"
+repository = "https://github.com/Universal-Commerce-Protocol/ucp-schema"
+
+[lib]
+name = "ucp_schema"
+
+[[bin]]
+name = "ucp-schema"
+path = "src/bin/ucp-schema.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive"] }
+jsonschema = "0.26"
+
+[dependencies.reqwest]
+version = "0.12"
+features = ["blocking", "json"]
+optional = true
+
+[features]
+default = ["remote"]
+remote = ["reqwest"]
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = "3"

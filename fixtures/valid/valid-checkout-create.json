@@ -1,0 +1,18 @@
+{
+  "line_items": [
+    {
+      "item": {
+        "id": "prod_123",
+        "title": "Test Product",
+        "price": {
+          "amount": 1999,
+          "currency": "USD"
+        }
+      },
+      "quantity": 2
+    }
+  ],
+  "buyer": {
+    "email": "test@example.com"
+  }
+}

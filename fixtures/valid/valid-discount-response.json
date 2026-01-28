@@ -1,0 +1,42 @@
+{
+  "ucp": {
+    "version": "2026-01-11",
+    "capabilities": {
+      "dev.ucp.shopping.checkout": [{"version": "2026-01-11"}],
+      "dev.ucp.shopping.discount": [{"version": "2026-01-11", "extends": "dev.ucp.shopping.checkout"}]
+    },
+    "payment_handlers": {
+      "com.stripe": [{"id": "stripe_gpay", "version": "2026-01-11"}]
+    }
+  },
+  "id": "checkout_abc123",
+  "status": "incomplete",
+  "currency": "USD",
+  "line_items": [
+    {
+      "id": "li_1",
+      "item": {"id": "prod_123", "title": "Test Product", "price": 1999},
+      "quantity": 2,
+      "totals": [{"type": "subtotal", "amount": 3998}]
+    }
+  ],
+  "totals": [
+    {"type": "subtotal", "amount": 3998},
+    {"type": "discount", "amount": 500},
+    {"type": "total", "amount": 3498}
+  ],
+  "links": [
+    {"type": "privacy_policy", "url": "https://example.com/privacy"},
+    {"type": "terms_of_service", "url": "https://example.com/terms"}
+  ],
+  "discounts": {
+    "codes": ["SAVE20"],
+    "applied": [
+      {
+        "code": "SAVE20",
+        "title": "20% Off Summer Sale",
+        "amount": 500
+      }
+    ]
+  }
+}

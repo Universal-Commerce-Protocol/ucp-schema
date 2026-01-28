@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+  "name": "dev.ucp.shopping.checkout",
+  "version": "2026-01-11",
+  "title": "Checkout",
+  "description": "Minimal checkout schema for testing composition.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Checkout ID",
+      "ucp_request": {
+        "create": "omit",
+        "update": "required"
+      },
+      "ucp_response": "required"
+    },
+    "status": {
+      "type": "string",
+      "enum": ["incomplete", "complete"],
+      "ucp_request": "omit",
+      "ucp_response": "required"
+    },
+    "line_items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "sku": { "type": "string" },
+          "quantity": { "type": "integer", "minimum": 1 }
+        },
+        "required": ["sku", "quantity"]
+      },
+      "ucp_request": {
+        "create": "required",
+        "update": "optional"
+      }
+    },
+    "ucp": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "UCP metadata block"
+    }
+  }
+}

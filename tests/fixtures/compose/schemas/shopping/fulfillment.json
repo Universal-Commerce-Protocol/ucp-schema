@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/shopping/fulfillment.json",
+  "name": "dev.ucp.shopping.fulfillment",
+  "version": "2026-01-11",
+  "title": "Fulfillment Extension",
+  "description": "Extends Checkout with fulfillment support.",
+  "$defs": {
+    "dev.ucp.shopping.checkout": {
+      "title": "Checkout with Fulfillment",
+      "description": "Checkout extended with fulfillment capability.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "ucp_response": "required" },
+        "status": { "type": "string", "ucp_response": "required" },
+        "line_items": { "type": "array" },
+        "ucp": { "type": "object", "additionalProperties": true },
+        "fulfillment": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": ["shipping", "pickup", "digital"]
+            },
+            "address": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "street": { "type": "string" },
+                "city": { "type": "string" },
+                "postal_code": { "type": "string" }
+              }
+            }
+          },
+          "ucp_request": {
+            "create": "optional",
+            "update": "optional"
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "line_items": [
+    {
+      "item": {
+        "id": "prod_123"
+      },
+      "quantity": 2
+    }
+  ],
+  "discounts": {
+    "codes": ["SAVE20"]
+  }
+}
