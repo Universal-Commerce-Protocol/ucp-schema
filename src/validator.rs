@@ -170,7 +170,10 @@ mod tests {
         let options = ResolveOptions::new(Direction::Request, "create").strict(true);
 
         let result = validate(&schema, &payload, &options);
-        assert!(result.is_ok(), "should accept properties from all allOf branches");
+        assert!(
+            result.is_ok(),
+            "should accept properties from all allOf branches"
+        );
     }
 
     #[test]
@@ -227,6 +230,9 @@ mod tests {
         let options = ResolveOptions::new(Direction::Request, "create").strict(false);
 
         let result = validate(&schema, &payload, &options);
-        assert!(result.is_ok(), "should allow unknown properties in non-strict mode");
+        assert!(
+            result.is_ok(),
+            "should allow unknown properties in non-strict mode"
+        );
     }
 }

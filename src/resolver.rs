@@ -45,9 +45,8 @@ fn close_additional_properties(value: &mut Value) {
 fn close_additional_properties_inner(value: &mut Value, in_composition_branch: bool) {
     if let Value::Object(map) = value {
         // Check if this schema uses composition keywords
-        let has_composition = map.contains_key("allOf")
-            || map.contains_key("anyOf")
-            || map.contains_key("oneOf");
+        let has_composition =
+            map.contains_key("allOf") || map.contains_key("anyOf") || map.contains_key("oneOf");
 
         // Check if this is an object schema (has "type": "object" or has "properties")
         let is_object_schema = map

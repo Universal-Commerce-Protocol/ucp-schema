@@ -316,7 +316,12 @@ fn resolve_ref_to_path(
 /// * `base_url` - Base URL for resolving relative refs (typically the schema's $id)
 #[cfg(feature = "remote")]
 pub fn bundle_refs_remote(schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
-    bundle_refs_remote_inner(schema, base_url, None, &mut std::collections::HashSet::new())
+    bundle_refs_remote_inner(
+        schema,
+        base_url,
+        None,
+        &mut std::collections::HashSet::new(),
+    )
 }
 
 #[cfg(feature = "remote")]

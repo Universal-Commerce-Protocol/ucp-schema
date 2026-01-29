@@ -44,8 +44,8 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::error::ComposeError;
-use crate::types::Direction;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
+use crate::types::Direction;
 
 #[cfg(feature = "remote")]
 use crate::loader::{bundle_refs_remote, load_schema_url};
@@ -113,11 +113,7 @@ pub fn detect_direction(payload: &Value) -> Option<DetectedDirection> {
     }
 
     // JSONRPC request pattern: meta.profile at root (NOT ucp.meta.profile)
-    if payload
-        .get("meta")
-        .and_then(|m| m.get("profile"))
-        .is_some()
-    {
+    if payload.get("meta").and_then(|m| m.get("profile")).is_some() {
         return Some(DetectedDirection::Request);
     }
 
@@ -198,12 +194,14 @@ pub fn extract_jsonrpc_payload<'a>(
     let short_name = capability_short_name(&root.name);
 
     // Extract payload from envelope using short name as key
-    let payload = envelope.get(&short_name).ok_or_else(|| ComposeError::InvalidEnvelope {
-        message: format!(
-            "JSONRPC envelope missing '{}' key (derived from capability '{}')",
-            short_name, root.name
-        ),
-    })?;
+    let payload = envelope
+        .get(&short_name)
+        .ok_or_else(|| ComposeError::InvalidEnvelope {
+            message: format!(
+                "JSONRPC envelope missing '{}' key (derived from capability '{}')",
+                short_name, root.name
+            ),
+        })?;
 
     Ok((payload, short_name))
 }

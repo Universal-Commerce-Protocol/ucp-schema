@@ -10,7 +10,7 @@ use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities_from_profile, extract_jsonrpc_payload, is_url, lint,
     load_schema, load_schema_auto, resolve, validate, ComposeError, DetectedDirection, Direction,
-    FileStatus, ResolveOptions, ResolveError, SchemaBaseConfig, ValidateError,
+    FileStatus, ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
