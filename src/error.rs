@@ -6,11 +6,14 @@ use thiserror::Error;
 /// Errors during schema composition from UCP capability metadata.
 #[derive(Debug, Error)]
 pub enum ComposeError {
-    #[error("payload is not self-describing: missing ucp.capabilities and ucp.meta.profile")]
+    #[error("payload is not self-describing: missing ucp.capabilities (response) or meta.profile (request)")]
     NotSelfDescribing,
 
     #[error("no capabilities declared in ucp.capabilities")]
     EmptyCapabilities,
+
+    #[error("invalid JSONRPC envelope: {message}")]
+    InvalidEnvelope { message: String },
 
     #[error("no root capability found (all capabilities have 'extends')")]
     NoRootCapability,

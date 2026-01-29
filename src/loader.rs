@@ -305,6 +305,118 @@ fn resolve_ref_to_path(
     base_dir.join(ref_val)
 }
 
+/// Bundle external $ref pointers by fetching from remote URLs.
+///
+/// Like `bundle_refs`, but fetches external refs via HTTP instead of local files.
+/// This allows remote-only validation by inlining all refs before passing to
+/// the JSON Schema validator.
+///
+/// # Arguments
+/// * `schema` - The schema to process (modified in place)
+/// * `base_url` - Base URL for resolving relative refs (typically the schema's $id)
+#[cfg(feature = "remote")]
+pub fn bundle_refs_remote(schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
+    bundle_refs_remote_inner(schema, base_url, None, &mut std::collections::HashSet::new())
+}
+
+#[cfg(feature = "remote")]
+fn bundle_refs_remote_inner(
+    schema: &mut Value,
+    base_url: &str,
+    file_root: Option<&Value>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<(), ResolveError> {
+    match schema {
+        Value::Object(obj) => {
+            if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
+                if ref_val.starts_with('#') {
+                    // Internal ref
+                    if ref_val == "#" {
+                        // Self-reference, leave as-is
+                    } else if let Some(root) = file_root {
+                        let mut target = navigate_fragment(root, ref_val)?;
+                        bundle_refs_remote_inner(&mut target, base_url, file_root, visited)?;
+                        obj.remove("$ref");
+                        if let Value::Object(ref_obj) = target {
+                            for (k, v) in ref_obj {
+                                obj.entry(k).or_insert(v);
+                            }
+                        }
+                        return Ok(());
+                    }
+                    // No file_root = root schema, leave for validator
+                } else {
+                    // External ref - resolve URL
+                    let (file_part, fragment) = match ref_val.find('#') {
+                        Some(idx) => (&ref_val[..idx], Some(&ref_val[idx..])),
+                        None => (ref_val, None),
+                    };
+
+                    // Resolve to absolute URL
+                    let resolved_url = resolve_url(file_part, base_url);
+                    let visit_key = format!("{}|{}", resolved_url, fragment.unwrap_or(""));
+
+                    if visited.contains(&visit_key) {
+                        return Err(ResolveError::BundleError {
+                            message: format!("circular reference detected: {}", ref_val),
+                        });
+                    }
+
+                    // Fetch the referenced schema
+                    let loaded = load_schema_url(&resolved_url)?;
+                    let mut target = if let Some(frag) = fragment {
+                        navigate_fragment(&loaded, frag)?
+                    } else {
+                        loaded.clone()
+                    };
+
+                    visited.insert(visit_key.clone());
+                    // Recursively bundle with new base URL
+                    bundle_refs_remote_inner(&mut target, &resolved_url, Some(&loaded), visited)?;
+                    visited.remove(&visit_key);
+
+                    obj.remove("$ref");
+                    if let Value::Object(ref_obj) = target {
+                        for (k, v) in ref_obj {
+                            obj.entry(k).or_insert(v);
+                        }
+                    }
+                    return Ok(());
+                }
+            }
+
+            // Recurse into all values
+            for value in obj.values_mut() {
+                bundle_refs_remote_inner(value, base_url, file_root, visited)?;
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                bundle_refs_remote_inner(item, base_url, file_root, visited)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Resolve a potentially relative URL against a base URL.
+#[cfg(feature = "remote")]
+fn resolve_url(url: &str, base: &str) -> String {
+    if is_url(url) {
+        // Already absolute
+        url.to_string()
+    } else {
+        // Relative - resolve against base
+        // Find the directory part of base URL
+        if let Some(idx) = base.rfind('/') {
+            format!("{}/{}", &base[..idx], url)
+        } else {
+            url.to_string()
+        }
+    }
+}
+
 /// Load a schema from a file path or URL.
 ///
 /// Automatically detects whether the source is a URL or file path.

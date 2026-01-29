@@ -25,13 +25,30 @@ pub fn resolve(schema: &Value, options: &ResolveOptions) -> Result<Value, Resolv
     Ok(resolved)
 }
 
-/// Recursively set `additionalProperties: false` on all object schemas.
+/// Recursively close object schemas to reject unknown properties.
 ///
-/// Only sets the value if `additionalProperties` is missing or explicitly `true`.
-/// If a schema has `additionalProperties` set to a custom schema (object),
-/// it's left untouched since the author explicitly defined what's allowed.
+/// For simple object schemas: sets `additionalProperties: false`
+/// For schemas with composition (allOf/anyOf/oneOf): sets `unevaluatedProperties: false`
+///
+/// The distinction matters because `additionalProperties` is evaluated per-schema,
+/// while `unevaluatedProperties` (JSON Schema 2020-12) looks across all subschemas.
+/// This allows $ref inheritance patterns to work correctly in strict mode.
 fn close_additional_properties(value: &mut Value) {
+    close_additional_properties_inner(value, false);
+}
+
+/// Inner implementation with context tracking.
+///
+/// `in_composition_branch` is true when processing direct children of allOf/anyOf/oneOf.
+/// We skip setting additionalProperties on these because each branch is validated
+/// independently and doesn't see properties from sibling branches.
+fn close_additional_properties_inner(value: &mut Value, in_composition_branch: bool) {
     if let Value::Object(map) = value {
+        // Check if this schema uses composition keywords
+        let has_composition = map.contains_key("allOf")
+            || map.contains_key("anyOf")
+            || map.contains_key("oneOf");
+
         // Check if this is an object schema (has "type": "object" or has "properties")
         let is_object_schema = map
             .get("type")
@@ -40,18 +57,31 @@ fn close_additional_properties(value: &mut Value) {
             .unwrap_or(false)
             || map.contains_key("properties");
 
-        if is_object_schema {
-            // Only inject false if additionalProperties is missing or true
-            // Leave custom schemas (objects) alone - author knows what they want
-            match map.get("additionalProperties") {
-                None => {
-                    map.insert("additionalProperties".to_string(), Value::Bool(false));
+        // Close the schema if we're not inside a composition branch
+        if !in_composition_branch && (is_object_schema || has_composition) {
+            if has_composition {
+                // Use unevaluatedProperties for composition - it looks across all subschemas
+                // so $ref inheritance works correctly
+                match map.get("unevaluatedProperties") {
+                    None => {
+                        map.insert("unevaluatedProperties".to_string(), Value::Bool(false));
+                    }
+                    Some(Value::Bool(true)) => {
+                        map.insert("unevaluatedProperties".to_string(), Value::Bool(false));
+                    }
+                    _ => {}
                 }
-                Some(Value::Bool(true)) => {
-                    map.insert("additionalProperties".to_string(), Value::Bool(false));
+            } else {
+                // Simple object schema - use additionalProperties
+                match map.get("additionalProperties") {
+                    None => {
+                        map.insert("additionalProperties".to_string(), Value::Bool(false));
+                    }
+                    Some(Value::Bool(true)) => {
+                        map.insert("additionalProperties".to_string(), Value::Bool(false));
+                    }
+                    _ => {}
                 }
-                // false or custom schema - leave as-is
-                _ => {}
             }
         }
 
@@ -62,27 +92,28 @@ fn close_additional_properties(value: &mut Value) {
                     // Recurse into each property definition
                     if let Value::Object(props) = child {
                         for prop_value in props.values_mut() {
-                            close_additional_properties(prop_value);
+                            close_additional_properties_inner(prop_value, false);
                         }
                     }
                 }
-                "items" | "additionalProperties" => {
+                "items" | "additionalProperties" | "unevaluatedProperties" => {
                     // Schema values - recurse
-                    close_additional_properties(child);
+                    close_additional_properties_inner(child, false);
                 }
                 "$defs" | "definitions" => {
                     // Definitions - recurse into each
                     if let Value::Object(defs) = child {
                         for def_value in defs.values_mut() {
-                            close_additional_properties(def_value);
+                            close_additional_properties_inner(def_value, false);
                         }
                     }
                 }
                 "allOf" | "anyOf" | "oneOf" => {
-                    // Composition - recurse into each branch
+                    // Composition branches - recurse but mark as in_composition
+                    // so we don't set additionalProperties on them directly
                     if let Value::Array(arr) = child {
                         for item in arr {
-                            close_additional_properties(item);
+                            close_additional_properties_inner(item, true);
                         }
                     }
                 }

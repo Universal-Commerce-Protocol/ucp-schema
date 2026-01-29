@@ -1049,8 +1049,10 @@ mod strict_mode {
     }
 
     #[test]
-    fn applies_to_allof_branches() {
-        // allOf branches should be closed in strict mode
+    fn uses_unevaluated_for_allof() {
+        // allOf schemas use unevaluatedProperties (not additionalProperties) because
+        // unevaluatedProperties looks across all subschemas, allowing $ref inheritance
+        // to work correctly while still rejecting unknown properties.
         let schema = json!({
             "allOf": [
                 {
@@ -1070,8 +1072,11 @@ mod strict_mode {
         let options = ResolveOptions::new(Direction::Request, "create").strict(true);
         let result = resolve(&schema, &options).unwrap();
 
-        assert_eq!(result["allOf"][0]["additionalProperties"], json!(false));
-        assert_eq!(result["allOf"][1]["additionalProperties"], json!(false));
+        // Top level should have unevaluatedProperties: false (for composition)
+        assert_eq!(result["unevaluatedProperties"], json!(false));
+        // Branches should NOT have additionalProperties injected
+        assert!(result["allOf"][0].get("additionalProperties").is_none());
+        assert!(result["allOf"][1].get("additionalProperties").is_none());
     }
 
     #[test]

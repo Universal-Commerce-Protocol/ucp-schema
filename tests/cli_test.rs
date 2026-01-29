@@ -424,7 +424,7 @@ mod validate_command {
             .assert()
             .code(3)
             .stdout(predicate::str::contains(r#""valid":false"#))
-            .stdout(predicate::str::contains(r#""error":"#));
+            .stdout(predicate::str::contains(r#""errors":"#));
     }
 }
 
@@ -1343,6 +1343,6 @@ mod compose {
             .assert()
             .code(2)
             .stdout(predicate::str::contains(r#""valid":false"#))
-            .stdout(predicate::str::contains(r#""error":"#));
+            .stdout(predicate::str::contains(r#""errors":"#));
     }
 }

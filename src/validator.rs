@@ -144,4 +144,89 @@ mod tests {
             _ => panic!("expected validation error with 2 errors"),
         }
     }
+
+    #[test]
+    fn validate_allof_strict_accepts_properties_from_all_branches() {
+        // allOf with strict mode should accept properties defined in ANY branch
+        // This tests that unevaluatedProperties correctly sees all branch properties
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        // Payload uses properties from BOTH branches
+        let payload = json!({ "id": "123", "name": "test" });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+
+        let result = validate(&schema, &payload, &options);
+        assert!(result.is_ok(), "should accept properties from all allOf branches");
+    }
+
+    #[test]
+    fn validate_allof_strict_rejects_unknown_properties() {
+        // allOf with strict mode should reject properties not in ANY branch
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        // Payload has unknown property
+        let payload = json!({ "id": "123", "name": "test", "unknown": "bad" });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+
+        let result = validate(&schema, &payload, &options);
+        assert!(
+            matches!(result, Err(ValidateError::Invalid { .. })),
+            "should reject unknown properties in strict mode"
+        );
+    }
+
+    #[test]
+    fn validate_allof_non_strict_allows_unknown_properties() {
+        // allOf without strict mode should allow unknown properties (extensibility)
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        // Payload has unknown property
+        let payload = json!({ "id": "123", "name": "test", "unknown": "allowed" });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(false);
+
+        let result = validate(&schema, &payload, &options);
+        assert!(result.is_ok(), "should allow unknown properties in non-strict mode");
+    }
 }

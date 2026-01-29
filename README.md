@@ -89,14 +89,18 @@ ucp-schema resolve checkout.json --request --op create --output resolved.json
 UCP payloads are self-describing: they embed capability metadata that declares which schemas apply. The validator can use this metadata directly, or you can specify an explicit schema.
 
 ```bash
-# Self-describing mode (extracts schema from payload's ucp.capabilities)
+# Self-describing mode (response: ucp.capabilities, JSONRPC request: meta.profile)
 ucp-schema validate <payload> --op <operation> [options]
+
+# REST request mode (profile via flag, payload is raw object)
+ucp-schema validate <payload> --profile <profile> --op <operation> [options]
 
 # Explicit schema mode (overrides self-describing)
 ucp-schema validate <payload> --schema <schema> --request|--response --op <operation> [options]
 
 Options:
   --schema <path>              Explicit schema (overrides self-describing mode)
+  --profile <path>             Agent profile URL/path (REST request pattern)
   --schema-local-base <dir>    Local directory to resolve schema URLs (see Validation Modes)
   --schema-remote-base <url>   URL prefix to strip when mapping to local (see URL Prefix Mapping)
   --request                    Direction is request (required with --schema, auto-detected otherwise)
@@ -113,26 +117,74 @@ Exit codes:
 
 ### Validation Modes
 
-The validator supports three modes based on which flags you provide:
+The validator supports multiple modes based on which flags you provide:
 
 | Mode | Command | Schema Source | Direction |
 |------|---------|---------------|-----------|
-| **Self-describing + remote** | `validate payload.json --op read` | `ucp.capabilities` URLs fetched | Auto-detected |
-| **Self-describing + local** | `validate payload.json --schema-local-base ./dir --op read` | `ucp.capabilities` URLs mapped to local files | Auto-detected |
-| **Explicit schema** | `validate payload.json --schema schema.json --request --op create` | Specified schema file/URL | Must specify `--request` or `--response` |
+| **Response (self-describing)** | `validate response.json --op read` | `ucp.capabilities` URLs | Auto-detected |
+| **JSONRPC request** | `validate envelope.json --op create` | `meta.profile` URL | Auto-detected |
+| **REST request** | `validate payload.json --profile profile.json --op create` | Explicit `--profile` URL | Request |
+| **Explicit schema** | `validate payload.json --schema schema.json --request --op create` | Specified schema | Must specify |
 
-**Mode 1: Self-describing + remote fetch**
+**Response Pattern (self-describing)**
 
-UCP payloads embed capability metadata declaring which schemas apply. The validator extracts schema URLs and fetches them:
+Response payloads embed capability metadata declaring which schemas apply:
+
+```json
+{
+  "ucp": {
+    "capabilities": {
+      "dev.ucp.shopping.checkout": [{"version": "2026-01-26", "schema": "https://..."}]
+    }
+  },
+  "id": "checkout-123",
+  "line_items": [...]
+}
+```
 
 ```bash
-# Payload has ucp.capabilities with schema URLs like https://ucp.dev/schemas/...
-# Validator fetches schemas from those URLs and composes them
 ucp-schema validate response.json --op read
 ```
 
-Requires: payload has `ucp.capabilities` (responses) or `ucp.meta.profile` (requests).
-Direction is auto-detected from payload structure.
+**JSONRPC Request Pattern**
+
+JSONRPC requests have `meta.profile` at root, with payload nested under the capability short name:
+
+```json
+{
+  "meta": {
+    "profile": "https://agent.example.com/.well-known/ucp"
+  },
+  "checkout": {
+    "line_items": [...]
+  }
+}
+```
+
+```bash
+ucp-schema validate envelope.json --op create
+```
+
+The validator:
+1. Fetches the profile from `meta.profile`
+2. Extracts capabilities from the profile
+3. Extracts payload from the capability key (e.g., `checkout`)
+4. Composes and validates
+
+**REST Request Pattern (--profile flag)**
+
+REST requests pass the profile via HTTP header (simulated with `--profile`), with payload being the raw object:
+
+```bash
+# Payload is just the checkout object (no envelope)
+ucp-schema validate raw-checkout.json --profile agent-profile.json --op create
+```
+
+The `--profile` flag:
+- Takes a profile URL or file path
+- Extracts capabilities from the profile
+- Treats the payload as the raw checkout object (no envelope extraction)
+- Implies `--request` direction
 
 **Mode 2: Self-describing + local resolution**
 
@@ -187,11 +239,11 @@ Requires: explicit `--request` or `--response` flag (direction cannot be auto-de
 
 **Error: No schema source**
 
-If payload has no `ucp.capabilities`/`ucp.meta.profile` AND no `--schema` is specified:
+If payload has no `ucp.capabilities`/`meta.profile` AND no `--schema`/`--profile` is specified:
 
 ```bash
 ucp-schema validate payload.json --op read
-# Error: payload is not self-describing: missing ucp.capabilities and ucp.meta.profile
+# Error: cannot infer direction: payload has no ucp.capabilities (response) or meta.profile (request)
 ```
 
 **JSON output for automation:**

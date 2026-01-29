@@ -17,18 +17,26 @@
 //! }
 //! ```
 //!
-//! # Request Pattern
+//! # Request Pattern (JSONRPC)
 //!
-//! Requests reference a profile URL:
+//! JSONRPC requests have `meta.profile` at root, with payload nested under
+//! the capability short name (last segment of the dotted capability name):
 //! ```json
 //! {
-//!   "ucp": {
-//!     "meta": {
-//!       "profile": "https://agent.example.com/.well-known/ucp"
-//!     }
+//!   "meta": {
+//!     "profile": "https://agent.example.com/.well-known/ucp"
+//!   },
+//!   "checkout": {
+//!     "line_items": [...]
 //!   }
 //! }
 //! ```
+//!
+//! # Request Pattern (REST)
+//!
+//! REST requests pass the profile URL via HTTP header (`UCP-Agent`), with
+//! the payload being the raw checkout object. Use `--profile` CLI flag to
+//! simulate this pattern.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -36,10 +44,11 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::error::ComposeError;
+use crate::types::Direction;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
 
 #[cfg(feature = "remote")]
-use crate::loader::load_schema_url;
+use crate::loader::{bundle_refs_remote, load_schema_url};
 
 /// Configuration for mapping schema URLs to local paths.
 ///
@@ -77,23 +86,38 @@ pub struct Capability {
 pub enum DetectedDirection {
     /// Payload has `ucp.capabilities` inline (response pattern).
     Response,
-    /// Payload has `ucp.meta.profile` URL (request pattern).
+    /// Payload has `meta.profile` at root (JSONRPC request pattern).
     Request,
+}
+
+impl From<DetectedDirection> for Direction {
+    fn from(d: DetectedDirection) -> Self {
+        match d {
+            DetectedDirection::Response => Direction::Response,
+            DetectedDirection::Request => Direction::Request,
+        }
+    }
 }
 
 /// Detect direction from payload structure.
 ///
 /// Returns `Some(Response)` if `ucp.capabilities` exists,
-/// `Some(Request)` if `ucp.meta.profile` exists,
+/// `Some(Request)` if `meta.profile` exists at root (JSONRPC pattern),
 /// `None` if neither is present.
 pub fn detect_direction(payload: &Value) -> Option<DetectedDirection> {
-    let ucp = payload.get("ucp")?;
-
-    if ucp.get("capabilities").is_some() {
-        return Some(DetectedDirection::Response);
+    // Response pattern: ucp.capabilities
+    if let Some(ucp) = payload.get("ucp") {
+        if ucp.get("capabilities").is_some() {
+            return Some(DetectedDirection::Response);
+        }
     }
 
-    if ucp.get("meta").and_then(|m| m.get("profile")).is_some() {
+    // JSONRPC request pattern: meta.profile at root (NOT ucp.meta.profile)
+    if payload
+        .get("meta")
+        .and_then(|m| m.get("profile"))
+        .is_some()
+    {
         return Some(DetectedDirection::Request);
     }
 
@@ -103,7 +127,7 @@ pub fn detect_direction(payload: &Value) -> Option<DetectedDirection> {
 /// Extract capabilities from a self-describing payload.
 ///
 /// - Response: extracts from `ucp.capabilities` directly
-/// - Request: fetches `ucp.meta.profile` URL, extracts from profile
+/// - JSONRPC Request: fetches `meta.profile` URL, extracts from profile
 ///
 /// # Arguments
 /// * `payload` - The UCP payload to extract capabilities from
@@ -112,31 +136,84 @@ pub fn extract_capabilities(
     payload: &Value,
     schema_base: &SchemaBaseConfig,
 ) -> Result<Vec<Capability>, ComposeError> {
-    let ucp = payload.get("ucp").ok_or(ComposeError::NotSelfDescribing)?;
-
     // Try response pattern first: ucp.capabilities
-    if let Some(caps) = ucp.get("capabilities") {
-        return parse_capabilities_object(caps);
+    if let Some(ucp) = payload.get("ucp") {
+        if let Some(caps) = ucp.get("capabilities") {
+            return parse_capabilities_object(caps);
+        }
     }
 
-    // Try request pattern: ucp.meta.profile
-    if let Some(profile_url) = ucp
+    // Try JSONRPC request pattern: meta.profile at root
+    if let Some(profile_url) = payload
         .get("meta")
         .and_then(|m| m.get("profile"))
         .and_then(|p| p.as_str())
     {
-        let profile = fetch_profile(profile_url, schema_base)?;
-        let caps = profile
-            .get("ucp")
-            .and_then(|u| u.get("capabilities"))
-            .ok_or_else(|| ComposeError::ProfileFetch {
-                url: profile_url.to_string(),
-                message: "profile missing ucp.capabilities".to_string(),
-            })?;
-        return parse_capabilities_object(caps);
+        return extract_capabilities_from_profile(profile_url, schema_base);
     }
 
     Err(ComposeError::NotSelfDescribing)
+}
+
+/// Extract capabilities from a profile URL.
+///
+/// Used for both JSONRPC requests (meta.profile) and REST requests (--profile flag).
+pub fn extract_capabilities_from_profile(
+    profile_url: &str,
+    schema_base: &SchemaBaseConfig,
+) -> Result<Vec<Capability>, ComposeError> {
+    let profile = fetch_profile(profile_url, schema_base)?;
+    let caps = profile
+        .get("ucp")
+        .and_then(|u| u.get("capabilities"))
+        .ok_or_else(|| ComposeError::ProfileFetch {
+            url: profile_url.to_string(),
+            message: "profile missing ucp.capabilities".to_string(),
+        })?;
+    parse_capabilities_object(caps)
+}
+
+/// Extract the actual payload from a JSONRPC request envelope.
+///
+/// JSONRPC requests have the structure: `{meta: {...}, <capability_key>: <payload>}`
+/// The capability key is the short name (last segment) of the root capability.
+///
+/// # Arguments
+/// * `envelope` - The full JSONRPC request envelope
+/// * `capabilities` - Capabilities extracted from the profile
+///
+/// # Returns
+/// The payload value and the capability key name used
+pub fn extract_jsonrpc_payload<'a>(
+    envelope: &'a Value,
+    capabilities: &[Capability],
+) -> Result<(&'a Value, String), ComposeError> {
+    // Find root capability (no extends)
+    let root = capabilities
+        .iter()
+        .find(|c| c.extends.is_none())
+        .ok_or(ComposeError::NoRootCapability)?;
+
+    // Derive short name from capability name (last segment of dotted name)
+    let short_name = capability_short_name(&root.name);
+
+    // Extract payload from envelope using short name as key
+    let payload = envelope.get(&short_name).ok_or_else(|| ComposeError::InvalidEnvelope {
+        message: format!(
+            "JSONRPC envelope missing '{}' key (derived from capability '{}')",
+            short_name, root.name
+        ),
+    })?;
+
+    Ok((payload, short_name))
+}
+
+/// Derive short name from a capability name.
+///
+/// Takes the last segment of a dotted capability name.
+/// E.g., "dev.ucp.shopping.checkout" -> "checkout"
+pub fn capability_short_name(name: &str) -> String {
+    name.rsplit('.').next().unwrap_or(name).to_string()
 }
 
 /// Parse a capabilities object into a list of Capability structs.
@@ -489,13 +566,21 @@ fn resolve_schema_url(url: &str, schema_base: &SchemaBaseConfig) -> Result<Value
 
         Ok(schema)
     } else if is_url(url) {
-        // HTTP fetch - bundling not supported for remote-only schemas
+        // HTTP fetch with remote bundling
         #[cfg(feature = "remote")]
         {
-            load_schema_url(url).map_err(|e| ComposeError::SchemaFetch {
+            let mut schema = load_schema_url(url).map_err(|e| ComposeError::SchemaFetch {
                 url: url.to_string(),
                 message: e.to_string(),
-            })
+            })?;
+
+            // Bundle refs using the URL as base for resolving relative refs
+            bundle_refs_remote(&mut schema, url).map_err(|e| ComposeError::SchemaFetch {
+                url: url.to_string(),
+                message: format!("bundling refs: {}", e),
+            })?;
+
+            Ok(schema)
         }
         #[cfg(not(feature = "remote"))]
         {
@@ -573,6 +658,21 @@ mod tests {
 
     #[test]
     fn detect_direction_request() {
+        // JSONRPC request: meta.profile at root (NOT ucp.meta.profile)
+        let payload = json!({
+            "meta": {
+                "profile": "https://example.com/.well-known/ucp"
+            },
+            "checkout": {
+                "line_items": []
+            }
+        });
+        assert_eq!(detect_direction(&payload), Some(DetectedDirection::Request));
+    }
+
+    #[test]
+    fn detect_direction_old_request_format_not_detected() {
+        // Old invalid format should NOT be detected as request
         let payload = json!({
             "ucp": {
                 "meta": {
@@ -580,7 +680,7 @@ mod tests {
                 }
             }
         });
-        assert_eq!(detect_direction(&payload), Some(DetectedDirection::Request));
+        assert_eq!(detect_direction(&payload), None);
     }
 
     #[test]
@@ -902,5 +1002,55 @@ mod tests {
             &cap_map,
             "dev.ucp.shopping.checkout"
         ));
+    }
+
+    #[test]
+    fn capability_short_name_extracts_last_segment() {
+        assert_eq!(
+            capability_short_name("dev.ucp.shopping.checkout"),
+            "checkout"
+        );
+        assert_eq!(
+            capability_short_name("dev.ucp.shopping.discount"),
+            "discount"
+        );
+        assert_eq!(capability_short_name("checkout"), "checkout");
+    }
+
+    #[test]
+    fn extract_jsonrpc_payload_finds_checkout_key() {
+        let envelope = json!({
+            "meta": {"profile": "https://example.com/profile"},
+            "checkout": {"line_items": [{"item": {"id": "sku"}, "quantity": 2}]}
+        });
+
+        let capabilities = vec![Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-01-26".to_string(),
+            schema_url: "https://example.com/checkout.json".to_string(),
+            extends: None,
+        }];
+
+        let (payload, key) = extract_jsonrpc_payload(&envelope, &capabilities).unwrap();
+        assert_eq!(key, "checkout");
+        assert_eq!(payload["line_items"][0]["quantity"], 2);
+    }
+
+    #[test]
+    fn extract_jsonrpc_payload_missing_key_errors() {
+        let envelope = json!({
+            "meta": {"profile": "https://example.com/profile"},
+            "wrong_key": {"line_items": []}
+        });
+
+        let capabilities = vec![Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-01-26".to_string(),
+            schema_url: "https://example.com/checkout.json".to_string(),
+            extends: None,
+        }];
+
+        let result = extract_jsonrpc_payload(&envelope, &capabilities);
+        assert!(matches!(result, Err(ComposeError::InvalidEnvelope { .. })));
     }
 }

@@ -7,10 +7,68 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 use ucp_schema::{
-    bundle_refs, compose_from_payload, detect_direction, lint, load_schema, load_schema_auto,
-    resolve, validate, DetectedDirection, Direction, FileStatus, ResolveOptions, SchemaBaseConfig,
-    ValidateError,
+    bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
+    detect_direction, extract_capabilities_from_profile, extract_jsonrpc_payload, is_url, lint,
+    load_schema, load_schema_auto, resolve, validate, ComposeError, DetectedDirection, Direction,
+    FileStatus, ResolveOptions, ResolveError, SchemaBaseConfig, ValidateError,
 };
+
+/// Errors with associated CLI exit codes.
+trait CliExitCode {
+    fn exit_code(&self) -> u8;
+}
+
+impl CliExitCode for ResolveError {
+    fn exit_code(&self) -> u8 {
+        ResolveError::exit_code(self) as u8
+    }
+}
+
+impl CliExitCode for ComposeError {
+    fn exit_code(&self) -> u8 {
+        ComposeError::exit_code(self) as u8
+    }
+}
+
+/// Map an error to a CLI exit code, reporting it in the configured format.
+fn cli_err<E: std::fmt::Display + CliExitCode>(json_output: bool) -> impl FnOnce(E) -> u8 {
+    move |e| {
+        report_error(json_output, &e.to_string());
+        e.exit_code()
+    }
+}
+
+/// Like cli_err but with a message prefix for additional context.
+fn cli_err_ctx<'a, E: std::fmt::Display + CliExitCode>(
+    json_output: bool,
+    context: &'a str,
+) -> impl FnOnce(E) -> u8 + 'a {
+    move |e| {
+        report_error(json_output, &format!("{}: {}", context, e));
+        e.exit_code()
+    }
+}
+
+/// Determine direction from CLI flags and optional inference.
+///
+/// Priority: explicit --request/--response flags override inference.
+/// When neither flag is set, uses inferred direction or defaults to Request.
+fn determine_direction(
+    request_flag: bool,
+    response_flag: bool,
+    inferred: Option<Direction>,
+) -> Direction {
+    if request_flag {
+        Direction::Request
+    } else if response_flag {
+        Direction::Response
+    } else {
+        inferred.unwrap_or(Direction::Request)
+    }
+}
+
+#[cfg(feature = "remote")]
+use ucp_schema::bundle_refs_remote;
 
 #[derive(Parser)]
 #[command(name = "ucp-schema")]
@@ -78,6 +136,10 @@ enum Commands {
         #[arg(long, requires = "schema_local_base")]
         schema_remote_base: Option<String>,
 
+        /// Agent profile URL (REST pattern: profile via header, payload is raw object)
+        #[arg(long, conflicts_with = "schema")]
+        profile: Option<String>,
+
         /// Validate as request (auto-inferred if omitted)
         #[arg(long, conflicts_with = "response")]
         request: bool,
@@ -138,6 +200,7 @@ fn main() -> ExitCode {
             schema,
             schema_local_base,
             schema_remote_base,
+            profile,
             request,
             response,
             op,
@@ -148,6 +211,7 @@ fn main() -> ExitCode {
             schema,
             schema_local_base,
             schema_remote_base,
+            profile,
             request,
             response,
             op,
@@ -178,12 +242,10 @@ fn run_resolve(
     bundle: bool,
     strict: bool,
 ) -> Result<(), u8> {
+    // run_resolve has no --json flag, so errors always go to stderr (json_output=false)
     let direction = Direction::from_request_flag(request);
 
-    let mut schema = load_schema_auto(schema_source).map_err(|e| {
-        eprintln!("Error: {}", e);
-        e.exit_code() as u8
-    })?;
+    let mut schema = load_schema_auto(schema_source).map_err(cli_err(false))?;
 
     // Bundle: dereference all $refs before resolving annotations
     if bundle {
@@ -192,17 +254,11 @@ fn run_resolve(
         let base_dir = std::path::Path::new(schema_source)
             .parent()
             .unwrap_or(std::path::Path::new("."));
-        bundle_refs(&mut schema, base_dir).map_err(|e| {
-            eprintln!("Error bundling refs: {}", e);
-            e.exit_code() as u8
-        })?;
+        bundle_refs(&mut schema, base_dir).map_err(cli_err_ctx(false, "bundling refs"))?;
     }
 
     let options = ResolveOptions::new(direction, op).strict(strict);
-    let resolved = resolve(&schema, &options).map_err(|e| {
-        eprintln!("Error: {}", e);
-        e.exit_code() as u8
-    })?;
+    let resolved = resolve(&schema, &options).map_err(cli_err(false))?;
 
     let json_output = if pretty {
         serde_json::to_string_pretty(&resolved)
@@ -234,6 +290,7 @@ struct ValidateArgs {
     schema: Option<String>,
     schema_local_base: Option<PathBuf>,
     schema_remote_base: Option<String>,
+    profile: Option<String>,
     request: bool,
     response: bool,
     op: String,
@@ -247,55 +304,117 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
         schema: schema_source,
         schema_local_base,
         schema_remote_base,
+        profile: profile_url,
         request,
         response,
         op,
         json_output,
         strict,
     } = args;
-    // Load payload first - needed for both explicit and self-describing modes
-    let payload = load_schema(&payload_path).map_err(|e| {
-        report_error(json_output, &format!("loading payload: {}", e));
-        e.exit_code() as u8
-    })?;
 
-    // Determine direction: explicit flag > auto-inference from payload
-    let direction = if request {
-        Direction::Request
-    } else if response {
-        Direction::Response
-    } else {
-        // Auto-infer from payload structure
-        match detect_direction(&payload) {
-            Some(DetectedDirection::Response) => Direction::Response,
-            Some(DetectedDirection::Request) => Direction::Request,
-            None => {
-                // No UCP metadata found - require explicit flag
-                report_error(json_output, "cannot infer direction: payload has no ucp.capabilities or ucp.meta.profile. Use --request or --response.");
-                return Err(2);
-            }
-        }
+    let config = SchemaBaseConfig {
+        local_base: schema_local_base.as_deref(),
+        remote_base: schema_remote_base.as_deref(),
     };
 
-    // Get schema: explicit --schema or compose from payload metadata
-    let schema = match &schema_source {
-        Some(source) => {
-            // Explicit schema - load directly
-            load_schema_auto(source).map_err(|e| {
-                report_error(json_output, &format!("loading schema: {}", e));
-                e.exit_code() as u8
-            })?
+    // Load payload file
+    let payload_file =
+        load_schema(&payload_path).map_err(cli_err_ctx(json_output, "loading payload"))?;
+
+    // Determine validation mode and extract actual payload to validate:
+    // 1. --profile: REST pattern, payload is raw object
+    // 2. --schema: explicit schema, payload is raw object
+    // 3. JSONRPC: meta.profile in payload, extract nested payload
+    // 4. Response: ucp.capabilities in payload, payload is self-describing
+    let (schema, payload, direction) = if let Some(ref profile) = profile_url {
+        // REST pattern: --profile flag provides profile URL, payload is raw
+        let direction = determine_direction(request, response, None);
+
+        let capabilities =
+            extract_capabilities_from_profile(profile, &config).map_err(cli_err(json_output))?;
+
+        let schema = compose_schema(&capabilities, &config).map_err(cli_err(json_output))?;
+
+        (schema, payload_file, direction)
+    } else if let Some(ref source) = schema_source {
+        // Explicit schema: try to infer direction from payload
+        let inferred = detect_direction(&payload_file).map(Direction::from);
+        let direction = determine_direction(request, response, inferred);
+
+        let mut schema =
+            load_schema_auto(source).map_err(cli_err_ctx(json_output, "loading schema"))?;
+
+        // Bundle refs based on source type and available mappings
+        #[cfg(feature = "remote")]
+        {
+            if is_url(source) {
+                bundle_refs_remote(&mut schema, source)
+                    .map_err(cli_err_ctx(json_output, "bundling refs"))?;
+            } else {
+                bundle_local_refs(
+                    &mut schema,
+                    source,
+                    &schema_local_base,
+                    &schema_remote_base,
+                    json_output,
+                )?;
+            }
         }
-        None => {
-            // Self-describing mode - compose from payload's UCP metadata
-            let config = SchemaBaseConfig {
-                local_base: schema_local_base.as_deref(),
-                remote_base: schema_remote_base.as_deref(),
-            };
-            compose_from_payload(&payload, &config).map_err(|e| {
-                report_error(json_output, &e.to_string());
-                e.exit_code() as u8
-            })?
+        #[cfg(not(feature = "remote"))]
+        {
+            bundle_local_refs(
+                &mut schema,
+                source,
+                &schema_local_base,
+                &schema_remote_base,
+                json_output,
+            )?;
+        }
+
+        (schema, payload_file, direction)
+    } else {
+        // Self-describing mode - detect from payload structure
+        match detect_direction(&payload_file) {
+            Some(DetectedDirection::Response) => {
+                // Response: ucp.capabilities, compose and validate full payload
+                let direction = determine_direction(request, response, Some(Direction::Response));
+                let schema =
+                    compose_from_payload(&payload_file, &config).map_err(cli_err(json_output))?;
+                (schema, payload_file, direction)
+            }
+            Some(DetectedDirection::Request) => {
+                // JSONRPC request: meta.profile, extract nested payload
+                let direction = determine_direction(request, response, Some(Direction::Request));
+
+                // Get profile URL from meta.profile
+                let profile = payload_file
+                    .get("meta")
+                    .and_then(|m| m.get("profile"))
+                    .and_then(|p| p.as_str())
+                    .ok_or_else(|| {
+                        report_error(json_output, "JSONRPC request missing meta.profile");
+                        2u8
+                    })?;
+
+                let capabilities = extract_capabilities_from_profile(profile, &config)
+                    .map_err(cli_err(json_output))?;
+
+                // Extract actual payload from envelope (e.g., "checkout" key)
+                let (nested_payload, _key) = extract_jsonrpc_payload(&payload_file, &capabilities)
+                    .map_err(cli_err(json_output))?;
+
+                let schema =
+                    compose_schema(&capabilities, &config).map_err(cli_err(json_output))?;
+
+                (schema, nested_payload.clone(), direction)
+            }
+            None => {
+                report_error(
+                    json_output,
+                    "cannot infer direction: payload has no ucp.capabilities (response) or meta.profile (request). Use --schema, --profile, --request, or --response.",
+                );
+                return Err(2);
+            }
         }
     };
 
@@ -332,10 +451,37 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
     }
 }
 
+/// Bundle refs for a local schema file.
+fn bundle_local_refs(
+    schema: &mut serde_json::Value,
+    source: &str,
+    schema_local_base: &Option<PathBuf>,
+    schema_remote_base: &Option<String>,
+    json_output: bool,
+) -> Result<(), u8> {
+    let schema_dir = Path::new(source).parent().unwrap_or(Path::new("."));
+
+    if let (Some(local_base), Some(remote_base)) = (schema_local_base, schema_remote_base) {
+        bundle_refs_with_url_mapping(schema, schema_dir, local_base, remote_base)
+            .map_err(cli_err_ctx(json_output, "bundling refs"))?;
+    } else {
+        bundle_refs(schema, schema_dir).map_err(cli_err_ctx(json_output, "bundling refs"))?;
+    }
+
+    Ok(())
+}
+
 /// Output an error message in plain text or JSON format.
+///
+/// Uses same shape as validation errors for consistent API:
+/// `{"valid": false, "errors": [{"path": "", "message": "..."}]}`
 fn report_error(json_output: bool, msg: &str) {
     if json_output {
-        println!(r#"{{"valid":false,"error":"{}"}}"#, msg);
+        let output = serde_json::json!({
+            "valid": false,
+            "errors": [{"path": "", "message": msg}]
+        });
+        println!("{}", output);
     } else {
         eprintln!("Error: {}", msg);
     }
