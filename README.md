@@ -496,6 +496,13 @@ During the transition period the resolved schema **always makes the field option
 - **`x-ucp-schema-transition`**: `{ "from", "to", "description" }` on the property for tooling and docs.
 - **`deprecated`: true** on the property only when the field is being **removed** (`to` is `"omit"`).
 
+**What to do for each transition**
+
+- **`required` → `optional`**: Field was required, becoming optional. Senders must still ALWAYS send (receivers require it). Receivers should start handling absence to prepare for the transition.
+- **`required` → `omit`**: Field was required, being removed. Senders must still ALWAYS send (receivers require it). Receivers should start handling absence to prepare for removal.
+- **`optional` → `omit`**: Field was optional, being removed. Senders should continue sending as they do today. Receivers should start ignoring the value.
+- **`optional` → `required`**: Field was optional, becoming required. Senders must start always sending (new receivers will require it). Receivers should continue handling absence during transition.
+
 **Example: Removing a required field**
 
 ```json
