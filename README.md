@@ -479,14 +479,67 @@ ucp-schema resolve schema.json --request --op create --strict=true
 
 ## Visibility Rules
 
-Annotations control how fields appear in the resolved schema:
+Annotations control how fields appear in the resolved schema. Simple values are strings; a schema transition uses an object so you can explain the change.
 
-| Value           | Effect on Properties | Effect on Required Array |
-| --------------- | -------------------- | ------------------------ |
-| `"omit"`        | Field removed        | Field removed            |
-| `"required"`    | Field kept           | Field added              |
-| `"optional"`    | Field kept           | Field removed            |
-| (no annotation) | Field kept           | Unchanged                |
+| Value / Form | Effect on Properties | Effect on Required Array |
+| -------------| -------------------- | ------------------------ |
+| `"omit"` | Field removed | Field removed |
+| `"required"` | Field kept | Field added |
+| `"optional"` | Field kept | Field removed |
+| `{ "from", "to", "description" }` (schema transition) | Field kept | Field removed (always optional in transition) |
+| (no annotation) | Field kept | Unchanged |
+
+### Schema transitions
+
+Use a **schema-transition object** to signal a field contract will change, with a human-readable reason:
+
+```json
+{
+  "from": "required",
+  "to": "omit",
+  "description": "Legacy id will be removed in v2; use resource_id instead."
+}
+```
+
+- **`from`** and **`to`** must be one of: `"omit"`, `"optional"`, `"required"`, and must be **distinct** (same value for both is invalid).
+- **`description`** is required and should explain the change and what to do instead.
+
+During the transition period the resolved schema **always makes the field optional**, so consumers can slowly transition to the correct state. The resolver emits the schema-transition context into the output schema:
+
+- **`x-ucp-schema-transition`**: `{ "from", "to", "description" }` on the property for tooling and docs.
+- **`deprecated`: true** on the property only when the field is being **removed** (`to` is `"omit"`).
+
+**What to do for each transition**
+
+- **`required` → `optional`**: Field was required, becoming optional. Senders must still ALWAYS send (receivers require it). Receivers should start handling absence to prepare for the transition.
+- **`required` → `omit`**: Field was required, being removed. Senders must still ALWAYS send (receivers require it). Receivers should start handling absence to prepare for removal.
+- **`optional` → `omit`**: Field was optional, being removed. Senders should continue sending as they do today. Receivers should start ignoring the value.
+- **`optional` → `required`**: Field was optional, becoming required. Senders must start always sending (new receivers will require it). Receivers should continue handling absence during transition.
+
+**Example: Removing a required field**
+
+```json
+// Phase 1: Field is required
+{ "ucp_request": { "update": "required" } }
+
+// Phase 2: Schema transition (field is optional in resolved schema; receivers should prepare)
+{ "ucp_request": { "update": { "from": "required", "to": "omit", "description": "Will be removed in v2." } } }
+
+// Phase 3: Remove
+{ "ucp_request": { "update": "omit" } }
+```
+
+**Example: Loosening required to optional**
+
+```json
+{ "ucp_request": { "update": { "from": "required", "to": "optional", "description": "Will become optional in v2." } } }
+```
+
+**Shorthand schema transition** (same transition for all operations):
+
+```json
+{ "ucp_request": { "from": "required", "to": "omit", "description": "Removed in v2." } }
+```
 
 ### Annotation Formats
 

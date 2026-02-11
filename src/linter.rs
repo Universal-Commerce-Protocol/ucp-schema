@@ -11,7 +11,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::loader::{load_schema, navigate_fragment};
-use crate::types::{json_type_name, Visibility, UCP_ANNOTATIONS, VALID_OPERATIONS};
+use crate::types::{
+    is_valid_schema_transition, json_type_name, Visibility, UCP_ANNOTATIONS, VALID_OPERATIONS,
+};
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -302,6 +304,85 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
     }
 }
 
+/// Check a schema-transition object { from, to, description }.
+fn check_schema_transition_object(
+    map: &serde_json::Map<String, Value>,
+    file: &Path,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let from = map.get("from").and_then(|v| v.as_str());
+    let to = map.get("to").and_then(|v| v.as_str());
+    let description = map.get("description");
+
+    if from.is_none() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/from", path),
+            message: "schema-transition object missing \"from\" (omit, optional, or required)".to_string(),
+        });
+    } else if Visibility::parse(from.unwrap()).is_none() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/from", path),
+            message: format!(
+                "schema-transition \"from\" must be omit, optional, or required, got \"{}\"",
+                from.unwrap()
+            ),
+        });
+    }
+
+    if to.is_none() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/to", path),
+            message: "schema-transition object missing \"to\" (omit, optional, or required)".to_string(),
+        });
+    } else if Visibility::parse(to.unwrap()).is_none() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/to", path),
+            message: format!(
+                "schema-transition \"to\" must be omit, optional, or required, got \"{}\"",
+                to.unwrap()
+            ),
+        });
+    }
+
+    if description.is_none() || !description.unwrap().is_string() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/description", path),
+            message: "schema-transition object missing or invalid \"description\" (string)".to_string(),
+        });
+    }
+
+    if let (Some(f), Some(t)) = (from, to) {
+        if !is_valid_schema_transition(f, t) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E004".to_string(),
+                file: file.to_path_buf(),
+                path: path.to_string(),
+                message: format!(
+                    "from and to must be distinct visibility values (omit, optional, required), got from=\"{}\" to=\"{}\"",
+                    f, t
+                ),
+            });
+        }
+    }
+}
+
 /// Check a single ucp_* annotation value is valid.
 fn check_annotation_value(
     annotation: &Value,
@@ -319,7 +400,7 @@ fn check_annotation_value(
                     severity: Severity::Error,
                     code: "E004".to_string(),
                     file: file.to_path_buf(),
-                    path: annotation_path,
+                    path: annotation_path.clone(),
                     message: format!(
                         "invalid {} value \"{}\": expected omit, required, or optional",
                         key, s
@@ -328,51 +409,59 @@ fn check_annotation_value(
             }
         }
         Value::Object(map) => {
-            // Object form: { "create": "omit", "update": "required" }
-            for (op, val) in map {
-                let op_path = format!("{}/{}", annotation_path, op);
+            let is_shorthand_schema_transition = map.contains_key("from")
+                && map.contains_key("to")
+                && map.contains_key("description")
+                && !map.keys().any(|k| VALID_OPERATIONS.contains(&k.as_str()));
 
-                // Warn on unknown operations
-                if !VALID_OPERATIONS.contains(&op.as_str()) {
-                    diagnostics.push(Diagnostic {
-                        severity: Severity::Warning,
-                        code: "W003".to_string(),
-                        file: file.to_path_buf(),
-                        path: op_path.clone(),
-                        message: format!(
-                            "unknown operation \"{}\": expected {}",
-                            op,
-                            VALID_OPERATIONS.join(", ")
-                        ),
-                    });
-                }
+            if is_shorthand_schema_transition {
+                check_schema_transition_object(map, file, &annotation_path, diagnostics);
+            } else {
+                for (op, val) in map {
+                    let op_path = format!("{}/{}", annotation_path, op);
 
-                // Check value is valid
-                if let Value::String(s) = val {
-                    if Visibility::parse(s).is_none() {
+                    if !VALID_OPERATIONS.contains(&op.as_str()) {
                         diagnostics.push(Diagnostic {
-                            severity: Severity::Error,
-                            code: "E004".to_string(),
+                            severity: Severity::Warning,
+                            code: "W003".to_string(),
                             file: file.to_path_buf(),
-                            path: op_path,
+                            path: op_path.clone(),
                             message: format!(
-                                "invalid {} value \"{}\": expected omit, required, or optional",
-                                key, s
+                                "unknown operation \"{}\": expected {}",
+                                op,
+                                VALID_OPERATIONS.join(", ")
                             ),
                         });
                     }
-                } else {
-                    diagnostics.push(Diagnostic {
-                        severity: Severity::Error,
-                        code: "E005".to_string(),
-                        file: file.to_path_buf(),
-                        path: op_path,
-                        message: format!(
-                            "invalid {} value type: expected string, got {}",
-                            key,
-                            json_type_name(val)
-                        ),
-                    });
+
+                    if let Value::String(s) = val {
+                        if Visibility::parse(s).is_none() {
+                            diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E004".to_string(),
+                                file: file.to_path_buf(),
+                                path: op_path,
+                                message: format!(
+                                    "invalid {} value \"{}\": expected omit, required, or optional",
+                                    key, s
+                                ),
+                            });
+                        }
+                    } else if let Value::Object(obj) = val {
+                        check_schema_transition_object(obj, file, &op_path, diagnostics);
+                    } else {
+                        diagnostics.push(Diagnostic {
+                            severity: Severity::Error,
+                            code: "E005".to_string(),
+                            file: file.to_path_buf(),
+                            path: op_path,
+                            message: format!(
+                                "invalid {} value type: expected string or schema-transition object {{ from, to, description }}, got {}",
+                                key,
+                                json_type_name(val)
+                            ),
+                        });
+                    }
                 }
             }
         }
@@ -544,6 +633,60 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Ok);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_valid_schema_transition_object() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "properties": {{
+                "legacy_id": {{
+                    "type": "string",
+                    "ucp_request": {{
+                        "update": {{
+                            "from": "required",
+                            "to": "omit",
+                            "description": "Will be removed in v2."
+                        }}
+                    }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_invalid_schema_transition() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "properties": {{
+                "x": {{
+                    "type": "string",
+                    "ucp_request": {{
+                        "from": "required",
+                        "to": "required",
+                        "description": "from and to must be distinct"
+                    }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E004"));
     }
 
     #[test]
