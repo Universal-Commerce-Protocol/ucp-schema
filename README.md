@@ -110,6 +110,7 @@ Options:
 ```
 
 Exit codes:
+
 - `0` - Valid
 - `1` - Validation failed (payload doesn't match schema)
 - `2` - Schema error (invalid annotations, parse error, composition error)
@@ -119,12 +120,12 @@ Exit codes:
 
 The validator supports multiple modes based on which flags you provide:
 
-| Mode | Command | Schema Source | Direction |
-|------|---------|---------------|-----------|
-| **Response (self-describing)** | `validate response.json --op read` | `ucp.capabilities` URLs | Auto-detected |
-| **JSONRPC request** | `validate envelope.json --op create` | `meta.profile` URL | Auto-detected |
-| **REST request** | `validate payload.json --profile profile.json --op create` | Explicit `--profile` URL | Request |
-| **Explicit schema** | `validate payload.json --schema schema.json --request --op create` | Specified schema | Must specify |
+| Mode                           | Command                                                            | Schema Source            | Direction     |
+| ------------------------------ | ------------------------------------------------------------------ | ------------------------ | ------------- |
+| **Response (self-describing)** | `validate response.json --op read`                                 | `ucp.capabilities` URLs  | Auto-detected |
+| **JSONRPC request**            | `validate envelope.json --op create`                               | `meta.profile` URL       | Auto-detected |
+| **REST request**               | `validate payload.json --profile profile.json --op create`         | Explicit `--profile` URL | Request       |
+| **Explicit schema**            | `validate payload.json --schema schema.json --request --op create` | Specified schema         | Must specify  |
 
 **Response Pattern (self-describing)**
 
@@ -166,6 +167,7 @@ ucp-schema validate envelope.json --op create
 ```
 
 The validator:
+
 1. Fetches the profile from `meta.profile`
 2. Extracts capabilities from the profile
 3. Extracts payload from the capability key (e.g., `checkout`)
@@ -181,6 +183,7 @@ ucp-schema validate raw-checkout.json --profile agent-profile.json --op create
 ```
 
 The `--profile` flag:
+
 - Takes a profile URL or file path
 - Extracts capabilities from the profile
 - Treats the payload as the raw checkout object (no envelope extraction)
@@ -197,6 +200,7 @@ ucp-schema validate response.json --schema-local-base ./local --op read
 ```
 
 The `--schema-local-base` flag maps URL paths to local files:
+
 - URL: `https://ucp.dev/schemas/shopping/checkout.json`
 - Path extracted: `/schemas/shopping/checkout.json`
 - Local file: `{schema-local-base}/schemas/shopping/checkout.json`
@@ -215,6 +219,7 @@ ucp-schema validate response.json \
 ```
 
 Mapping with `--schema-remote-base`:
+
 - URL: `https://ucp.dev/draft/schemas/shopping/checkout.json`
 - Strip prefix: `https://ucp.dev/draft` → `/schemas/shopping/checkout.json`
 - Local file: `{schema-local-base}/schemas/shopping/checkout.json`
@@ -269,15 +274,15 @@ Options:
 
 **What it checks:**
 
-| Category | Issue | Severity |
-|----------|-------|----------|
-| Syntax | Invalid JSON | Error |
-| References | `$ref` to missing file | Error |
-| References | `$ref` to missing anchor (e.g., `#/$defs/foo`) | Error |
-| Annotations | Invalid `ucp_*` type (must be string or object) | Error |
-| Annotations | Invalid visibility value (must be omit/required/optional) | Error |
-| Hygiene | Missing `$id` field | Warning |
-| Hygiene | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning |
+| Category    | Issue                                                        | Severity |
+| ----------- | ------------------------------------------------------------ | -------- |
+| Syntax      | Invalid JSON                                                 | Error    |
+| References  | `$ref` to missing file                                       | Error    |
+| References  | `$ref` to missing anchor (e.g., `#/$defs/foo`)               | Error    |
+| Annotations | Invalid `ucp_*` type (must be string or object)              | Error    |
+| Annotations | Invalid visibility value (must be omit/required/optional)    | Error    |
+| Hygiene     | Missing `$id` field                                          | Warning  |
+| Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning  |
 
 **Examples:**
 
@@ -296,6 +301,7 @@ ucp-schema lint schemas/ --quiet
 ```
 
 **Exit codes:**
+
 - `0` - All files passed (or only warnings in non-strict mode)
 - `1` - Errors found (or warnings in strict mode)
 - `2` - Path not found
@@ -363,7 +369,9 @@ For the example above, the composed schema is:
 ```json
 {
   "allOf": [
-    { /* checkout's $defs["dev.ucp.shopping.checkout"] from discount.json */ }
+    {
+      /* checkout's $defs["dev.ucp.shopping.checkout"] from discount.json */
+    }
   ]
 }
 ```
@@ -383,7 +391,9 @@ Extension schemas must define their additions in `$defs` under the root capabili
         {
           "type": "object",
           "properties": {
-            "discounts": { /* discount-specific fields */ }
+            "discounts": {
+              /* discount-specific fields */
+            }
           }
         }
       ]
@@ -418,12 +428,14 @@ ucp-schema resolve checkout.json --request --op create --bundle --pretty
 ```
 
 **When to use bundling:**
+
 - Distributing schemas without file dependencies
 - Feeding schemas to tools that don't support external refs
 - Debugging to see the fully-expanded schema
 - Pre-processing for faster repeated validation
 
 **How it works:**
+
 - External file refs (`"$ref": "types/buyer.json"`) are loaded and inlined
 - Fragment refs (`"$ref": "types/common.json#/$defs/address"`) navigate to the specific definition
 - Internal refs within external files (`"$ref": "#/$defs/foo"`) resolve correctly against their source file
@@ -457,6 +469,7 @@ ucp-schema resolve schema.json --request --op create --strict=true
 ```
 
 **What strict mode does:**
+
 - Adds `additionalProperties: false` to all object schemas (root, nested, in arrays, in definitions)
 - Only injects `false` when `additionalProperties` is missing or explicitly `true`
 - Preserves custom `additionalProperties` schemas (e.g., `{"type": "string"}`)
@@ -478,16 +491,19 @@ Annotations control how fields appear in the resolved schema:
 ### Annotation Formats
 
 **Shorthand** - applies to all operations:
+
 ```json
 { "ucp_request": "omit" }
 ```
 
 **Per-operation** - different behavior per operation:
+
 ```json
 { "ucp_request": { "create": "omit", "update": "required", "read": "omit" } }
 ```
 
 **Separate request/response:**
+
 ```json
 {
   "ucp_request": { "create": "omit" },

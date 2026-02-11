@@ -2,12 +2,16 @@
   "ucp": {
     "version": "2026-01-11",
     "capabilities": {
-      "dev.ucp.shopping.checkout": [{"version": "2026-01-11"}],
-      "dev.ucp.shopping.discount": [{"version": "2026-01-11", "extends": "dev.ucp.shopping.checkout"}],
-      "dev.ucp.shopping.fulfillment": [{"version": "2026-01-11", "extends": "dev.ucp.shopping.checkout"}]
+      "dev.ucp.shopping.checkout": [{ "version": "2026-01-11" }],
+      "dev.ucp.shopping.discount": [
+        { "version": "2026-01-11", "extends": "dev.ucp.shopping.checkout" }
+      ],
+      "dev.ucp.shopping.fulfillment": [
+        { "version": "2026-01-11", "extends": "dev.ucp.shopping.checkout" }
+      ]
     },
     "payment_handlers": {
-      "com.stripe": [{"id": "stripe_gpay", "version": "2026-01-11"}]
+      "com.stripe": [{ "id": "stripe_gpay", "version": "2026-01-11" }]
     }
   },
   "id": "checkout_abc123",

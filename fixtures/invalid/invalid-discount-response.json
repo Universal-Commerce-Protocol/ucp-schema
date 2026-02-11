@@ -2,11 +2,11 @@
   "ucp": {
     "version": "2026-01-11",
     "capabilities": {
-      "dev.ucp.shopping.checkout": [{"version": "2026-01-11"}],
-      "dev.ucp.shopping.discount": [{"version": "2026-01-11"}]
+      "dev.ucp.shopping.checkout": [{ "version": "2026-01-11" }],
+      "dev.ucp.shopping.discount": [{ "version": "2026-01-11" }]
     },
     "payment_handlers": {
-      "com.stripe": [{"id": "stripe_gpay", "version": "2026-01-11"}]
+      "com.stripe": [{ "id": "stripe_gpay", "version": "2026-01-11" }]
     }
   },
   "id": "checkout_abc123",
@@ -15,14 +15,14 @@
   "line_items": [
     {
       "id": "li_1",
-      "item": {"id": "prod_123", "title": "Test Product", "price": 1999},
+      "item": { "id": "prod_123", "title": "Test Product", "price": 1999 },
       "quantity": 2,
-      "totals": [{"type": "subtotal", "amount": 3998}]
+      "totals": [{ "type": "subtotal", "amount": 3998 }]
     }
   ],
   "totals": [
-    {"type": "subtotal", "amount": 3998},
-    {"type": "total", "amount": 3498}
+    { "type": "subtotal", "amount": 3998 },
+    { "type": "total", "amount": 3498 }
   ],
   "discounts": {
     "codes": ["SAVE20"],

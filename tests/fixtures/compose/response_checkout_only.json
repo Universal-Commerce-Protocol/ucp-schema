@@ -1,15 +1,15 @@
 {
   "ucp": {
     "capabilities": {
-      "dev.ucp.shopping.checkout": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/checkout.json"
-      }]
+      "dev.ucp.shopping.checkout": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+        }
+      ]
     }
   },
   "id": "chk_123",
   "status": "incomplete",
-  "line_items": [
-    { "sku": "ABC123", "quantity": 2 }
-  ]
+  "line_items": [{ "sku": "ABC123", "quantity": 2 }]
 }

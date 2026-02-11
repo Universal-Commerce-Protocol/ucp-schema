@@ -1,32 +1,34 @@
 {
   "ucp": {
     "capabilities": {
-      "dev.ucp.shopping.checkout": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/checkout.json"
-      }],
-      "dev.ucp.shopping.discount": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/discount.json",
-        "extends": "dev.ucp.shopping.checkout"
-      }],
-      "dev.ucp.shopping.fulfillment": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/fulfillment.json",
-        "extends": "dev.ucp.shopping.checkout"
-      }]
+      "dev.ucp.shopping.checkout": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+        }
+      ],
+      "dev.ucp.shopping.discount": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/discount.json",
+          "extends": "dev.ucp.shopping.checkout"
+        }
+      ],
+      "dev.ucp.shopping.fulfillment": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/fulfillment.json",
+          "extends": "dev.ucp.shopping.checkout"
+        }
+      ]
     }
   },
   "id": "chk_456",
   "status": "incomplete",
-  "line_items": [
-    { "sku": "XYZ789", "quantity": 1 }
-  ],
+  "line_items": [{ "sku": "XYZ789", "quantity": 1 }],
   "discounts": {
     "codes": ["SAVE10"],
-    "applied": [
-      { "code": "SAVE10", "title": "10% Off", "amount": 500 }
-    ]
+    "applied": [{ "code": "SAVE10", "title": "10% Off", "amount": 500 }]
   },
   "fulfillment": {
     "method": "shipping",
