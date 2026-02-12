@@ -24,11 +24,11 @@ Use `--strict` only when you need a closed contract:
 
 **They're different validation modes:**
 
-| Flag                          | Mode                    | Schema source                               |
-| ----------------------------- | ----------------------- | ------------------------------------------- |
-| (none)                        | Self-describing         | Fetches URLs from `ucp.capabilities`        |
-| `--schema-local-base ./dir`   | Self-describing + local | Maps capability URLs to local files         |
-| `--schema file.json`          | Explicit                | Uses specified schema, ignores capabilities |
+| Flag                        | Mode                    | Schema source                               |
+| --------------------------- | ----------------------- | ------------------------------------------- |
+| (none)                      | Self-describing         | Fetches URLs from `ucp.capabilities`        |
+| `--schema-local-base ./dir` | Self-describing + local | Maps capability URLs to local files         |
+| `--schema file.json`        | Explicit                | Uses specified schema, ignores capabilities |
 
 `--schema-local-base` is useful for:
 

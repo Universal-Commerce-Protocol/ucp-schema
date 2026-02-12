@@ -22,14 +22,14 @@ For example, a field annotated with `"ucp_request": {"create": "omit", "update":
 
 **"I want to..."**
 
-| Goal | Command |
-|------|---------|
-| Inspect the composed schema (annotations preserved) | `compose payload.json --schema-local-base ./schemas --pretty` |
-| Get JSON Schema for an operation | `resolve payload.json --op read --schema-local-base ./schemas` |
-| Resolve a single schema file (no composition) | `resolve schema.json --request --op create` |
-| Validate a payload end-to-end | `validate payload.json --op read --schema-local-base ./schemas` |
-| Check schemas for errors before runtime | `lint schemas/` |
-| Debug what the pipeline is doing | Add `--verbose` to any command |
+| Goal                                                | Command                                                         |
+| --------------------------------------------------- | --------------------------------------------------------------- |
+| Inspect the composed schema (annotations preserved) | `compose payload.json --schema-local-base ./schemas --pretty`   |
+| Get JSON Schema for an operation                    | `resolve payload.json --op read --schema-local-base ./schemas`  |
+| Resolve a single schema file (no composition)       | `resolve schema.json --request --op create`                     |
+| Validate a payload end-to-end                       | `validate payload.json --op read --schema-local-base ./schemas` |
+| Check schemas for errors before runtime             | `lint schemas/`                                                 |
+| Debug what the pipeline is doing                    | Add `--verbose` to any command                                  |
 
 ## Installation
 
@@ -126,12 +126,12 @@ Options:
 
 The validator auto-detects how to find the schema based on what flags you provide and what metadata the payload contains (see [Validation Modes](#validation-modes) in Concepts):
 
-| Pattern | Command | Schema Source | Direction |
-|---------|---------|--------------|-----------|
-| **Response** (self-describing) | `validate response.json --op read` | `ucp.capabilities` URLs | Auto |
-| **JSONRPC request** | `validate envelope.json --op create` | `meta.profile` URL | Auto |
-| **REST request** | `validate payload.json --profile profile.json --op create` | `--profile` URL | Request |
-| **Explicit schema** | `validate payload.json --schema s.json --request --op create` | `--schema` | Specified |
+| Pattern                        | Command                                                       | Schema Source           | Direction |
+| ------------------------------ | ------------------------------------------------------------- | ----------------------- | --------- |
+| **Response** (self-describing) | `validate response.json --op read`                            | `ucp.capabilities` URLs | Auto      |
+| **JSONRPC request**            | `validate envelope.json --op create`                          | `meta.profile` URL      | Auto      |
+| **REST request**               | `validate payload.json --profile profile.json --op create`    | `--profile` URL         | Request   |
+| **Explicit schema**            | `validate payload.json --schema s.json --request --op create` | `--schema`              | Specified |
 
 ```bash
 # Self-describing response
@@ -161,15 +161,15 @@ Options:
   --quiet, -q           Only show errors, suppress progress
 ```
 
-| Category | Issue | Severity |
-|----------|-------|----------|
-| Syntax | Invalid JSON | Error |
-| References | `$ref` to missing file | Error |
-| References | `$ref` to missing anchor (`#/$defs/foo`) | Error |
-| Annotations | Invalid `ucp_*` type (must be string or object) | Error |
-| Annotations | Invalid visibility value (must be omit/required/optional) | Error |
-| Hygiene | Missing `$id` field | Warning |
-| Hygiene | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning |
+| Category    | Issue                                                        | Severity |
+| ----------- | ------------------------------------------------------------ | -------- |
+| Syntax      | Invalid JSON                                                 | Error    |
+| References  | `$ref` to missing file                                       | Error    |
+| References  | `$ref` to missing anchor (`#/$defs/foo`)                     | Error    |
+| Annotations | Invalid `ucp_*` type (must be string or object)              | Error    |
+| Annotations | Invalid visibility value (must be omit/required/optional)    | Error    |
+| Hygiene     | Missing `$id` field                                          | Warning  |
+| Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning  |
 
 ```bash
 # Lint a directory of schemas
@@ -258,12 +258,12 @@ Annotations are stripped; output is standard JSON Schema.
 
 **Resolution rules:**
 
-| Value | Effect on Properties | Effect on Required Array |
-|-------|---------------------|--------------------------|
-| `"omit"` | Field removed | Field removed |
-| `"required"` | Field kept | Field added |
-| `"optional"` | Field kept | Field removed |
-| (no annotation) | Field kept | Unchanged |
+| Value           | Effect on Properties | Effect on Required Array |
+| --------------- | -------------------- | ------------------------ |
+| `"omit"`        | Field removed        | Field removed            |
+| `"required"`    | Field kept           | Field added              |
+| `"optional"`    | Field kept           | Field removed            |
+| (no annotation) | Field kept           | Unchanged                |
 
 Annotations can be **shorthand** (all operations) or **per-operation**, and request/response are independent:
 
