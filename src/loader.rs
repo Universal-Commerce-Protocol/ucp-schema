@@ -126,10 +126,12 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
 /// * `schema` - The schema to process (modified in place)
 /// * `base_dir` - Base directory for resolving relative file paths
 pub fn bundle_refs(schema: &mut Value, base_dir: &Path) -> Result<(), ResolveError> {
+    // Snapshot root schema so internal #/$defs/ refs can resolve against it.
+    let root_snapshot = schema.clone();
     bundle_refs_inner(
         schema,
         base_dir,
-        None,
+        Some(&root_snapshot),
         None,
         None,
         &mut std::collections::HashSet::new(),
@@ -154,10 +156,11 @@ pub fn bundle_refs_with_url_mapping(
     local_base: &Path,
     remote_base: &str,
 ) -> Result<(), ResolveError> {
+    let root_snapshot = schema.clone();
     bundle_refs_inner(
         schema,
         base_dir,
-        None,
+        Some(&root_snapshot),
         Some(local_base),
         Some(remote_base),
         &mut std::collections::HashSet::new(),
@@ -201,7 +204,7 @@ fn bundle_refs_inner(
                         }
                         return Ok(());
                     }
-                    // No file_root = root schema, leave for validator
+                    // No file_root context — leave as-is
                 } else {
                     // External ref - may be relative path or absolute URL
                     let (file_part, fragment) = match ref_val.find('#') {
@@ -316,10 +319,12 @@ fn resolve_ref_to_path(
 /// * `base_url` - Base URL for resolving relative refs (typically the schema's $id)
 #[cfg(feature = "remote")]
 pub fn bundle_refs_remote(schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
+    // Snapshot root schema so internal #/$defs/ refs can resolve against it.
+    let root_snapshot = schema.clone();
     bundle_refs_remote_inner(
         schema,
         base_url,
-        None,
+        Some(&root_snapshot),
         &mut std::collections::HashSet::new(),
     )
 }
@@ -349,7 +354,7 @@ fn bundle_refs_remote_inner(
                         }
                         return Ok(());
                     }
-                    // No file_root = root schema, leave for validator
+                    // No file_root context — leave as-is
                 } else {
                     // External ref - resolve URL
                     let (file_part, fragment) = match ref_val.find('#') {
