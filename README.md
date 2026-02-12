@@ -58,14 +58,23 @@ ucp-schema validate payload.json --schema schema.json --request --op update
 
 ### `resolve` - Generate operation-specific schema
 
+Accepts a schema file or a self-describing payload. When given a payload, automatically composes schemas from capabilities before resolving.
+
 ```bash
+# Schema input (direction flag required)
 ucp-schema resolve <schema> --request|--response --op <operation> [options]
 
+# Payload input (direction auto-inferred)
+ucp-schema resolve <payload> --op <operation> --schema-local-base <dir> [options]
+
 Options:
-  --pretty           Pretty-print JSON output
-  --bundle           Inline all external $ref pointers (see Bundling)
-  --strict=true      Reject unknown fields (default: false, see Validation)
-  --output           Write to file instead of stdout
+  --pretty                    Pretty-print JSON output
+  --bundle                    Inline all external $ref pointers (schema input only)
+  --schema-local-base <dir>   Local directory for schema resolution (payload input only)
+  --schema-remote-base <url>  URL prefix to strip when mapping to local
+  --strict=true               Reject unknown fields (default: false, see Validation)
+  --output                    Write to file instead of stdout
+  --verbose, -v               Print pipeline stages to stderr
 ```
 
 Examples:
@@ -82,6 +91,12 @@ ucp-schema resolve https://ucp.dev/schemas/checkout.json --request --op create
 
 # Save resolved schema to file
 ucp-schema resolve checkout.json --request --op create --output resolved.json
+
+# Auto-compose from payload, then resolve (direction auto-inferred)
+ucp-schema resolve response.json --op read --schema-local-base ./schemas
+
+# Debug pipeline stages
+ucp-schema resolve response.json --op read --schema-local-base ./schemas --verbose
 ```
 
 ### `validate` - Validate payload against resolved schema
@@ -258,6 +273,36 @@ ucp-schema validate order.json --schema checkout.json --request --op create --js
 # Output: {"valid":true}
 # Or:     {"valid":false,"errors":[{"path":"","message":"..."}]}
 ```
+
+### `compose` - Compose schemas from capabilities
+
+Pure composition step: merges capability schemas from a self-describing payload. Output preserves UCP annotations (no resolve step). Use this to inspect what the composed schema looks like before resolution.
+
+```bash
+ucp-schema compose <payload> [options]
+
+Options:
+  --schema-local-base <dir>   Local directory for schema resolution
+  --schema-remote-base <url>  URL prefix to strip when mapping to local
+  --pretty                    Pretty-print JSON output
+  --output                    Write to file instead of stdout
+  --verbose, -v               Print pipeline stages to stderr
+```
+
+Examples:
+
+```bash
+# Compose and inspect the merged schema
+ucp-schema compose response.json --schema-local-base ./schemas --pretty
+
+# Save composed schema for debugging
+ucp-schema compose response.json --schema-local-base ./schemas --output composed.json
+
+# See pipeline stages
+ucp-schema compose response.json --schema-local-base ./schemas --verbose
+```
+
+Note: `compose` does NOT accept `--request`/`--response`/`--op` flags — those belong to `resolve` and `validate`. If you need a resolved schema, use `resolve` with a payload input.
 
 ### `lint` - Static analysis of schema files
 
@@ -510,6 +555,45 @@ Annotations control how fields appear in the resolved schema:
   "ucp_response": "required"
 }
 ```
+
+## How It Works
+
+Each CLI command corresponds to a depth in the processing pipeline:
+
+```
+compose   ■ □ □     compose only (annotations preserved)
+resolve   ■ ■ □     compose + resolve (if payload input)
+validate  ■ ■ ■     compose + resolve + validate
+lint      independent static analysis
+```
+
+When `resolve` or `validate` receives a self-describing payload (detected by `ucp.capabilities` or `meta.profile`), the compose step runs automatically. When given a plain schema file, only the later stages run.
+
+**"I want to..."**
+
+| Goal | Command |
+|------|---------|
+| See the composed schema with annotations | `compose response.json --schema-local-base ./schemas --pretty` |
+| Get a standard JSON Schema for an operation | `resolve response.json --op read --schema-local-base ./schemas` |
+| Validate a payload end-to-end | `validate response.json --op read --schema-local-base ./schemas` |
+| Resolve a single schema file | `resolve schema.json --request --op create` |
+| Debug what the pipeline is doing | Add `--verbose` to any command |
+
+## Debugging with `--verbose`
+
+All commands accept `--verbose` (or `-v`) which prints pipeline stages to stderr:
+
+```bash
+$ ucp-schema resolve response.json --op read --schema-local-base ./schemas --verbose
+[load] reading response.json
+[detect] payload with 2 capabilities (1 root, 1 extensions)
+[detect]   root dev.ucp.shopping.checkout → https://ucp.dev/schemas/shopping/checkout.json
+[detect]   ext  dev.ucp.shopping.discount → https://ucp.dev/schemas/shopping/discount.json
+[compose] composing schemas from payload capabilities
+[resolve] resolving for response/read
+```
+
+Verbose output goes to stderr, so it doesn't interfere with JSON output on stdout.
 
 ## More Information
 

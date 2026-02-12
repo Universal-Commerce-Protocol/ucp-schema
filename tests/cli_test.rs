@@ -616,7 +616,9 @@ mod help_and_version {
             .success()
             .stdout(predicate::str::contains("--request"))
             .stdout(predicate::str::contains("--response"))
-            .stdout(predicate::str::contains("--op"));
+            .stdout(predicate::str::contains("--op"))
+            .stdout(predicate::str::contains("--schema-local-base"))
+            .stdout(predicate::str::contains("--schema-remote-base"));
     }
 
     #[test]
@@ -895,6 +897,65 @@ mod bundle {
             .success()
             // Internal ref should be resolved
             .stdout(predicate::str::contains(r#""minLength""#));
+    }
+
+    #[test]
+    fn bundle_resolves_internal_defs_in_root_schema() {
+        let dir = TempDir::new().unwrap();
+
+        // Root schema with $defs and an internal $ref — the ref should be inlined
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "$defs": {
+                    "search_filter": {
+                        "type": "object",
+                        "properties": {
+                            "available": { "type": "boolean" }
+                        }
+                    }
+                },
+                "type": "object",
+                "properties": {
+                    "search_filters": {
+                        "allOf": [
+                            { "$ref": "#/$defs/search_filter" }
+                        ]
+                    }
+                }
+            }"##,
+        );
+
+        let assert = cmd()
+            .args([
+                "resolve",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--bundle",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let bundled: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // The internal #/$defs/ ref should be inlined
+        let all_of = &bundled["properties"]["search_filters"]["allOf"];
+        let first_entry = &all_of[0];
+
+        // $ref should be removed (inlined)
+        assert!(
+            first_entry.get("$ref").is_none(),
+            "Internal #/$defs/ ref should be inlined, but $ref still present: {first_entry}"
+        );
+        // The inlined content should have the 'available' property
+        assert!(
+            first_entry["properties"]["available"]["type"].as_str() == Some("boolean"),
+            "Inlined def should contain 'available: boolean', got: {first_entry}"
+        );
     }
 
     #[test]
@@ -1344,5 +1405,466 @@ mod compose {
             .code(2)
             .stdout(predicate::str::contains(r#""valid":false"#))
             .stdout(predicate::str::contains(r#""errors":"#));
+    }
+}
+
+/// Compose subcommand tests — output composed schemas (annotations preserved)
+mod compose_command {
+    use super::*;
+
+    #[test]
+    fn compose_checkout_only() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // Should produce a composed schema with properties
+        assert!(schema["properties"]["id"].is_object());
+        assert!(schema["properties"]["status"].is_object());
+        // UCP annotations should be PRESERVED (compose is pure composition)
+        assert!(
+            schema["properties"]["id"].get("ucp_response").is_some()
+                || schema["properties"]["id"].get("ucp_request").is_some(),
+            "compose should preserve UCP annotations"
+        );
+    }
+
+    #[test]
+    fn compose_with_extensions() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_with_extensions.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--pretty",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // Should produce an allOf composition
+        let all_of = schema["allOf"].as_array().unwrap();
+        assert_eq!(all_of.len(), 2); // discount + fulfillment
+
+        // Both branches should have their specific properties
+        let has_discounts = all_of
+            .iter()
+            .any(|s| s["properties"]["discounts"].is_object());
+        let has_fulfillment = all_of
+            .iter()
+            .any(|s| s["properties"]["fulfillment"].is_object());
+        assert!(has_discounts, "Should include discount properties");
+        assert!(has_fulfillment, "Should include fulfillment properties");
+
+        // UCP annotations should be PRESERVED in compose output
+        assert!(
+            stdout.contains("ucp_response") || stdout.contains("ucp_request"),
+            "compose should preserve UCP annotations"
+        );
+    }
+
+    #[test]
+    fn compose_needs_no_direction_or_op() {
+        // compose is pure composition — no --op, no --request/--response needed
+        cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("properties"));
+    }
+
+    #[test]
+    fn compose_non_payload_error() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(&dir, "schema.json", r#"{"name": "test"}"#);
+
+        // compose requires a self-describing payload; plain schema should error
+        cmd()
+            .args(["compose", schema.to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("not a self-describing payload"));
+    }
+
+    #[test]
+    fn compose_empty_capabilities_error() {
+        let dir = TempDir::new().unwrap();
+        let payload = write_temp_file(&dir, "payload.json", r#"{"ucp": {"capabilities": {}}}"#);
+
+        cmd()
+            .args(["compose", payload.to_str().unwrap()])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("no capabilities"));
+    }
+
+    #[test]
+    fn compose_missing_schema_base_error() {
+        cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "/nonexistent/schemas",
+            ])
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("failed to fetch schema"));
+    }
+
+    #[test]
+    fn compose_with_output_file() {
+        let dir = TempDir::new().unwrap();
+        let output = dir.path().join("composed.json");
+
+        cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--output",
+                output.to_str().unwrap(),
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::is_empty());
+
+        let content = fs::read_to_string(&output).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(schema["properties"]["id"].is_object());
+    }
+
+    #[test]
+    fn compose_with_pretty() {
+        cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--pretty",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("{\n"));
+    }
+
+    #[test]
+    fn compose_schema_remote_base() {
+        let dir = TempDir::new().unwrap();
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{
+                "ucp": {
+                    "capabilities": {
+                        "dev.ucp.shopping.checkout": [{
+                            "version": "2026-01-11",
+                            "schema": "https://ucp.dev/versioned/schemas/shopping/checkout.json"
+                        }]
+                    }
+                }
+            }"#,
+        );
+
+        cmd()
+            .args([
+                "compose",
+                payload.to_str().unwrap(),
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--schema-remote-base",
+                "https://ucp.dev/versioned",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("properties"));
+    }
+
+    #[test]
+    fn compose_help() {
+        cmd()
+            .args(["compose", "--help"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("--schema-local-base"))
+            .stdout(predicate::str::contains("--pretty"))
+            .stdout(predicate::str::contains("--output"))
+            // compose is pure composition — no direction or op flags
+            .stdout(predicate::str::contains("--request").not())
+            .stdout(predicate::str::contains("--response").not())
+            .stdout(predicate::str::contains("--op").not());
+    }
+}
+
+/// Resolve auto-composes when given a self-describing payload
+mod resolve_payload {
+    use super::*;
+
+    #[test]
+    fn resolve_auto_composes_payload() {
+        // resolve with a payload should auto-compose + resolve in one step
+        let assert = cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--response",
+                "--op",
+                "read",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+        // Should have resolved properties (annotations stripped)
+        assert!(schema["properties"]["id"].is_object());
+        // UCP annotations should be STRIPPED (resolve goes beyond compose)
+        assert!(
+            !stdout.contains("ucp_response") && !stdout.contains("ucp_request"),
+            "resolve should strip UCP annotations"
+        );
+    }
+
+    #[test]
+    fn resolve_auto_infers_direction_from_payload() {
+        // Direction is auto-inferred from payload's ucp.capabilities
+        let assert = cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--op",
+                "read",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        assert!(schema["properties"]["id"].is_object());
+    }
+
+    #[test]
+    fn resolve_no_warning_on_schema_input() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/checkout.json",
+                "--response",
+                "--op",
+                "read",
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("compose").not());
+    }
+}
+
+/// Flag/input-type compatibility: reject flags that don't apply
+mod flag_validation {
+    use super::*;
+
+    // resolve: --bundle rejected for payload input
+    #[test]
+    fn resolve_bundle_rejected_for_payload() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--bundle",
+                "--op",
+                "read",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "--bundle does not apply to payload input",
+            ));
+    }
+
+    // resolve: --schema-local-base rejected for schema input
+    #[test]
+    fn resolve_schema_local_base_rejected_for_schema() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/checkout.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--request",
+                "--op",
+                "create",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("only apply to payload input"));
+    }
+
+    // resolve: --schema-remote-base rejected for schema input
+    #[test]
+    fn resolve_schema_remote_base_rejected_for_schema() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/checkout.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--schema-remote-base",
+                "https://ucp.dev/draft",
+                "--request",
+                "--op",
+                "create",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("only apply to payload input"));
+    }
+
+    // validate: --schema-local-base rejected with explicit --schema
+    #[test]
+    fn validate_schema_local_base_rejected_with_explicit_schema() {
+        cmd()
+            .args([
+                "validate",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema",
+                "tests/fixtures/checkout.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--response",
+                "--op",
+                "read",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "do not apply with explicit --schema",
+            ));
+    }
+
+    // validate: --schema-remote-base rejected with explicit --schema
+    #[test]
+    fn validate_schema_remote_base_rejected_with_explicit_schema() {
+        cmd()
+            .args([
+                "validate",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema",
+                "tests/fixtures/checkout.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--schema-remote-base",
+                "https://ucp.dev/draft",
+                "--response",
+                "--op",
+                "read",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "do not apply with explicit --schema",
+            ));
+    }
+}
+
+/// Verbose mode tests
+mod verbose {
+    use super::*;
+
+    #[test]
+    fn resolve_verbose_shows_pipeline_stages() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--op",
+                "read",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--verbose",
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("[load]"))
+            .stderr(predicate::str::contains("[detect]"))
+            .stderr(predicate::str::contains("[compose]"))
+            .stderr(predicate::str::contains("[resolve]"));
+    }
+
+    #[test]
+    fn compose_verbose_shows_annotations_preserved() {
+        cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_checkout_only.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+                "--verbose",
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "[compose] composing schemas (annotations preserved)",
+            ));
+    }
+
+    #[test]
+    fn resolve_verbose_schema_input() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/checkout.json",
+                "--request",
+                "--op",
+                "create",
+                "--verbose",
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("[detect] input is a schema file"))
+            .stderr(predicate::str::contains(
+                "[resolve] resolving for request/create",
+            ));
+    }
+
+    #[test]
+    fn no_verbose_output_by_default() {
+        cmd()
+            .args([
+                "resolve",
+                "tests/fixtures/checkout.json",
+                "--request",
+                "--op",
+                "create",
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("[load]").not())
+            .stderr(predicate::str::contains("[resolve]").not());
     }
 }
