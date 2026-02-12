@@ -13,24 +13,24 @@ This is intentional:
 
 If a payload has `{ "id": "123", "custom_field": "foo" }` and the schema only defines `id`, validation passes. The `custom_field` is ignored—not rejected.
 
-Use `--strict=true` only when you need a closed contract:
+Use `--strict` only when you need a closed contract:
 
 - Catching field name typos during development
 - Systems where the schema is the complete specification
 
 ---
 
-## What's the difference between `--schema` and `--schema-base`?
+## What's the difference between `--schema` and `--schema-local-base`?
 
 **They're different validation modes:**
 
-| Flag                  | Mode                    | Schema source                               |
-| --------------------- | ----------------------- | ------------------------------------------- |
-| (none)                | Self-describing         | Fetches URLs from `ucp.capabilities`        |
-| `--schema-base ./dir` | Self-describing + local | Maps capability URLs to local files         |
-| `--schema file.json`  | Explicit                | Uses specified schema, ignores capabilities |
+| Flag                          | Mode                    | Schema source                               |
+| ----------------------------- | ----------------------- | ------------------------------------------- |
+| (none)                        | Self-describing         | Fetches URLs from `ucp.capabilities`        |
+| `--schema-local-base ./dir`   | Self-describing + local | Maps capability URLs to local files         |
+| `--schema file.json`          | Explicit                | Uses specified schema, ignores capabilities |
 
-`--schema-base` is useful for:
+`--schema-local-base` is useful for:
 
 - Offline testing
 - Local development before publishing schemas
@@ -38,10 +38,10 @@ Use `--strict=true` only when you need a closed contract:
 
 **How it works:** The flag extracts the URL path and maps it to a local file. This works for any domain—not just `ucp.dev`:
 
-| Schema URL                                       | Local path (`--schema-base ./local`)     |
-| ------------------------------------------------ | ---------------------------------------- |
-| `https://ucp.dev/schemas/shopping/checkout.json` | `./local/schemas/shopping/checkout.json` |
-| `https://extensions.3p.com/schemas/loyalty.json` | `./local/schemas/loyalty.json`           |
+| Schema URL                                       | Local path (`--schema-local-base ./local`) |
+| ------------------------------------------------ | ------------------------------------------ |
+| `https://ucp.dev/schemas/shopping/checkout.json` | `./local/schemas/shopping/checkout.json`   |
+| `https://extensions.3p.com/schemas/loyalty.json` | `./local/schemas/loyalty.json`             |
 
 This means you can develop and test third-party extensions locally before publishing.
 
@@ -54,10 +54,10 @@ This means you can develop and test third-party extensions locally before publis
 | Payload has        | Detected direction                               |
 | ------------------ | ------------------------------------------------ |
 | `ucp.capabilities` | Response                                         |
-| `ucp.meta.profile` | Request                                          |
+| `meta.profile`     | Request                                          |
 | Neither            | Error (must specify `--request` or `--response`) |
 
-This only applies to `validate`. The `resolve` command always requires explicit `--request` or `--response`.
+This applies to both `validate` and `resolve` when the input is a self-describing payload. When resolving a plain schema file, explicit `--request` or `--response` is required.
 
 ---
 
