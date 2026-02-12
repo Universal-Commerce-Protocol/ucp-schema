@@ -1045,47 +1045,61 @@ mod bundle {
     }
 }
 
-/// Remote schema loading tests - require network access
+/// Remote schema loading tests — use local mock server (no external dependencies)
 mod remote {
     use super::*;
 
     #[test]
     fn resolve_from_url() {
-        // Use httpbin.org which returns valid JSON
-        // The resolve command should fetch and process it
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/schema.json")
+            .with_body(r#"{"type": "object", "properties": {"name": {"type": "string"}}}"#)
+            .create();
+
         cmd()
             .args([
                 "resolve",
-                "https://httpbin.org/json",
+                &format!("{}/schema.json", server.url()),
                 "--request",
                 "--op",
                 "create",
             ])
             .assert()
             .success()
-            // httpbin returns {"slideshow": {...}} which should pass through
-            .stdout(predicate::str::contains("slideshow"));
+            .stdout(predicate::str::contains("name"));
+
+        mock.assert();
     }
 
     #[test]
     fn resolve_url_404() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/missing.json")
+            .with_status(404)
+            .create();
+
         cmd()
             .args([
                 "resolve",
-                "https://httpbin.org/status/404",
+                &format!("{}/missing.json", server.url()),
                 "--request",
                 "--op",
                 "create",
             ])
             .assert()
-            .code(3) // Network errors are exit code 3
+            .code(3)
             .stderr(
                 predicate::str::contains("failed to fetch").or(predicate::str::contains("404")),
             );
+
+        mock.assert();
     }
 
     #[test]
     fn resolve_url_invalid_host() {
+        // DNS failure is local — no mock needed
         cmd()
             .args([
                 "resolve",
@@ -1100,27 +1114,29 @@ mod remote {
 
     #[test]
     fn validate_with_remote_schema() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("GET", "/schema.json")
+            .with_body(r#"{"type": "object", "properties": {"name": {"type": "string"}}}"#)
+            .create();
+
         let dir = TempDir::new().unwrap();
-        // httpbin.org/json returns {"slideshow": {"author": "...", ...}}
-        // Create a payload that matches that structure
-        let payload = write_temp_file(
-            &dir,
-            "payload.json",
-            r#"{"slideshow": {"author": "Test Author", "title": "Test"}}"#,
-        );
+        let payload = write_temp_file(&dir, "payload.json", r#"{"name": "test"}"#);
 
         cmd()
             .args([
                 "validate",
                 payload.to_str().unwrap(),
                 "--schema",
-                "https://httpbin.org/json",
+                &format!("{}/schema.json", server.url()),
                 "--request",
                 "--op",
                 "create",
             ])
             .assert()
             .success();
+
+        mock.assert();
     }
 }
 
