@@ -7,3 +7,6 @@
 /.gitignore  @Universal-Commerce-Protocol/devops-maintainers
 /Cargo.toml  @Universal-Commerce-Protocol/devops-maintainers
 /Cargo.lock  @Universal-Commerce-Protocol/devops-maintainers
+
+# Governance
+/.github/CODEOWNERS      @Universal-Commerce-Protocol/governance-council
