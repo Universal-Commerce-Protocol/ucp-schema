@@ -1,0 +1,23 @@
+# Universal Commerce Protocol (UCP) Codeowners
+
+# Default for all files.
+* @Universal-Commerce-Protocol/devops-maintainers
+
+# Infrastructure & Tooling
+/.github/                 @Universal-Commerce-Protocol/devops-maintainers
+/Makefile                 @Universal-Commerce-Protocol/devops-maintainers
+/.gitignore               @Universal-Commerce-Protocol/devops-maintainers
+/Cargo.toml               @Universal-Commerce-Protocol/devops-maintainers
+/Cargo.lock               @Universal-Commerce-Protocol/devops-maintainers
+/.pre-commit-config.yaml  @Universal-Commerce-Protocol/devops-maintainers
+
+# Documentation, Tests & Core Schema
+/src/                     @Universal-Commerce-Protocol/maintainers
+/tests/                   @Universal-Commerce-Protocol/maintainers
+/fixtures/                @Universal-Commerce-Protocol/maintainers
+/README.md                @Universal-Commerce-Protocol/maintainers
+/FAQ.md                   @Universal-Commerce-Protocol/maintainers
+
+# Governance
+/LICENSE                  @Universal-Commerce-Protocol/governance-council
+/.github/CODEOWNERS       @Universal-Commerce-Protocol/governance-council
