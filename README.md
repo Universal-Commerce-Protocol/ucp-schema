@@ -264,6 +264,8 @@ Annotations are stripped; output is standard JSON Schema.
 | `"required"`    | Field kept           | Field added              |
 | `"optional"`    | Field kept           | Field removed            |
 | (no annotation) | Field kept           | Unchanged                |
+| `{ "transition": { "from", "to", "description" } }` (schema transition) | Matches `from` value | Matches `from` value |
+| (no annotation) | Field kept | Unchanged |
 
 Annotations can be **shorthand** (all operations) or **per-operation**, and request/response are independent:
 
@@ -282,6 +284,47 @@ Annotations can be **shorthand** (all operations) or **per-operation**, and requ
 ```
 
 Valid operations: `create`, `read`, `update`, `complete`.
+
+#### Schema transitions
+
+Use a **schema-transition object** to signal a field contract will change, with a human-readable reason:
+
+```json
+{
+  "transition": {
+    "from": "required",
+    "to": "omit",
+    "description": "Legacy id will be removed in v2; use resource_id instead."
+  }
+}
+```
+
+- **`from`** and **`to`** must be one of: `"omit"`, `"optional"`, `"required"`, and must be **distinct** (same value for both is invalid).
+- **`description`** is required and should explain the change and what to do instead.
+
+During the transition period the resolved schema **uses the `from` value** as the field's visibility, so previous implementers are not immediately affected. The resolver emits the schema-transition context into the output schema:
+
+- **`x-ucp-schema-transition`**: `{ "from", "to", "description" }` on the property for tooling and docs.
+- **`deprecated`: true** on the property only when the field is being **removed** (`to` is `"omit"`).
+
+**Example: Removing a required field**
+
+```json
+// Phase 1: Field is required
+{ "ucp_request": { "update": "required" } }
+
+// Phase 2: Schema transition (field stays required in resolved schema; tooling offers warnings)
+{ "ucp_request": { "update": { "transition": { "from": "required", "to": "omit", "description": "Will be removed in v2." } } } }
+
+// Phase 3: Remove
+{ "ucp_request": { "update": "omit" } }
+```
+
+**Shorthand schema transition** (same transition for all operations):
+
+```json
+{ "ucp_request": { "transition": { "from": "required", "to": "omit", "description": "Removed in v2." } } }
+```
 
 ### Schema Composition
 

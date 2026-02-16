@@ -3,6 +3,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Schema transition: from/to are visibility values (omit, optional, required).
+/// During the transition period the field is always optional in the resolved schema.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaTransitionInfo {
+    pub from: String,
+    pub to: String,
+    pub description: String,
+}
+
 /// Valid UCP operations for annotation object form.
 pub const VALID_OPERATIONS: &[&str] = &["create", "update", "complete", "read"];
 
@@ -80,6 +89,14 @@ impl Visibility {
     }
 }
 
+/// Returns true if (from, to) is a valid schema transition: both are visibility
+/// values (omit, optional, required) and from != to.
+pub fn is_valid_schema_transition(from: &str, to: &str) -> bool {
+    from != to
+        && Visibility::parse(from).is_some()
+        && Visibility::parse(to).is_some()
+}
+
 /// Options for schema resolution.
 #[derive(Debug, Clone)]
 pub struct ResolveOptions {
@@ -136,6 +153,28 @@ mod tests {
         assert_eq!(Visibility::parse("include"), None);
         assert_eq!(Visibility::parse("readonly"), None);
         assert_eq!(Visibility::parse(""), None);
+    }
+
+    #[test]
+    fn valid_schema_transitions() {
+        // Any distinct pair of visibility values is valid
+        for (from, to) in [
+            ("required", "optional"),
+            ("required", "omit"),
+            ("optional", "omit"),
+            ("optional", "required"),
+            ("omit", "required"),
+            ("omit", "optional"),
+        ] {
+            assert!(super::is_valid_schema_transition(from, to));
+        }
+        // Disbarred: same value for both
+        assert!(!super::is_valid_schema_transition("required", "required"));
+        assert!(!super::is_valid_schema_transition("omit", "omit"));
+        assert!(!super::is_valid_schema_transition("optional", "optional"));
+        // Disbarred: invalid visibility value
+        assert!(!super::is_valid_schema_transition("readonly", "omit"));
+        assert!(!super::is_valid_schema_transition("required", "invalid"));
     }
 
     #[test]

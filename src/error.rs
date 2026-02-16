@@ -92,6 +92,9 @@ pub enum ResolveError {
     #[error("unknown visibility \"{value}\" at {path}: expected omit, required, or optional")]
     UnknownVisibility { path: String, value: String },
 
+    #[error("invalid schema transition at {path}: {message}")]
+    InvalidSchemaTransition { path: String, message: String },
+
     #[error("invalid schema: {message}")]
     InvalidSchema { message: String },
 

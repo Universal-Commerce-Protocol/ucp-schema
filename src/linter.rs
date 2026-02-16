@@ -11,7 +11,9 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::loader::{load_schema, navigate_fragment};
-use crate::types::{json_type_name, Visibility, UCP_ANNOTATIONS, VALID_OPERATIONS};
+use crate::types::{
+    is_valid_schema_transition, json_type_name, Visibility, UCP_ANNOTATIONS, VALID_OPERATIONS,
+};
 
 /// Severity level for diagnostics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -332,6 +334,12 @@ fn check_annotation_value(
             for (op, val) in map {
                 let op_path = format!("{}/{}", annotation_path, op);
 
+                // Handle shorthand transition key
+                if op == "transition" {
+                    check_transition_object(val, key, file, &op_path, diagnostics);
+                    continue;
+                }
+
                 // Warn on unknown operations
                 if !VALID_OPERATIONS.contains(&op.as_str()) {
                     diagnostics.push(Diagnostic {
@@ -348,31 +356,51 @@ fn check_annotation_value(
                 }
 
                 // Check value is valid
-                if let Value::String(s) = val {
-                    if Visibility::parse(s).is_none() {
+                match val {
+                    Value::String(s) => {
+                        if Visibility::parse(s).is_none() {
+                            diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E004".to_string(),
+                                file: file.to_path_buf(),
+                                path: op_path,
+                                message: format!(
+                                    "invalid {} value \"{}\": expected omit, required, or optional",
+                                    key, s
+                                ),
+                            });
+                        }
+                    }
+                    Value::Object(obj) => {
+                        // Per-operation transition: { "update": { "transition": { ... } } }
+                        if let Some(t) = obj.get("transition") {
+                            check_transition_object(t, key, file, &op_path, diagnostics);
+                        } else {
+                            diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E005".to_string(),
+                                file: file.to_path_buf(),
+                                path: op_path,
+                                message: format!(
+                                    "invalid {} value type: expected string or transition object, got {}",
+                                    key,
+                                ),
+                            });
+                        }
+                    }
+                    _ => {
                         diagnostics.push(Diagnostic {
                             severity: Severity::Error,
-                            code: "E004".to_string(),
+                            code: "E005".to_string(),
                             file: file.to_path_buf(),
                             path: op_path,
                             message: format!(
-                                "invalid {} value \"{}\": expected omit, required, or optional",
-                                key, s
+                                "invalid {} value type: expected string or transition object, got {}",
+                                key,
+                                json_type_name(val)
                             ),
                         });
                     }
-                } else {
-                    diagnostics.push(Diagnostic {
-                        severity: Severity::Error,
-                        code: "E005".to_string(),
-                        file: file.to_path_buf(),
-                        path: op_path,
-                        message: format!(
-                            "invalid {} value type: expected string, got {}",
-                            key,
-                            json_type_name(val)
-                        ),
-                    });
                 }
             }
         }
@@ -389,6 +417,46 @@ fn check_annotation_value(
                 ),
             });
         }
+    }
+}
+
+/// Validate a schema transition object { "from", "to", "description" }.
+fn check_transition_object(
+    value: &Value,
+    key: &str,
+    file: &Path,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(obj) = value.as_object() else {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E005".to_string(),
+            file: file.to_path_buf(),
+            path: path.to_string(),
+            message: format!(
+                "invalid {} transition: expected object, got {}",
+                key,
+                json_type_name(value)
+            ),
+        });
+        return;
+    };
+
+    let from = obj.get("from").and_then(|v| v.as_str()).unwrap_or("");
+    let to = obj.get("to").and_then(|v| v.as_str()).unwrap_or("");
+
+    if !is_valid_schema_transition(from, to) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: path.to_string(),
+            message: format!(
+                "invalid {} schema transition: \"from\" ({}) and \"to\" ({}) must be distinct visibility values (omit, required, optional)",
+                key, from, to
+            ),
+        });
     }
 }
 
@@ -544,6 +612,64 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Ok);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_valid_schema_transition_object() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "properties": {{
+                "legacy_id": {{
+                    "type": "string",
+                    "ucp_request": {{
+                        "update": {{
+                            "transition": {{
+                                "from": "required",
+                                "to": "omit",
+                                "description": "Will be removed in v2."
+                            }}
+                        }}
+                    }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_invalid_schema_transition() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "properties": {{
+                "x": {{
+                    "type": "string",
+                    "ucp_request": {{
+                        "transition": {{
+                            "from": "required",
+                            "to": "required",
+                            "description": "from and to must be distinct"
+                        }}
+                    }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E004"));
     }
 
     #[test]
