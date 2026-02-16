@@ -92,9 +92,7 @@ impl Visibility {
 /// Returns true if (from, to) is a valid schema transition: both are visibility
 /// values (omit, optional, required) and from != to.
 pub fn is_valid_schema_transition(from: &str, to: &str) -> bool {
-    from != to
-        && Visibility::parse(from).is_some()
-        && Visibility::parse(to).is_some()
+    from != to && Visibility::parse(from).is_some() && Visibility::parse(to).is_some()
 }
 
 /// Options for schema resolution.

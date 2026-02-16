@@ -258,14 +258,14 @@ Annotations are stripped; output is standard JSON Schema.
 
 **Resolution rules:**
 
-| Value           | Effect on Properties | Effect on Required Array |
-| --------------- | -------------------- | ------------------------ |
-| `"omit"`        | Field removed        | Field removed            |
-| `"required"`    | Field kept           | Field added              |
-| `"optional"`    | Field kept           | Field removed            |
-| (no annotation) | Field kept           | Unchanged                |
-| `{ "transition": { "from", "to", "description" } }` (schema transition) | Matches `from` value | Matches `from` value |
-| (no annotation) | Field kept | Unchanged |
+| Value                                                                   | Effect on Properties | Effect on Required Array |
+| ----------------------------------------------------------------------- | -------------------- | ------------------------ |
+| `"omit"`                                                                | Field removed        | Field removed            |
+| `"required"`                                                            | Field kept           | Field added              |
+| `"optional"`                                                            | Field kept           | Field removed            |
+| (no annotation)                                                         | Field kept           | Unchanged                |
+| `{ "transition": { "from", "to", "description" } }` (schema transition) | Matches `from` value | Matches `from` value     |
+| (no annotation)                                                         | Field kept           | Unchanged                |
 
 Annotations can be **shorthand** (all operations) or **per-operation**, and request/response are independent:
 
@@ -323,7 +323,15 @@ During the transition period the resolved schema **uses the `from` value** as th
 **Shorthand schema transition** (same transition for all operations):
 
 ```json
-{ "ucp_request": { "transition": { "from": "required", "to": "omit", "description": "Removed in v2." } } }
+{
+  "ucp_request": {
+    "transition": {
+      "from": "required",
+      "to": "omit",
+      "description": "Removed in v2."
+    }
+  }
+}
 ```
 
 ### Schema Composition

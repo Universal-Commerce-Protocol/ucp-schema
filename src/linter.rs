@@ -384,6 +384,7 @@ fn check_annotation_value(
                                 message: format!(
                                     "invalid {} value type: expected string or transition object, got {}",
                                     key,
+                                    json_type_name(val)
                                 ),
                             });
                         }

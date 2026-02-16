@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 
 use crate::error::ResolveError;
 use crate::types::{
-    json_type_name, is_valid_schema_transition, Direction, ResolveOptions, SchemaTransitionInfo,
+    is_valid_schema_transition, json_type_name, Direction, ResolveOptions, SchemaTransitionInfo,
     Visibility, UCP_ANNOTATIONS,
 };
 
@@ -724,7 +724,9 @@ mod tests {
         assert!(result["properties"].get("id").is_some());
         let required = result["required"].as_array().unwrap();
         assert!(required.contains(&json!("id")));
-        let transition = result["properties"]["id"].get("x-ucp-schema-transition").unwrap();
+        let transition = result["properties"]["id"]
+            .get("x-ucp-schema-transition")
+            .unwrap();
         assert_eq!(transition["from"], "required");
         assert_eq!(transition["to"], "optional");
         assert_eq!(transition["description"], "Will become optional in v2.");
@@ -755,7 +757,9 @@ mod tests {
         assert!(result["properties"].get("id").is_some());
         let required = result["required"].as_array().unwrap();
         assert!(!required.contains(&json!("id")));
-        assert!(result["properties"]["id"].get("x-ucp-schema-transition").is_some());
+        assert!(result["properties"]["id"]
+            .get("x-ucp-schema-transition")
+            .is_some());
         assert_eq!(result["properties"]["id"]["deprecated"], true);
     }
 
@@ -790,7 +794,10 @@ mod tests {
         assert!(result["properties"].get("id").is_some());
         let required = result["required"].as_array().unwrap();
         assert!(required.contains(&json!("id")));
-        assert_eq!(result["properties"]["id"]["x-ucp-schema-transition"]["description"], "Removing in v2.");
+        assert_eq!(
+            result["properties"]["id"]["x-ucp-schema-transition"]["description"],
+            "Removing in v2."
+        );
     }
 
     #[test]
