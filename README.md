@@ -265,7 +265,6 @@ Annotations are stripped; output is standard JSON Schema.
 | `"optional"`                                                            | Field kept           | Field removed            |
 | (no annotation)                                                         | Field kept           | Unchanged                |
 | `{ "transition": { "from", "to", "description" } }` (schema transition) | Matches `from` value | Matches `from` value     |
-| (no annotation)                                                         | Field kept           | Unchanged                |
 
 Annotations can be **shorthand** (all operations) or **per-operation**, and request/response are independent:
 

@@ -446,6 +446,20 @@ fn check_transition_object(
 
     let from = obj.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = obj.get("to").and_then(|v| v.as_str()).unwrap_or("");
+    let description = obj.get("description").and_then(|v| v.as_str()).unwrap_or("");
+
+    if description.is_empty() {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E004".to_string(),
+            file: file.to_path_buf(),
+            path: path.to_string(),
+            message: format!(
+                "invalid {} transition: missing required field \"description\"",
+                key
+            ),
+        });
+    }
 
     if !is_valid_schema_transition(from, to) {
         diagnostics.push(Diagnostic {
@@ -671,6 +685,36 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Error);
         assert!(result.diagnostics.iter().any(|d| d.code == "E004"));
+    }
+
+    #[test]
+    fn lint_schema_transition_missing_description() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "properties": {{
+                "x": {{
+                    "type": "string",
+                    "ucp_request": {{
+                        "transition": {{
+                            "from": "required",
+                            "to": "omit"
+                        }}
+                    }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E004" && d.message.contains("description")));
     }
 
     #[test]
