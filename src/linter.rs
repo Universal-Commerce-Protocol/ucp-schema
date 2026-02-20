@@ -446,7 +446,10 @@ fn check_transition_object(
 
     let from = obj.get("from").and_then(|v| v.as_str()).unwrap_or("");
     let to = obj.get("to").and_then(|v| v.as_str()).unwrap_or("");
-    let description = obj.get("description").and_then(|v| v.as_str()).unwrap_or("");
+    let description = obj
+        .get("description")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     if description.is_empty() {
         diagnostics.push(Diagnostic {

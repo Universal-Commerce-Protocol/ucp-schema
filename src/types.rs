@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 /// Schema transition: from/to are visibility values (omit, optional, required).
-/// During the transition period the field is always optional in the resolved schema.
+/// During the transition period the field is always the `from` visibility.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SchemaTransitionInfo {
     pub from: String,
