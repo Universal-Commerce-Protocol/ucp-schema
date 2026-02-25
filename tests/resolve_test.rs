@@ -1162,7 +1162,10 @@ mod allof_propagation {
         let opts = ResolveOptions::new(Direction::Response, "search");
         // Should not crash; non-object property is untouched
         let result = resolve(&schema, &opts).unwrap();
-        assert_eq!(result["allOf"][0]["properties"]["id"], json!("not_an_object"));
+        assert_eq!(
+            result["allOf"][0]["properties"]["id"],
+            json!("not_an_object")
+        );
     }
 
     #[test]
