@@ -704,6 +704,585 @@ mod composition {
     }
 }
 
+// === allOf Annotation Propagation Tests ===
+
+mod allof_propagation {
+    use super::*;
+
+    // --- Core propagation ---
+
+    #[test]
+    fn extension_annotation_propagates_to_base() {
+        // Extension (allOf[1]) annotates "id" as omit; base (allOf[0]) has "id"
+        // without annotation. After propagation, base's "id" should be omitted.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let options = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &options).unwrap();
+
+        // Base branch: id omitted via propagation
+        assert!(result["allOf"][0]["properties"].get("id").is_none());
+        // Extension branch: id omitted (own annotation)
+        assert!(result["allOf"][1]["properties"].get("id").is_none());
+    }
+
+    #[test]
+    fn per_operation_propagation() {
+        // Extension annotates with per-op: search=omit, get_product=required.
+        // Base should receive the annotation for each operation.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "expensive": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "expensive": {
+                            "type": "string",
+                            "ucp_response": { "search": "omit", "get_product": "required" }
+                        }
+                    }
+                }
+            ]
+        });
+
+        // search: omitted
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+        assert!(result["allOf"][0]["properties"].get("expensive").is_none());
+
+        // get_product: required
+        let opts = ResolveOptions::new(Direction::Response, "get_product");
+        let result = resolve(&schema, &opts).unwrap();
+        assert!(result["allOf"][0]["properties"].get("expensive").is_some());
+        assert!(result["allOf"][0]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("expensive")));
+    }
+
+    #[test]
+    fn last_writer_wins_across_branches() {
+        // Three branches all annotate "status". Last branch's annotation wins.
+        // Note: per-branch results can be JSON Schema-contradictory, but this is
+        // academic since UCP allOf is always 2-branch (base + extension).
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "ucp_response": "required" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "status": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        // Last writer (branch 2) says omit — propagates to branch 0
+        assert!(result["allOf"][0]["properties"].get("status").is_none());
+    }
+
+    // --- Injection guards ---
+
+    #[test]
+    fn own_annotation_not_overwritten() {
+        // Base already has its own annotation — propagation should NOT overwrite it.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "required" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        // Base keeps its own "required" annotation
+        assert!(result["allOf"][0]["properties"].get("id").is_some());
+        assert!(result["allOf"][0]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("id")));
+        // Extension omits
+        assert!(result["allOf"][1]["properties"].get("id").is_none());
+    }
+
+    #[test]
+    fn no_annotations_no_propagation() {
+        // Neither branch has annotations — nothing to propagate.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "tag": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        assert!(result["allOf"][0]["properties"].get("name").is_some());
+        assert!(result["allOf"][1]["properties"].get("tag").is_some());
+    }
+
+    // --- Monotonicity enforcement ---
+
+    #[test]
+    fn monotonicity_required_to_omit_rejected() {
+        // Base declares "id" as required. Extension tries to omit it. Should error.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts);
+        assert!(matches!(
+            result,
+            Err(ResolveError::MonotonicityViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn monotonicity_required_to_optional_rejected() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "optional" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts);
+        assert!(matches!(
+            result,
+            Err(ResolveError::MonotonicityViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn monotonicity_required_to_required_ok() {
+        // Strengthening required → required is a no-op (allowed).
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "required" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        assert!(result["allOf"][0]["properties"].get("id").is_some());
+        assert!(result["allOf"][0]["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("id")));
+    }
+
+    #[test]
+    fn monotonicity_optional_to_omit_ok() {
+        // Narrowing optional → omit is allowed (field not in required).
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "tag": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "tag": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        assert!(result["allOf"][0]["properties"].get("tag").is_none());
+    }
+
+    #[test]
+    fn monotonicity_per_op_some_ok_some_not() {
+        // Per-op annotation: search=omit (would violate for required field),
+        // get_product=required (fine). Should error because search violates.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": {
+                            "type": "string",
+                            "ucp_response": {
+                                "search": "omit",
+                                "get_product": "required"
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        // search triggers violation
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        assert!(matches!(
+            resolve(&schema, &opts),
+            Err(ResolveError::MonotonicityViolation { .. })
+        ));
+
+        // get_product is fine
+        let opts = ResolveOptions::new(Direction::Response, "get_product");
+        assert!(resolve(&schema, &opts).is_ok());
+    }
+
+    // --- Type conflict detection ---
+
+    #[test]
+    fn type_conflict_detected() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "number" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        assert!(matches!(
+            resolve(&schema, &opts),
+            Err(ResolveError::TypeConflict { .. })
+        ));
+    }
+
+    #[test]
+    fn same_type_no_conflict() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        assert!(resolve(&schema, &opts).is_ok());
+    }
+
+    #[test]
+    fn disjoint_properties_no_conflict() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "number" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        assert!(resolve(&schema, &opts).is_ok());
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn branch_without_properties_is_skipped() {
+        // One branch is a $ref or has no properties — should not break propagation.
+        let schema = json!({
+            "allOf": [
+                { "$ref": "#/$defs/base" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "extra": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        // $ref branch passes through unchanged
+        assert!(result["allOf"][0].get("$ref").is_some());
+        // Extension: extra omitted
+        assert!(result["allOf"][1]["properties"].get("extra").is_none());
+    }
+
+    #[test]
+    fn single_branch_allof() {
+        // Single-branch allOf — edge case, no propagation needed.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        assert!(result["allOf"][0]["properties"].get("id").is_none());
+    }
+
+    #[test]
+    fn non_object_property_in_branch_skipped() {
+        // If properties contains a non-object value, skip gracefully.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": "not_an_object"
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        // Should not crash; non-object property is untouched
+        let result = resolve(&schema, &opts).unwrap();
+        assert_eq!(
+            result["allOf"][0]["properties"]["id"],
+            json!("not_an_object")
+        );
+    }
+
+    #[test]
+    fn ghost_field_annotation_ignored() {
+        // Extension annotates a field that doesn't exist in base — no injection needed.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "phantom": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        // Base unaffected (phantom doesn't exist there)
+        assert!(result["allOf"][0]["properties"].get("id").is_some());
+        assert!(result["allOf"][0]["properties"].get("phantom").is_none());
+        // Extension: phantom omitted
+        assert!(result["allOf"][1]["properties"].get("phantom").is_none());
+    }
+
+    // --- Coverage gaps ---
+
+    #[test]
+    fn per_op_split_across_branches() {
+        // One op in base, different op in extension for same field.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "string",
+                            "ucp_response": { "search": "omit" }
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "data": {
+                            "type": "string",
+                            "ucp_response": { "lookup": "omit" }
+                        }
+                    }
+                }
+            ]
+        });
+
+        // search: base has own annotation → omit
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+        assert!(result["allOf"][0]["properties"].get("data").is_none());
+
+        // lookup: extension annotation propagates to base
+        let opts = ResolveOptions::new(Direction::Response, "lookup");
+        let result = resolve(&schema, &opts).unwrap();
+        // Base has own annotation for search, but the merged annotation from extension
+        // (which covers lookup) does NOT overwrite base's own annotation
+        // So base's annotation {"search":"omit"} stands — lookup defaults to include
+        assert!(result["allOf"][0]["properties"].get("data").is_some());
+    }
+
+    #[test]
+    fn nested_objects_not_propagated() {
+        // Propagation is shallow — only top-level properties of each allOf branch.
+        // Nested objects within a branch are resolved normally, not propagated across.
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "deep": { "type": "string" }
+                            }
+                        }
+                    }
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "deep": { "type": "string", "ucp_response": "omit" }
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+        let opts = ResolveOptions::new(Direction::Response, "search");
+        let result = resolve(&schema, &opts).unwrap();
+
+        // Base's inner.deep is NOT affected (no cross-branch nesting propagation)
+        assert!(result["allOf"][0]["properties"]["inner"]["properties"]
+            .get("deep")
+            .is_some());
+        // Extension's inner.deep IS omitted (own annotation)
+        assert!(result["allOf"][1]["properties"]["inner"]["properties"]
+            .get("deep")
+            .is_none());
+    }
+}
+
 // === Additional Properties Tests (Phase 2) ===
 
 mod additional_properties {

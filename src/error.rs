@@ -95,6 +95,30 @@ pub enum ResolveError {
     #[error("invalid schema transition at {path}: {message}")]
     InvalidSchemaTransition { path: String, message: String },
 
+    /// allOf extension tries to weaken a field that base declares as required.
+    /// Monotonicity rule: extensions can narrow (optional→omit) or strengthen
+    /// (optional→required) but never weaken required fields.
+    #[error(
+        "monotonicity violation at {path}: field \"{field}\" is {base_status} in base schema \
+         but extension sets it to \"{attempted}\""
+    )]
+    MonotonicityViolation {
+        path: String,
+        field: String,
+        base_status: String,
+        attempted: String,
+    },
+
+    /// allOf branches declare contradictory types on the same property.
+    #[error(
+        "type conflict at {path}: base declares \"{base_type}\" but extension declares \"{ext_type}\""
+    )]
+    TypeConflict {
+        path: String,
+        base_type: String,
+        ext_type: String,
+    },
+
     #[error("invalid schema: {message}")]
     InvalidSchema { message: String },
 

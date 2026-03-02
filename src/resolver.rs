@@ -143,7 +143,18 @@ pub fn get_visibility(
     let Some(annotation) = prop.get(key) else {
         return Ok((Visibility::Include, None));
     };
+    get_visibility_from_annotation(annotation, operation, path)
+}
 
+/// Parse visibility (and optional transition info) from a raw annotation value.
+///
+/// Shared between `get_visibility` (which extracts annotation by direction key)
+/// and `inject_annotations` (which already has the annotation from allOf propagation).
+fn get_visibility_from_annotation(
+    annotation: &Value,
+    operation: &str,
+    path: &str,
+) -> Result<(Visibility, Option<SchemaTransitionInfo>), ResolveError> {
     match annotation {
         // Shorthand: "ucp_request": "omit" - applies to all operations
         Value::String(s) => Ok((parse_visibility_string(s, path)?, None)),
@@ -284,8 +295,16 @@ fn resolve_object(
                 let resolved = resolve_defs(value, options, &child_path)?;
                 result.insert(key.clone(), resolved);
             }
-            "allOf" | "anyOf" | "oneOf" => {
-                // Composition - transform each branch
+            "allOf" => {
+                // allOf gets special handling: annotations from later branches
+                // propagate to earlier branches (last-writer-wins), enabling
+                // extension schemas to control visibility of inherited fields.
+                let resolved = resolve_allof(value, options, &child_path)?;
+                result.insert(key.clone(), resolved);
+            }
+            "anyOf" | "oneOf" => {
+                // anyOf/oneOf branches are independent alternatives —
+                // no annotation propagation across branches.
                 let resolved = resolve_composition(value, options, &child_path)?;
                 result.insert(key.clone(), resolved);
             }
@@ -430,6 +449,178 @@ fn resolve_composition(
     }
 
     Ok(Value::Array(result))
+}
+
+/// allOf-specific resolution with cross-branch annotation propagation.
+///
+/// Three-phase approach:
+/// 1. **Collect**: scan all branches for annotations (last-writer-wins)
+/// 2. **Validate**: check for type conflicts across branches
+/// 3. **Inject + Resolve**: copy collected annotations into branches that lack them,
+///    enforcing monotonicity (extensions cannot weaken required fields), then resolve
+///
+/// Why last-writer-wins: in UCP's allOf convention, the base schema is allOf[0]
+/// and extensions follow. Later branches (extensions) should override earlier ones.
+fn resolve_allof(
+    value: &Value,
+    options: &ResolveOptions,
+    path: &str,
+) -> Result<Value, ResolveError> {
+    let Some(arr) = value.as_array() else {
+        return Ok(value.clone());
+    };
+
+    let ann_key = options.direction.annotation_key();
+    let merged = collect_allof_annotations(arr, ann_key);
+    validate_allof_types(arr, path)?;
+
+    let mut result = Vec::new();
+    for (i, item) in arr.iter().enumerate() {
+        let item_path = format!("{}/{}", path, i);
+        let item = if !merged.is_empty() {
+            inject_annotations(item, &merged, ann_key, options, &item_path)?
+        } else {
+            item.clone()
+        };
+        let resolved = resolve_value(&item, options, &item_path)?;
+        result.push(resolved);
+    }
+
+    Ok(Value::Array(result))
+}
+
+/// Scan allOf branches and collect annotations per property (last-writer-wins).
+///
+/// Returns a map of property_name → annotation_value for properties that have
+/// a UCP annotation in any branch. When multiple branches annotate the same
+/// property, the last branch's annotation wins.
+fn collect_allof_annotations(branches: &[Value], ann_key: &str) -> Map<String, Value> {
+    let mut merged = Map::new();
+    for branch in branches {
+        let props = branch
+            .as_object()
+            .and_then(|o| o.get("properties"))
+            .and_then(|p| p.as_object());
+        if let Some(props) = props {
+            for (name, prop) in props {
+                if let Some(ann) = prop.as_object().and_then(|p| p.get(ann_key)) {
+                    merged.insert(name.clone(), ann.clone());
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Inject collected annotations into a branch's properties where they're missing.
+///
+/// Enforces monotonicity: if a field is `required` in a base branch's required
+/// array, an extension annotation cannot weaken it to `omit` or `optional`.
+///
+/// | base required? | extension annotation | result     |
+/// |---------------|---------------------|------------|
+/// | yes           | required            | OK         |
+/// | yes           | optional            | ERROR      |
+/// | yes           | omit                | ERROR      |
+/// | no            | any                 | OK         |
+fn inject_annotations(
+    branch: &Value,
+    annotations: &Map<String, Value>,
+    ann_key: &str,
+    options: &ResolveOptions,
+    path: &str,
+) -> Result<Value, ResolveError> {
+    let mut branch = branch.clone();
+
+    let base_required: Vec<String> = branch
+        .as_object()
+        .and_then(|o| o.get("required"))
+        .and_then(|r| r.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if let Some(props) = branch
+        .as_object_mut()
+        .and_then(|o| o.get_mut("properties"))
+        .and_then(|p| p.as_object_mut())
+    {
+        for (name, ann) in annotations {
+            if let Some(prop) = props.get_mut(name) {
+                if let Some(obj) = prop.as_object_mut() {
+                    // Skip if this property already has its own annotation
+                    if obj.contains_key(ann_key) {
+                        continue;
+                    }
+
+                    // Monotonicity check: required fields cannot be weakened
+                    if base_required.contains(name) {
+                        let (vis, _) = get_visibility_from_annotation(
+                            ann,
+                            &options.operation,
+                            &format!("{}/properties/{}", path, name),
+                        )?;
+                        if matches!(vis, Visibility::Omit | Visibility::Optional) {
+                            return Err(ResolveError::MonotonicityViolation {
+                                path: format!("{}/properties/{}", path, name),
+                                field: name.clone(),
+                                base_status: "required".into(),
+                                attempted: match vis {
+                                    Visibility::Omit => "omit",
+                                    Visibility::Optional => "optional",
+                                    Visibility::Required => "required",
+                                    Visibility::Include => "include",
+                                }
+                                .into(),
+                            });
+                        }
+                    }
+
+                    obj.insert(ann_key.to_string(), ann.clone());
+                }
+            }
+        }
+    }
+
+    Ok(branch)
+}
+
+/// Validate that allOf branches don't declare contradictory types on the same property.
+///
+/// Only checks string-form `"type"` values. Array-form types (e.g. `["string", "null"]`)
+/// are intentionally skipped — they're rare and the semantic comparison is non-trivial.
+fn validate_allof_types(branches: &[Value], path: &str) -> Result<(), ResolveError> {
+    let mut prop_types: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for branch in branches {
+        let props = branch
+            .as_object()
+            .and_then(|o| o.get("properties"))
+            .and_then(|p| p.as_object());
+        if let Some(props) = props {
+            for (name, prop) in props {
+                if let Some(type_val) = prop.as_object().and_then(|p| p.get("type")) {
+                    if let Some(type_str) = type_val.as_str() {
+                        if let Some(existing) = prop_types.get(name) {
+                            if existing != type_str {
+                                return Err(ResolveError::TypeConflict {
+                                    path: format!("{}/properties/{}", path, name),
+                                    base_type: existing.clone(),
+                                    ext_type: type_str.to_string(),
+                                });
+                            }
+                        } else {
+                            prop_types.insert(name.clone(), type_str.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn strip_annotations_recursive(value: &Value) -> Value {

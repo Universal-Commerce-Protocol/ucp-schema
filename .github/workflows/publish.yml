@@ -1,0 +1,43 @@
+name: Publish to Crates.io
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  publish:
+    name: Publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: get_version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Verify Cargo.toml matches Tag
+        run: |
+          TAG_VERSION=${{ steps.get_version.outputs.VERSION }}
+          CARGO_VERSION=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          
+          echo "Tag version: $TAG_VERSION"
+          echo "Cargo version: $CARGO_VERSION"
+          
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "::error::Version mismatch! Tag is v$TAG_VERSION but Cargo.toml says $CARGO_VERSION."
+            exit 1
+          fi
+
+      - name: Verify Cargo.lock is in sync
+        run: cargo fetch --locked
+
+      - name: Publish to Crates.io
+        uses: rust-lang/simple-publish-action@v1
