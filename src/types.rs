@@ -106,6 +106,12 @@ pub struct ResolveOptions {
     /// When true, sets `additionalProperties: false` on all object schemas
     /// to reject unknown fields. Defaults to false to respect schema extensibility.
     pub strict: bool,
+    /// When true, includes fields with `omit` visibility that have a transition
+    /// targeting a non-omit value (i.e., planned additions). These fields appear
+    /// in the resolved output with `x-ucp-schema-transition` metadata but are NOT
+    /// added to `required`. Completes the lifecycle symmetry: deprecations (to=omit)
+    /// are always surfaced; this flag surfaces planned additions (from=omit) too.
+    pub include_future: bool,
 }
 
 impl ResolveOptions {
@@ -119,12 +125,19 @@ impl ResolveOptions {
             direction,
             operation: operation.into().to_lowercase(),
             strict: false,
+            include_future: false,
         }
     }
 
     /// Set strict mode (additionalProperties: false on all objects).
     pub fn strict(mut self, strict: bool) -> Self {
         self.strict = strict;
+        self
+    }
+
+    /// Include future fields (omit-visibility with non-omit transition target).
+    pub fn include_future(mut self, include_future: bool) -> Self {
+        self.include_future = include_future;
         self
     }
 }
