@@ -161,15 +161,19 @@ Options:
   --quiet, -q           Only show errors, suppress progress
 ```
 
-| Category    | Issue                                                        | Severity |
-| ----------- | ------------------------------------------------------------ | -------- |
-| Syntax      | Invalid JSON                                                 | Error    |
-| References  | `$ref` to missing file                                       | Error    |
-| References  | `$ref` to missing anchor (`#/$defs/foo`)                     | Error    |
-| Annotations | Invalid `ucp_*` type (must be string or object)              | Error    |
-| Annotations | Invalid visibility value (must be omit/required/optional)    | Error    |
-| Hygiene     | Missing `$id` field                                          | Warning  |
-| Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning  |
+| Code | Category    | Issue                                                        | Severity |
+| ---- | ----------- | ------------------------------------------------------------ | -------- |
+| E001 | Syntax      | Invalid JSON                                                 | Error    |
+| E002 | References  | `$ref` to missing file                                       | Error    |
+| E003 | References  | `$ref` to missing anchor (`#/$defs/foo`)                     | Error    |
+| E004 | Annotations | Invalid visibility value or schema transition                | Error    |
+| E005 | Annotations | Invalid `ucp_*` type (must be string or object)              | Error    |
+| E006 | Requires    | Invalid `requires` structure (wrong types, bad version format) | Error  |
+| E007 | Requires    | `requires.capabilities` key not found in `$defs`             | Error    |
+| W002 | Hygiene     | Missing `$id` field                                          | Warning  |
+| W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning  |
+| W004 | Requires    | Version constraint has `min` > `max`                         | Warning  |
+| W005 | Requires    | Unknown key in `requires` or version constraint              | Warning  |
 
 ```bash
 # Lint a directory of schemas
@@ -388,6 +392,28 @@ Extension schemas define their additions in `$defs` keyed by the root capability
   }
 }
 ```
+
+**Version constraints (`requires`):**
+
+Extension schemas can declare which protocol and capability versions they depend on. Composition fails if the declared constraints are not satisfied by the profile's versions:
+
+```json
+{
+  "$id": "https://acme.com/ucp/schemas/loyalty.json",
+  "name": "com.acme.shopping.loyalty",
+  "requires": {
+    "protocol": { "min": "2026-01-23" },
+    "capabilities": {
+      "dev.ucp.shopping.checkout": { "min": "2026-06-01" }
+    }
+  },
+  "$defs": {
+    "dev.ucp.shopping.checkout": { ... }
+  }
+}
+```
+
+Each constraint is an object with a required `min` and optional `max` (both inclusive). Keys in `requires.capabilities` must be a subset of `$defs` keys. Schemas without `requires` compose as before — the composer asserts compatibility.
 
 ### Validation Modes
 

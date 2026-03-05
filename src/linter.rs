@@ -12,7 +12,8 @@ use serde_json::Value;
 
 use crate::loader::{load_schema, navigate_fragment};
 use crate::types::{
-    is_valid_schema_transition, json_type_name, Visibility, UCP_ANNOTATIONS, VALID_OPERATIONS,
+    is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
+    UCP_ANNOTATIONS, VALID_OPERATIONS,
 };
 
 /// Severity level for diagnostics.
@@ -151,6 +152,9 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
 
     // Check ucp_* annotations
     check_annotations(&schema, file, "", &mut diagnostics);
+
+    // Check `requires` field (version constraints on extension schemas)
+    check_requires(&schema, file, &mut diagnostics);
 
     // Check for missing $id (warning)
     if schema.get("$id").is_none() {
@@ -475,6 +479,229 @@ fn check_transition_object(
                 key, from, to
             ),
         });
+    }
+}
+
+/// Validate a `version_constraint` object at the given path.
+/// Returns the parsed constraint on success for further checks.
+fn check_version_constraint(
+    value: &Value,
+    file: &Path,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<VersionConstraint> {
+    let obj = match value.as_object() {
+        Some(o) => o,
+        None => {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E006".to_string(),
+                file: file.to_path_buf(),
+                path: path.to_string(),
+                message: format!(
+                    "invalid version constraint: expected object, got {}",
+                    json_type_name(value)
+                ),
+            });
+            return None;
+        }
+    };
+
+    // Warn about unknown keys (catch typos like "maxx")
+    const KNOWN_CONSTRAINT_KEYS: &[&str] = &["min", "max"];
+    for key in obj.keys() {
+        if !KNOWN_CONSTRAINT_KEYS.contains(&key.as_str()) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                code: "W005".to_string(),
+                file: file.to_path_buf(),
+                path: format!("{}/{}", path, key),
+                message: format!(
+                    "unknown key \"{}\" in version constraint: expected min, max",
+                    key
+                ),
+            });
+        }
+    }
+
+    let min = match obj.get("min").and_then(|v| v.as_str()) {
+        Some(s) => s,
+        None => {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E006".to_string(),
+                file: file.to_path_buf(),
+                path: path.to_string(),
+                message: "version constraint missing required field \"min\"".to_string(),
+            });
+            return None;
+        }
+    };
+
+    if !is_valid_version(min) {
+        diagnostics.push(Diagnostic {
+            severity: Severity::Error,
+            code: "E006".to_string(),
+            file: file.to_path_buf(),
+            path: format!("{}/min", path),
+            message: format!("invalid version format \"{}\": expected YYYY-MM-DD", min),
+        });
+        return None;
+    }
+
+    let mut max_str = None;
+    if let Some(max_val) = obj.get("max") {
+        match max_val.as_str() {
+            Some(s) => {
+                if !is_valid_version(s) {
+                    diagnostics.push(Diagnostic {
+                        severity: Severity::Error,
+                        code: "E006".to_string(),
+                        file: file.to_path_buf(),
+                        path: format!("{}/max", path),
+                        message: format!("invalid version format \"{}\": expected YYYY-MM-DD", s),
+                    });
+                    return None;
+                }
+                max_str = Some(s.to_string());
+            }
+            None => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: "E006".to_string(),
+                    file: file.to_path_buf(),
+                    path: format!("{}/max", path),
+                    message: "\"max\" must be a string".to_string(),
+                });
+                return None;
+            }
+        }
+    }
+
+    let vc = VersionConstraint {
+        min: min.to_string(),
+        max: max_str,
+    };
+
+    // Warn if min > max (likely authoring error)
+    if let Some(ref max) = vc.max {
+        if vc.min.as_str() > max.as_str() {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                code: "W004".to_string(),
+                file: file.to_path_buf(),
+                path: path.to_string(),
+                message: format!("version constraint has min ({}) > max ({})", vc.min, max),
+            });
+        }
+    }
+
+    Some(vc)
+}
+
+/// Validate the top-level `requires` field on an extension schema.
+///
+/// Checks:
+/// - E006: Invalid structure (wrong types, bad version format)
+/// - E007: `requires.capabilities` key not found in `$defs`
+/// - W004: `min` > `max` in a version constraint
+fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>) {
+    let Some(requires) = schema.get("requires") else {
+        return;
+    };
+
+    let requires_path = "/requires";
+
+    let obj = match requires.as_object() {
+        Some(o) => o,
+        None => {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Error,
+                code: "E006".to_string(),
+                file: file.to_path_buf(),
+                path: requires_path.to_string(),
+                message: format!(
+                    "\"requires\" must be an object, got {}",
+                    json_type_name(requires)
+                ),
+            });
+            return;
+        }
+    };
+
+    // Warn about unknown keys (catch typos like "protocl")
+    const KNOWN_REQUIRES_KEYS: &[&str] = &["protocol", "capabilities"];
+    for key in obj.keys() {
+        if !KNOWN_REQUIRES_KEYS.contains(&key.as_str()) {
+            diagnostics.push(Diagnostic {
+                severity: Severity::Warning,
+                code: "W005".to_string(),
+                file: file.to_path_buf(),
+                path: format!("{}/{}", requires_path, key),
+                message: format!(
+                    "unknown key \"{}\" in requires: expected protocol, capabilities",
+                    key
+                ),
+            });
+        }
+    }
+
+    // Validate requires.protocol
+    if let Some(protocol) = obj.get("protocol") {
+        check_version_constraint(
+            protocol,
+            file,
+            &format!("{}/protocol", requires_path),
+            diagnostics,
+        );
+    }
+
+    // Validate requires.capabilities
+    if let Some(caps) = obj.get("capabilities") {
+        let caps_path = format!("{}/capabilities", requires_path);
+        let caps_obj = match caps.as_object() {
+            Some(o) => o,
+            None => {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: "E006".to_string(),
+                    file: file.to_path_buf(),
+                    path: caps_path,
+                    message: format!(
+                        "\"requires.capabilities\" must be an object, got {}",
+                        json_type_name(caps)
+                    ),
+                });
+                return;
+            }
+        };
+
+        // Collect $defs keys for cross-reference check
+        let defs_keys: std::collections::HashSet<&str> = schema
+            .get("$defs")
+            .and_then(|d| d.as_object())
+            .map(|d| d.keys().map(|k| k.as_str()).collect())
+            .unwrap_or_default();
+
+        for (cap_name, constraint) in caps_obj {
+            let cap_path = format!("{}/{}", caps_path, cap_name);
+
+            check_version_constraint(constraint, file, &cap_path, diagnostics);
+
+            // Cross-reference: capability key must exist in $defs
+            if !defs_keys.contains(cap_name.as_str()) {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Error,
+                    code: "E007".to_string(),
+                    file: file.to_path_buf(),
+                    path: cap_path,
+                    message: format!(
+                        "requires.capabilities key \"{}\" not found in $defs",
+                        cap_name
+                    ),
+                });
+            }
+        }
     }
 }
 
@@ -823,6 +1050,251 @@ mod tests {
         .unwrap();
 
         let result = lint_file(&main_path, dir.path());
+        assert_eq!(result.status, FileStatus::Ok);
+    }
+
+    #[test]
+    fn lint_valid_requires() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/loyalty.json",
+            "requires": {{
+                "protocol": {{ "min": "2026-01-23" }},
+                "capabilities": {{
+                    "dev.ucp.shopping.checkout": {{ "min": "2026-06-01" }}
+                }}
+            }},
+            "$defs": {{
+                "dev.ucp.shopping.checkout": {{ "type": "object" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_requires_with_range() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/loyalty.json",
+            "requires": {{
+                "protocol": {{ "min": "2026-01-23", "max": "2026-09-01" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_requires_not_object() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": "bad"
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E006"));
+    }
+
+    #[test]
+    fn lint_requires_bad_version_format() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "protocol": {{ "min": "not-a-date" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E006"));
+    }
+
+    #[test]
+    fn lint_requires_missing_min() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "protocol": {{ "max": "2026-09-01" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E006" && d.message.contains("min")));
+    }
+
+    #[test]
+    fn lint_requires_min_greater_than_max() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "protocol": {{ "min": "2026-09-01", "max": "2026-01-23" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(result.diagnostics.iter().any(|d| d.code == "W004"));
+    }
+
+    #[test]
+    fn lint_requires_capability_not_in_defs() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/loyalty.json",
+            "requires": {{
+                "capabilities": {{
+                    "dev.ucp.shopping.checkout": {{ "min": "2026-06-01" }}
+                }}
+            }},
+            "$defs": {{
+                "dev.ucp.shopping.order": {{ "type": "object" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E007"));
+    }
+
+    #[test]
+    fn lint_requires_capability_no_defs() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "capabilities": {{
+                    "dev.ucp.shopping.checkout": {{ "min": "2026-06-01" }}
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E007"));
+    }
+
+    #[test]
+    fn lint_requires_unknown_key_in_requires() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "protocl": {{ "min": "2026-01-23" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W005" && d.message.contains("protocl")));
+    }
+
+    #[test]
+    fn lint_requires_unknown_key_in_constraint() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "protocol": {{ "min": "2026-01-23", "maxx": "2026-09-01" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "W005" && d.message.contains("maxx")));
+    }
+
+    #[test]
+    fn lint_requires_empty_capabilities_ok() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "requires": {{
+                "capabilities": {{}}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+    }
+
+    #[test]
+    fn lint_schema_without_requires_unchanged() {
+        // Backwards compat: schemas without `requires` pass unchanged
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "properties": {{
+                "id": {{ "type": "string" }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Ok);
     }
 

@@ -44,6 +44,14 @@ pub enum ComposeError {
 
     #[error("invalid URL '{url}': {message}")]
     InvalidUrl { url: String, message: String },
+
+    #[error("extension '{extension}' requires {target} {range} but found {actual}")]
+    VersionConstraintViolation {
+        extension: String,
+        target: String,
+        range: String,
+        actual: String,
+    },
 }
 
 impl ComposeError {
