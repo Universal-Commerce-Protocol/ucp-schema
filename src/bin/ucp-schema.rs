@@ -394,9 +394,17 @@ fn run_resolve(
         .include_future(include_future);
     if verbose {
         let mut flags = Vec::new();
-        if strict { flags.push("strict"); }
-        if include_future { flags.push("include-future"); }
-        let suffix = if flags.is_empty() { String::new() } else { format!(" ({})", flags.join(", ")) };
+        if strict {
+            flags.push("strict");
+        }
+        if include_future {
+            flags.push("include-future");
+        }
+        let suffix = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(", "))
+        };
         eprintln!(
             "[resolve] resolving for {}/{}{}",
             direction

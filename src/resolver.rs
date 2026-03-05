@@ -368,10 +368,8 @@ fn resolve_properties(
                 // Include future fields: currently omit but transitioning to non-omit.
                 // Completes transition lifecycle symmetry — deprecations (to=omit) are
                 // already surfaced; this surfaces planned additions (from=omit).
-                let is_future = options.include_future
-                    && transition
-                        .as_ref()
-                        .map_or(false, |t| t.to != "omit");
+                let is_future =
+                    options.include_future && transition.as_ref().is_some_and(|t| t.to != "omit");
 
                 if is_future {
                     let resolved = resolve_value(prop_value, options, &prop_path)?;
@@ -1141,16 +1139,24 @@ mod tests {
 
         // stable: present, no transition
         assert!(result["properties"].get("stable").is_some());
-        assert!(result["properties"]["stable"].get("x-ucp-schema-transition").is_none());
+        assert!(result["properties"]["stable"]
+            .get("x-ucp-schema-transition")
+            .is_none());
 
         // planned: present via include_future, transition metadata, not deprecated
         assert!(result["properties"].get("planned").is_some());
-        assert_eq!(result["properties"]["planned"]["x-ucp-schema-transition"]["from"], "omit");
+        assert_eq!(
+            result["properties"]["planned"]["x-ucp-schema-transition"]["from"],
+            "omit"
+        );
         assert!(result["properties"]["planned"].get("deprecated").is_none());
 
         // legacy: present (from=optional), transition metadata, deprecated=true
         assert!(result["properties"].get("legacy").is_some());
-        assert_eq!(result["properties"]["legacy"]["x-ucp-schema-transition"]["to"], "omit");
+        assert_eq!(
+            result["properties"]["legacy"]["x-ucp-schema-transition"]["to"],
+            "omit"
+        );
         assert_eq!(result["properties"]["legacy"]["deprecated"], true);
 
         // required: only stable (planned is omit-visibility, legacy is optional)
