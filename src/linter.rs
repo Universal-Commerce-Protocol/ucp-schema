@@ -629,7 +629,7 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
         }
     };
 
-    // Warn about unknown keys (catch typos like "protocl")
+    // Warn about unknown keys (catch typos)
     const KNOWN_REQUIRES_KEYS: &[&str] = &["protocol", "capabilities"];
     for key in obj.keys() {
         if !KNOWN_REQUIRES_KEYS.contains(&key.as_str()) {
@@ -1226,7 +1226,7 @@ mod tests {
             r#"{{
             "$id": "https://example.com/test.json",
             "requires": {{
-                "protocl": {{ "min": "2026-01-23" }}
+                "proto_version": {{ "min": "2026-01-23" }}
             }}
         }}"#
         )
@@ -1236,7 +1236,7 @@ mod tests {
         assert!(result
             .diagnostics
             .iter()
-            .any(|d| d.code == "W005" && d.message.contains("protocl")));
+            .any(|d| d.code == "W005" && d.message.contains("proto_version")));
     }
 
     #[test]

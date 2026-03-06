@@ -161,19 +161,19 @@ Options:
   --quiet, -q           Only show errors, suppress progress
 ```
 
-| Code | Category    | Issue                                                        | Severity |
-| ---- | ----------- | ------------------------------------------------------------ | -------- |
-| E001 | Syntax      | Invalid JSON                                                 | Error    |
-| E002 | References  | `$ref` to missing file                                       | Error    |
-| E003 | References  | `$ref` to missing anchor (`#/$defs/foo`)                     | Error    |
-| E004 | Annotations | Invalid visibility value or schema transition                | Error    |
-| E005 | Annotations | Invalid `ucp_*` type (must be string or object)              | Error    |
-| E006 | Requires    | Invalid `requires` structure (wrong types, bad version format) | Error  |
-| E007 | Requires    | `requires.capabilities` key not found in `$defs`             | Error    |
-| W002 | Hygiene     | Missing `$id` field                                          | Warning  |
-| W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`) | Warning  |
-| W004 | Requires    | Version constraint has `min` > `max`                         | Warning  |
-| W005 | Requires    | Unknown key in `requires` or version constraint              | Warning  |
+| Code | Category    | Issue                                                          | Severity |
+| ---- | ----------- | -------------------------------------------------------------- | -------- |
+| E001 | Syntax      | Invalid JSON                                                   | Error    |
+| E002 | References  | `$ref` to missing file                                         | Error    |
+| E003 | References  | `$ref` to missing anchor (`#/$defs/foo`)                       | Error    |
+| E004 | Annotations | Invalid visibility value or schema transition                  | Error    |
+| E005 | Annotations | Invalid `ucp_*` type (must be string or object)                | Error    |
+| E006 | Requires    | Invalid `requires` structure (wrong types, bad version format) | Error    |
+| E007 | Requires    | `requires.capabilities` key not found in `$defs`               | Error    |
+| W002 | Hygiene     | Missing `$id` field                                            | Warning  |
+| W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`)   | Warning  |
+| W004 | Requires    | Version constraint has `min` > `max`                           | Warning  |
+| W005 | Requires    | Unknown key in `requires` or version constraint                | Warning  |
 
 ```bash
 # Lint a directory of schemas
