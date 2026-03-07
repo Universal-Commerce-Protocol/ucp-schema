@@ -1,23 +1,23 @@
 # Universal Commerce Protocol (UCP) Codeowners
 
 # Default for all files.
-* @Universal-Commerce-Protocol/devops-maintainers
+* @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
 
 # Infrastructure & Tooling
-/.github/                 @Universal-Commerce-Protocol/devops-maintainers
-/Makefile                 @Universal-Commerce-Protocol/devops-maintainers
-/.gitignore               @Universal-Commerce-Protocol/devops-maintainers
-/Cargo.toml               @Universal-Commerce-Protocol/devops-maintainers
-/Cargo.lock               @Universal-Commerce-Protocol/devops-maintainers
-/.pre-commit-config.yaml  @Universal-Commerce-Protocol/devops-maintainers
+/.github/                 @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/Makefile                 @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/.gitignore               @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/Cargo.toml               @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/Cargo.lock               @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/.pre-commit-config.yaml  @Universal-Commerce-Protocol/devops-maintainers @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
 
 # Documentation, Tests & Core Schema
-/src/                     @Universal-Commerce-Protocol/maintainers
-/tests/                   @Universal-Commerce-Protocol/maintainers
-/fixtures/                @Universal-Commerce-Protocol/maintainers
-/README.md                @Universal-Commerce-Protocol/maintainers
-/FAQ.md                   @Universal-Commerce-Protocol/maintainers
+/src/                     @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/tests/                   @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/fixtures/                @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/README.md                @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
+/FAQ.md                   @Universal-Commerce-Protocol/maintainers @Universal-Commerce-Protocol/tech-council @Universal-Commerce-Protocol/governance-council
 
 # Governance
-/LICENSE                  @Universal-Commerce-Protocol/governance-council
+/LICENSE                 @Universal-Commerce-Protocol/governance-council
 /.github/CODEOWNERS       @Universal-Commerce-Protocol/governance-council
