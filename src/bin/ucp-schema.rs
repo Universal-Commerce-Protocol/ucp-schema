@@ -124,6 +124,12 @@ enum Commands {
         #[arg(long, default_value_t = false, action = clap::ArgAction::Set)]
         strict: bool,
 
+        /// Include future fields: omit-visibility fields with a transition targeting
+        /// non-omit (planned additions). Surfaces them with x-ucp-schema-transition
+        /// metadata but does not add to required.
+        #[arg(long)]
+        include_future: bool,
+
         /// Print pipeline stages to stderr for debugging
         #[arg(long, short)]
         verbose: bool,
@@ -235,6 +241,7 @@ fn main() -> ExitCode {
             schema_local_base,
             schema_remote_base,
             strict,
+            include_future,
             verbose,
         } => run_resolve(
             &schema,
@@ -247,6 +254,7 @@ fn main() -> ExitCode {
             schema_local_base,
             schema_remote_base,
             strict,
+            include_future,
             verbose,
         ),
 
@@ -323,6 +331,7 @@ fn run_resolve(
     schema_local_base: Option<PathBuf>,
     schema_remote_base: Option<String>,
     strict: bool,
+    include_future: bool,
     verbose: bool,
 ) -> Result<(), u8> {
     if verbose {
@@ -380,8 +389,22 @@ fn run_resolve(
             2u8
         })?;
 
-    let options = ResolveOptions::new(direction, &op).strict(strict);
+    let options = ResolveOptions::new(direction, &op)
+        .strict(strict)
+        .include_future(include_future);
     if verbose {
+        let mut flags = Vec::new();
+        if strict {
+            flags.push("strict");
+        }
+        if include_future {
+            flags.push("include-future");
+        }
+        let suffix = if flags.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", flags.join(", "))
+        };
         eprintln!(
             "[resolve] resolving for {}/{}{}",
             direction
@@ -389,7 +412,7 @@ fn run_resolve(
                 .strip_prefix("ucp_")
                 .unwrap_or(direction.annotation_key()),
             op,
-            if strict { " (strict)" } else { "" }
+            suffix
         );
     }
     let resolved = resolve(&schema, &options).map_err(cli_err(false))?;

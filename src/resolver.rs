@@ -365,7 +365,19 @@ fn resolve_properties(
 
         match visibility {
             Visibility::Omit => {
-                // Remove from properties and required
+                // Include future fields: currently omit but transitioning to non-omit.
+                // Completes transition lifecycle symmetry — deprecations (to=omit) are
+                // already surfaced; this surfaces planned additions (from=omit).
+                let is_future =
+                    options.include_future && transition.as_ref().is_some_and(|t| t.to != "omit");
+
+                if is_future {
+                    let resolved = resolve_value(prop_value, options, &prop_path)?;
+                    let mut stripped = strip_annotations(&resolved);
+                    apply_transition_metadata(&mut stripped, &transition);
+                    result.insert(prop_name.clone(), stripped);
+                    // NOT added to required — current visibility is omit
+                }
                 required.retain(|r| r != prop_name);
             }
             Visibility::Required => {
@@ -989,6 +1001,169 @@ mod tests {
             result["properties"]["id"]["x-ucp-schema-transition"]["description"],
             "Removing in v2."
         );
+    }
+
+    #[test]
+    fn resolve_include_future_surfaces_omit_to_nonomit_transition() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "existing": { "type": "string", "ucp_request": "required" },
+                "planned": {
+                    "type": "string",
+                    "description": "A future field.",
+                    "ucp_request": {
+                        "transition": {
+                            "from": "omit",
+                            "to": "required",
+                            "description": "Planned for v2."
+                        }
+                    }
+                }
+            }
+        });
+
+        // Without include_future: planned field is absent
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+        assert!(result["properties"].get("existing").is_some());
+        assert!(result["properties"].get("planned").is_none());
+
+        // With include_future: planned field is present with transition metadata
+        let options = ResolveOptions::new(Direction::Request, "create").include_future(true);
+        let result = resolve(&schema, &options).unwrap();
+        assert!(result["properties"].get("existing").is_some());
+        assert!(result["properties"].get("planned").is_some());
+
+        // Transition metadata is emitted
+        let transition = &result["properties"]["planned"]["x-ucp-schema-transition"];
+        assert_eq!(transition["from"], "omit");
+        assert_eq!(transition["to"], "required");
+        assert_eq!(transition["description"], "Planned for v2.");
+
+        // NOT in required (current visibility is omit)
+        let required = result.get("required").and_then(|r| r.as_array());
+        if let Some(req) = required {
+            assert!(!req.contains(&json!("planned")));
+        }
+
+        // Not marked deprecated (to != "omit")
+        assert!(result["properties"]["planned"].get("deprecated").is_none());
+    }
+
+    #[test]
+    fn resolve_include_future_does_not_surface_plain_omit() {
+        // A plain omit field (no transition) stays hidden even with include_future.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "hidden": { "type": "string", "ucp_request": "omit" }
+            }
+        });
+
+        let options = ResolveOptions::new(Direction::Request, "create").include_future(true);
+        let result = resolve(&schema, &options).unwrap();
+        assert!(result["properties"].get("hidden").is_none());
+    }
+
+    #[test]
+    fn resolve_include_future_per_operation_transition() {
+        // Transition scoped to a single operation: "search" is future, "lookup" is omit.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "like": {
+                    "type": "array",
+                    "ucp_request": {
+                        "search": {
+                            "transition": {
+                                "from": "omit",
+                                "to": "optional",
+                                "description": "Planned for search."
+                            }
+                        },
+                        "lookup": "omit"
+                    }
+                }
+            }
+        });
+
+        // search with include_future: like appears
+        let options = ResolveOptions::new(Direction::Request, "search").include_future(true);
+        let result = resolve(&schema, &options).unwrap();
+        assert!(result["properties"].get("like").is_some());
+        assert_eq!(
+            result["properties"]["like"]["x-ucp-schema-transition"]["to"],
+            "optional"
+        );
+
+        // lookup with include_future: like stays hidden (plain omit, no transition)
+        let options = ResolveOptions::new(Direction::Request, "lookup").include_future(true);
+        let result = resolve(&schema, &options).unwrap();
+        assert!(result["properties"].get("like").is_none());
+    }
+
+    #[test]
+    fn resolve_include_future_coexists_with_deprecated() {
+        // Three fields: normal, future (from=omit), deprecated (to=omit).
+        // All three should be present with include_future, each with correct metadata.
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "stable": { "type": "string", "ucp_request": "required" },
+                "planned": {
+                    "type": "string",
+                    "ucp_request": {
+                        "transition": {
+                            "from": "omit",
+                            "to": "optional",
+                            "description": "Coming soon."
+                        }
+                    }
+                },
+                "legacy": {
+                    "type": "string",
+                    "ucp_request": {
+                        "transition": {
+                            "from": "optional",
+                            "to": "omit",
+                            "description": "Being removed."
+                        }
+                    }
+                }
+            }
+        });
+
+        let options = ResolveOptions::new(Direction::Request, "create").include_future(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        // stable: present, no transition
+        assert!(result["properties"].get("stable").is_some());
+        assert!(result["properties"]["stable"]
+            .get("x-ucp-schema-transition")
+            .is_none());
+
+        // planned: present via include_future, transition metadata, not deprecated
+        assert!(result["properties"].get("planned").is_some());
+        assert_eq!(
+            result["properties"]["planned"]["x-ucp-schema-transition"]["from"],
+            "omit"
+        );
+        assert!(result["properties"]["planned"].get("deprecated").is_none());
+
+        // legacy: present (from=optional), transition metadata, deprecated=true
+        assert!(result["properties"].get("legacy").is_some());
+        assert_eq!(
+            result["properties"]["legacy"]["x-ucp-schema-transition"]["to"],
+            "omit"
+        );
+        assert_eq!(result["properties"]["legacy"]["deprecated"], true);
+
+        // required: only stable (planned is omit-visibility, legacy is optional)
+        let required = result["required"].as_array().unwrap();
+        assert!(required.contains(&json!("stable")));
+        assert!(!required.contains(&json!("planned")));
+        assert!(!required.contains(&json!("legacy")));
     }
 
     #[test]
