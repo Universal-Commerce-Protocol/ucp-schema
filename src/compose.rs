@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::error::ComposeError;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
-use crate::types::Direction;
+use crate::types::{Direction, Requires, VersionConstraint};
 
 #[cfg(feature = "remote")]
 use crate::loader::{bundle_refs_remote, load_schema_url};
@@ -304,6 +304,97 @@ fn fetch_profile(url: &str, schema_base: &SchemaBaseConfig) -> Result<Value, Com
     })
 }
 
+/// A version constraint violation found during composition.
+#[derive(Debug, Clone)]
+pub struct VersionViolation {
+    /// The extension that declared the constraint.
+    pub extension: String,
+    /// What was constrained ("protocol" or capability name).
+    pub target: String,
+    /// The declared constraint.
+    pub constraint: VersionConstraint,
+    /// The actual version found.
+    pub actual: String,
+}
+
+impl VersionViolation {
+    /// Format the constraint as a human-readable range string.
+    pub fn range_display(&self) -> String {
+        match &self.constraint.max {
+            Some(max) => format!("[{}, {}]", self.constraint.min, max),
+            None => format!(">= {}", self.constraint.min),
+        }
+    }
+}
+
+impl std::fmt::Display for VersionViolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "extension '{}' requires {} {} but found {}",
+            self.extension,
+            self.target,
+            self.range_display(),
+            self.actual
+        )
+    }
+}
+
+/// Check an extension schema's `requires` constraints against the available versions.
+///
+/// Returns a list of violations (empty if all constraints are satisfied).
+pub fn check_version_constraints(
+    extension_name: &str,
+    extension_schema: &Value,
+    protocol_version: Option<&str>,
+    capabilities: &[Capability],
+) -> Vec<VersionViolation> {
+    let Some(requires_val) = extension_schema.get("requires") else {
+        return vec![];
+    };
+
+    let requires = match Requires::parse(requires_val) {
+        Ok(r) => r,
+        Err(_) => return vec![], // Malformed requires is a lint error, not a compose error
+    };
+
+    let mut violations = Vec::new();
+
+    // Check protocol constraint
+    if let (Some(ref constraint), Some(version)) = (&requires.protocol, protocol_version) {
+        if !constraint.satisfied_by(version) {
+            violations.push(VersionViolation {
+                extension: extension_name.to_string(),
+                target: "protocol".to_string(),
+                constraint: constraint.clone(),
+                actual: version.to_string(),
+            });
+        }
+    }
+
+    // Check capability constraints
+    let cap_versions: HashMap<&str, &str> = capabilities
+        .iter()
+        .map(|c| (c.name.as_str(), c.version.as_str()))
+        .collect();
+
+    for (cap_name, constraint) in &requires.capabilities {
+        if let Some(&version) = cap_versions.get(cap_name.as_str()) {
+            if !constraint.satisfied_by(version) {
+                violations.push(VersionViolation {
+                    extension: extension_name.to_string(),
+                    target: cap_name.clone(),
+                    constraint: constraint.clone(),
+                    actual: version.to_string(),
+                });
+            }
+        }
+        // If capability isn't in the list, it won't be composed — not our problem
+    }
+
+    violations
+}
+
 /// Compose schema from capability declarations.
 ///
 /// 1. Finds root capability (no extends)
@@ -388,6 +479,19 @@ pub fn compose_schema(
                 message: e.to_string(),
             }
         })?;
+
+        // Check version constraints: if requires is declared and violated, fail.
+        // No requires = backwards compat (composer asserts compatibility).
+        let violations =
+            check_version_constraints(&ext.name, &ext_schema, Some(&root.version), capabilities);
+        if let Some(v) = violations.first() {
+            return Err(ComposeError::VersionConstraintViolation {
+                extension: v.extension.clone(),
+                target: v.target.clone(),
+                range: v.range_display(),
+                actual: v.actual.clone(),
+            });
+        }
 
         // Extract $defs[root.name] and inline any internal refs
         let defs = ext_schema
@@ -1050,5 +1154,368 @@ mod tests {
 
         let result = extract_jsonrpc_payload(&envelope, &capabilities);
         assert!(matches!(result, Err(ComposeError::InvalidEnvelope { .. })));
+    }
+
+    // -- compose_schema version constraint integration tests --
+
+    #[test]
+    fn compose_rejects_violated_protocol_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Root schema
+        let checkout_path = dir.path().join("checkout.json");
+        std::fs::write(
+            &checkout_path,
+            r#"{"type": "object", "properties": {"id": {"type": "string"}}}"#,
+        )
+        .unwrap();
+
+        // Extension schema with requires.protocol that won't be satisfied
+        let ext_path = dir.path().join("loyalty.json");
+        std::fs::write(
+            &ext_path,
+            r#"{
+                "requires": { "protocol": { "min": "2026-09-01" } },
+                "$defs": {
+                    "dev.ucp.shopping.checkout": {
+                        "type": "object",
+                        "properties": { "loyalty": { "type": "integer" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let capabilities = vec![
+            Capability {
+                name: "dev.ucp.shopping.checkout".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: checkout_path.to_str().unwrap().to_string(),
+                extends: None,
+            },
+            Capability {
+                name: "com.acme.loyalty".to_string(),
+                version: "2026-01-01".to_string(),
+                schema_url: ext_path.to_str().unwrap().to_string(),
+                extends: Some(vec!["dev.ucp.shopping.checkout".to_string()]),
+            },
+        ];
+
+        let config = SchemaBaseConfig::default();
+        let result = compose_schema(&capabilities, &config);
+        assert!(
+            matches!(result, Err(ComposeError::VersionConstraintViolation { .. })),
+            "expected VersionConstraintViolation, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn compose_rejects_violated_capability_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let checkout_path = dir.path().join("checkout.json");
+        std::fs::write(
+            &checkout_path,
+            r#"{"type": "object", "properties": {"id": {"type": "string"}}}"#,
+        )
+        .unwrap();
+
+        // Extension requires checkout >= 2026-09-01 but profile has 2026-06-01
+        let ext_path = dir.path().join("loyalty.json");
+        std::fs::write(
+            &ext_path,
+            r#"{
+                "requires": {
+                    "capabilities": {
+                        "dev.ucp.shopping.checkout": { "min": "2026-09-01" }
+                    }
+                },
+                "$defs": {
+                    "dev.ucp.shopping.checkout": {
+                        "type": "object",
+                        "properties": { "loyalty": { "type": "integer" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let capabilities = vec![
+            Capability {
+                name: "dev.ucp.shopping.checkout".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: checkout_path.to_str().unwrap().to_string(),
+                extends: None,
+            },
+            Capability {
+                name: "com.acme.loyalty".to_string(),
+                version: "2026-01-01".to_string(),
+                schema_url: ext_path.to_str().unwrap().to_string(),
+                extends: Some(vec!["dev.ucp.shopping.checkout".to_string()]),
+            },
+        ];
+
+        let config = SchemaBaseConfig::default();
+        let result = compose_schema(&capabilities, &config);
+        match &result {
+            Err(ComposeError::VersionConstraintViolation {
+                extension, target, ..
+            }) => {
+                assert_eq!(extension, "com.acme.loyalty");
+                assert_eq!(target, "dev.ucp.shopping.checkout");
+            }
+            other => panic!("expected VersionConstraintViolation, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn compose_succeeds_when_constraints_satisfied() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let checkout_path = dir.path().join("checkout.json");
+        std::fs::write(
+            &checkout_path,
+            r#"{"type": "object", "properties": {"id": {"type": "string"}}}"#,
+        )
+        .unwrap();
+
+        // Extension requires checkout >= 2026-01-23, profile has 2026-06-01 — satisfied
+        let ext_path = dir.path().join("loyalty.json");
+        std::fs::write(
+            &ext_path,
+            r#"{
+                "requires": {
+                    "protocol": { "min": "2026-01-23" },
+                    "capabilities": {
+                        "dev.ucp.shopping.checkout": { "min": "2026-01-23" }
+                    }
+                },
+                "$defs": {
+                    "dev.ucp.shopping.checkout": {
+                        "type": "object",
+                        "properties": { "loyalty": { "type": "integer" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let capabilities = vec![
+            Capability {
+                name: "dev.ucp.shopping.checkout".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: checkout_path.to_str().unwrap().to_string(),
+                extends: None,
+            },
+            Capability {
+                name: "com.acme.loyalty".to_string(),
+                version: "2026-01-01".to_string(),
+                schema_url: ext_path.to_str().unwrap().to_string(),
+                extends: Some(vec!["dev.ucp.shopping.checkout".to_string()]),
+            },
+        ];
+
+        let config = SchemaBaseConfig::default();
+        let result = compose_schema(&capabilities, &config);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    #[test]
+    fn compose_succeeds_without_requires() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let checkout_path = dir.path().join("checkout.json");
+        std::fs::write(
+            &checkout_path,
+            r#"{"type": "object", "properties": {"id": {"type": "string"}}}"#,
+        )
+        .unwrap();
+
+        // No requires — backwards compat
+        let ext_path = dir.path().join("discount.json");
+        std::fs::write(
+            &ext_path,
+            r#"{
+                "$defs": {
+                    "dev.ucp.shopping.checkout": {
+                        "type": "object",
+                        "properties": { "discounts": { "type": "array" } }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let capabilities = vec![
+            Capability {
+                name: "dev.ucp.shopping.checkout".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: checkout_path.to_str().unwrap().to_string(),
+                extends: None,
+            },
+            Capability {
+                name: "dev.ucp.shopping.discount".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: ext_path.to_str().unwrap().to_string(),
+                extends: Some(vec!["dev.ucp.shopping.checkout".to_string()]),
+            },
+        ];
+
+        let config = SchemaBaseConfig::default();
+        let result = compose_schema(&capabilities, &config);
+        assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    }
+
+    // -- Version constraint checking (standalone function) tests --
+
+    fn make_capabilities() -> Vec<Capability> {
+        vec![
+            Capability {
+                name: "dev.ucp.shopping.checkout".to_string(),
+                version: "2026-06-01".to_string(),
+                schema_url: "https://example.com/checkout.json".to_string(),
+                extends: None,
+            },
+            Capability {
+                name: "dev.ucp.shopping.fulfillment".to_string(),
+                version: "2026-03-01".to_string(),
+                schema_url: "https://example.com/fulfillment.json".to_string(),
+                extends: Some(vec!["dev.ucp.shopping.checkout".to_string()]),
+            },
+        ]
+    }
+
+    #[test]
+    fn version_constraints_satisfied() {
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "protocol": { "min": "2026-01-23" },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": { "min": "2026-01-23" }
+                }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn version_constraints_protocol_violation() {
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "protocol": { "min": "2026-09-01" }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].target, "protocol");
+    }
+
+    #[test]
+    fn version_constraints_capability_violation() {
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": { "min": "2026-09-01" }
+                }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert_eq!(violations.len(), 1);
+        assert_eq!(violations[0].target, "dev.ucp.shopping.checkout");
+        assert_eq!(violations[0].actual, "2026-06-01");
+    }
+
+    #[test]
+    fn version_constraints_max_exceeded() {
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": {
+                        "min": "2026-01-23",
+                        "max": "2026-03-01"
+                    }
+                }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert_eq!(violations.len(), 1);
+        assert!(violations[0]
+            .to_string()
+            .contains("[2026-01-23, 2026-03-01]"));
+    }
+
+    #[test]
+    fn version_constraints_no_requires() {
+        let caps = make_capabilities();
+        let schema = json!({ "type": "object" });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn version_constraints_no_protocol_version() {
+        // Protocol constraint present but no protocol version provided — skip check
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "protocol": { "min": "2026-09-01" }
+            }
+        });
+
+        let violations = check_version_constraints("com.acme.loyalty", &schema, None, &caps);
+        assert!(violations.is_empty());
+    }
+
+    #[test]
+    fn version_constraints_multiple_violations() {
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "protocol": { "min": "2026-09-01" },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": { "min": "2026-09-01" }
+                }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert_eq!(violations.len(), 2);
+        let targets: Vec<&str> = violations.iter().map(|v| v.target.as_str()).collect();
+        assert!(targets.contains(&"protocol"));
+        assert!(targets.contains(&"dev.ucp.shopping.checkout"));
+    }
+
+    #[test]
+    fn version_constraints_unknown_capability() {
+        // Constraint on a capability not in the list — no violation (not our problem)
+        let caps = make_capabilities();
+        let schema = json!({
+            "requires": {
+                "capabilities": {
+                    "dev.ucp.shopping.order": { "min": "2026-01-23" }
+                }
+            }
+        });
+
+        let violations =
+            check_version_constraints("com.acme.loyalty", &schema, Some("2026-06-01"), &caps);
+        assert!(violations.is_empty());
     }
 }
