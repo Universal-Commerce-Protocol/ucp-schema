@@ -216,6 +216,26 @@ fn bundle_refs_inner(
                     let ref_path =
                         resolve_ref_to_path(file_part, base_dir, url_local_base, url_remote_base);
 
+                    // If local resolution fails and the ref is a URL, try HTTP fetch
+                    #[cfg(feature = "remote")]
+                    let (loaded, ref_dir_owned) = if !ref_path.exists() && is_url(file_part) {
+                        let fetched = load_schema_url(file_part)?;
+                        // Remote schemas have no local directory; use base_dir for
+                        // any relative refs within the fetched schema
+                        (fetched, base_dir.to_path_buf())
+                    } else {
+                        let schema = load_schema(&ref_path)?;
+                        let dir = ref_path.parent().unwrap_or(base_dir).to_path_buf();
+                        (schema, dir)
+                    };
+
+                    #[cfg(not(feature = "remote"))]
+                    let (loaded, ref_dir_owned) = {
+                        let schema = load_schema(&ref_path)?;
+                        let dir = ref_path.parent().unwrap_or(base_dir).to_path_buf();
+                        (schema, dir)
+                    };
+
                     let canonical = ref_path.canonicalize().unwrap_or(ref_path.clone());
                     let visit_key = format!("{}|{}", canonical.display(), fragment.unwrap_or(""));
 
@@ -225,8 +245,6 @@ fn bundle_refs_inner(
                         });
                     }
 
-                    // Load file - this becomes the new file_root for internal refs
-                    let loaded = load_schema(&ref_path)?;
                     let mut target = if let Some(frag) = fragment {
                         navigate_fragment(&loaded, frag)?
                     } else {
@@ -234,11 +252,10 @@ fn bundle_refs_inner(
                     };
 
                     visited.insert(visit_key.clone());
-                    let ref_dir = ref_path.parent().unwrap_or(base_dir);
                     // Pass loaded file as file_root so internal refs resolve against it
                     bundle_refs_inner(
                         &mut target,
-                        ref_dir,
+                        &ref_dir_owned,
                         Some(&loaded),
                         url_local_base,
                         url_remote_base,

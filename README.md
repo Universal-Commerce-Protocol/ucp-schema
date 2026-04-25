@@ -87,7 +87,7 @@ Options:
   --pretty                    Pretty-print JSON output
   --output <path>             Write to file instead of stdout
   --bundle                    Inline external $ref pointers (schema input only; payloads bundle automatically)
-  --schema-local-base <dir>   Local directory for schema resolution (payload input only)
+  --schema-local-base <dir>   Local directory for schema resolution
   --schema-remote-base <url>  URL prefix to strip when mapping to local
   --strict                    Inject additionalProperties: false (see Concepts > Strict Mode)
   --verbose, -v               Print pipeline stages to stderr
@@ -102,6 +102,14 @@ ucp-schema resolve response.json --op read --schema-local-base ./schemas
 
 # Bundle external $refs into a self-contained schema
 ucp-schema resolve checkout.json --request --op create --bundle --pretty
+
+# Bundle a 3P extension with absolute URL refs (maps URLs to local copies)
+ucp-schema resolve my_extension.json --response --op read --bundle \
+  --schema-remote-base "https://ucp.dev/schemas" \
+  --schema-local-base ./local-ucp-schemas
+
+# Bundle a 3P extension with absolute URL refs (fetches from network)
+ucp-schema resolve my_extension.json --response --op read --bundle
 
 # Resolve from URL
 ucp-schema resolve https://ucp.dev/schemas/checkout.json --request --op create
@@ -454,7 +462,7 @@ ucp-schema validate order.json --schema checkout.json --request --op create
 
 #### Local Resolution
 
-When working offline or testing schema changes, `--schema-local-base` maps schema URL paths to local files:
+When working offline or testing schema changes, `--schema-local-base` maps schema URL paths to local files. This applies to self-describing payloads (capability schema URLs), explicit `--schema` input, and `--bundle` mode (absolute URL `$ref` values in schema files):
 
 ```bash
 # Schema URL: https://ucp.dev/schemas/shopping/checkout.json
