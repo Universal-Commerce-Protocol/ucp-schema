@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.2.0...v1.3.0) (2026-04-29)
+
+
+### Features
+
+* support URL mapping in `resolve --bundle` + `validate --schema` ([#27](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/27)) ([be4400e](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/be4400e94796555a2a43f6b3adf346f4b21f8ed1))
+
 ## [1.2.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.1.0...v1.2.0) (2026-03-10)
 
 
