@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vendor.example.com/schemas/shopping/absolute_ref_extension.json",
+  "name": "com.example.absolute",
+  "version": "2026-01-11",
+  "title": "Extension with absolute URL refs",
+  "description": "Test fixture: a 3P extension schema that references UCP core types via absolute URLs.",
+  "type": "object",
+  "properties": {
+    "checkout": {
+      "$ref": "https://ucp.dev/schemas/shopping/checkout.json"
+    }
+  }
+}

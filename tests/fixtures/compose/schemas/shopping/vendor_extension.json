@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vendor.example.com/schemas/shopping/vendor_extension.json",
+  "name": "com.example.vendor.loyalty",
+  "version": "2026-01-11",
+  "title": "Vendor Loyalty Extension",
+  "description": "3P extension with absolute URL refs to UCP core types.",
+  "$defs": {
+    "loyalty_points": {
+      "type": "object",
+      "properties": {
+        "earned": { "type": "integer", "minimum": 0 },
+        "redeemed": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "dev.ucp.shopping.checkout": {
+      "title": "Checkout with Loyalty",
+      "description": "Checkout extended with loyalty points.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string", "ucp_response": "required" },
+        "status": { "type": "string", "ucp_response": "required" },
+        "loyalty": { "$ref": "#/$defs/loyalty_points" }
+      }
+    }
+  }
+}

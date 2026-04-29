@@ -342,14 +342,9 @@ fn run_resolve(
     // Auto-detect: is this a payload (needs compose) or a schema (resolve directly)?
     let detected = detect_direction(&input);
 
-    // Flag validation: reject flags that don't apply to the detected input type
-    if detected.is_some() {
-        if bundle {
-            report_error(false, "--bundle does not apply to payload input (schemas are auto-composed from capabilities). Remove --bundle, or pass a schema file instead of a payload.");
-            return Err(2);
-        }
-    } else if schema_local_base.is_some() || schema_remote_base.is_some() {
-        report_error(false, "--schema-local-base/--schema-remote-base only apply to payload input. Remove these flags, or pass a self-describing payload instead of a schema file.");
+    // Flag validation: --bundle only applies to schema file input, not payloads
+    if detected.is_some() && bundle {
+        report_error(false, "--bundle does not apply to payload input (schemas are auto-composed from capabilities). Remove --bundle, or pass a schema file instead of a payload.");
         return Err(2);
     }
 
@@ -371,10 +366,22 @@ fn run_resolve(
         // Input is a schema file — bundle $refs if requested
         if bundle {
             if verbose {
-                eprintln!("[bundle] inlining $ref pointers");
+                match (schema_local_base.as_deref(), schema_remote_base.as_deref()) {
+                    (Some(local), Some(remote)) => eprintln!(
+                        "[bundle] inlining $ref pointers (mapping {} -> {})",
+                        remote,
+                        local.display()
+                    ),
+                    _ => eprintln!("[bundle] inlining $ref pointers"),
+                }
             }
-            let base_dir = Path::new(schema_source).parent().unwrap_or(Path::new("."));
-            bundle_refs(&mut input, base_dir).map_err(cli_err_ctx(false, "bundling refs"))?;
+            bundle_local_refs(
+                &mut input,
+                schema_source,
+                &schema_local_base,
+                &schema_remote_base,
+                false,
+            )?;
         }
         input
     };
@@ -483,12 +490,9 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
         verbose,
     } = args;
 
-    // Flag validation: --schema-local-base/--schema-remote-base don't apply with
-    // explicit --schema (composition is bypassed, so these would silently do nothing)
-    if schema_source.is_some() && (schema_local_base.is_some() || schema_remote_base.is_some()) {
-        report_error(json_output, "--schema-local-base/--schema-remote-base do not apply with explicit --schema (composition is bypassed). Remove these flags, or remove --schema to use self-describing mode.");
-        return Err(2);
-    }
+    // Note: --schema-local-base/--schema-remote-base apply to both modes:
+    // - Self-describing: passed to compose for capability schema URL resolution
+    // - Explicit --schema: used for URL-to-local mapping when bundling $ref values
 
     let config = SchemaBaseConfig {
         local_base: schema_local_base.as_deref(),
