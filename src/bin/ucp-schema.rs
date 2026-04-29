@@ -365,25 +365,23 @@ fn run_resolve(
         }
         // Input is a schema file — bundle $refs if requested
         if bundle {
-            let base_dir = Path::new(schema_source).parent().unwrap_or(Path::new("."));
-            if let (Some(local_base), Some(remote_base)) =
-                (schema_local_base.as_deref(), schema_remote_base.as_deref())
-            {
-                if verbose {
-                    eprintln!(
+            if verbose {
+                match (schema_local_base.as_deref(), schema_remote_base.as_deref()) {
+                    (Some(local), Some(remote)) => eprintln!(
                         "[bundle] inlining $ref pointers (mapping {} -> {})",
-                        remote_base,
-                        local_base.display()
-                    );
+                        remote,
+                        local.display()
+                    ),
+                    _ => eprintln!("[bundle] inlining $ref pointers"),
                 }
-                bundle_refs_with_url_mapping(&mut input, base_dir, local_base, remote_base)
-                    .map_err(cli_err_ctx(false, "bundling refs"))?;
-            } else {
-                if verbose {
-                    eprintln!("[bundle] inlining $ref pointers");
-                }
-                bundle_refs(&mut input, base_dir).map_err(cli_err_ctx(false, "bundling refs"))?;
             }
+            bundle_local_refs(
+                &mut input,
+                schema_source,
+                &schema_local_base,
+                &schema_remote_base,
+                false,
+            )?;
         }
         input
     };
