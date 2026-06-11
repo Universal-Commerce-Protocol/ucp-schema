@@ -127,6 +127,28 @@ The validator:
 2. Extracts `$defs[root_name]` from each extension
 3. Composes them with `allOf`
 
+If the capability is a **container** (see below), repeat the base's operation keys instead: `$defs[root_name]` is itself `{ "$defs": { "<op>_<direction>": ... } }`, and the tool merges one shape at a time.
+
+---
+
+## How do I validate a catalog (or other container) capability?
+
+When a capability's request and response are different objects (a search request is a query; its response, a list of products), one file holds each shape under `$defs`, named `{op}_{direction}`. Validate by naming the operation and direction:
+
+```bash
+ucp-schema validate search-response.json --op search --response --schema-local-base ./schemas
+```
+
+The operation, not just direction, selects the shape — `catalog.lookup` holds both `lookup` and `get_product`. A missing shape errors, never passes.
+
+For shapes that aren't an operation+direction (a transport's `error_response`, a profile's `business_schema`, `cart` → `checkout`), name the `$def` with `--def`:
+
+```bash
+ucp-schema validate envelope.json --schema transports/jsonrpc.json --op read --def error_response
+```
+
+See [Container Capabilities](./README.md#container-capabilities) for the full picture.
+
 ---
 
 ## Can extensions remove required fields from the base schema?

@@ -22,14 +22,16 @@ For example, a field annotated with `"ucp_request": {"create": "omit", "update":
 
 **"I want to..."**
 
-| Goal                                                | Command                                                         |
-| --------------------------------------------------- | --------------------------------------------------------------- |
-| Inspect the composed schema (annotations preserved) | `compose payload.json --schema-local-base ./schemas --pretty`   |
-| Get JSON Schema for an operation                    | `resolve payload.json --op read --schema-local-base ./schemas`  |
-| Resolve a single schema file (no composition)       | `resolve schema.json --request --op create`                     |
-| Validate a payload end-to-end                       | `validate payload.json --op read --schema-local-base ./schemas` |
-| Check schemas for errors before runtime             | `lint schemas/`                                                 |
-| Debug what the pipeline is doing                    | Add `--verbose` to any command                                  |
+| Goal                                                | Command                                                                       |
+| --------------------------------------------------- | ----------------------------------------------------------------------------- |
+| Inspect the composed schema (annotations preserved) | `compose payload.json --schema-local-base ./schemas --pretty`                 |
+| Get JSON Schema for an operation                    | `resolve payload.json --op read --schema-local-base ./schemas`                |
+| Resolve a single schema file (no composition)       | `resolve schema.json --request --op create`                                   |
+| Validate a payload end-to-end                       | `validate payload.json --op read --schema-local-base ./schemas`               |
+| Validate a catalog (container) response             | `validate response.json --op search --response --schema-local-base ./schemas` |
+| Validate against a named shape (request/error/view) | `validate payload.json --schema s.json --op read --def error_response`        |
+| Check schemas for errors before runtime             | `lint schemas/`                                                               |
+| Debug what the pipeline is doing                    | Add `--verbose` to any command                                                |
 
 ## Installation
 
@@ -83,7 +85,11 @@ ucp-schema resolve <payload> --op <operation> --schema-local-base <dir> [options
 
 Options:
   --request / --response      Direction (required for schema input, auto-inferred for payloads)
-  --op <operation>            Operation: create, read, update, complete
+  --op <operation>            Operation; drives annotation visibility and, for
+                              container capabilities, the {op}_{direction} shape
+                              (create/read/update/complete; search/lookup/get_product)
+  --def <name>                Output a single $defs entry instead of the full
+                              schema (container capabilities; see Concepts)
   --pretty                    Pretty-print JSON output
   --output <path>             Write to file instead of stdout
   --bundle                    Inline external $ref pointers (schema input only; payloads bundle automatically)
@@ -124,7 +130,11 @@ Options:
   --schema <path|url>          Explicit schema (skips self-describing detection)
   --profile <path|url>         Agent profile (REST request pattern)
   --request / --response       Direction (required with --schema, auto-detected otherwise)
-  --op <operation>             Operation: create, read, update, complete
+  --op <operation>             Operation; drives annotation visibility and, for
+                               container capabilities, the {op}_{direction} shape
+                               (create/read/update/complete; search/lookup/get_product)
+  --def <name>                 Validate against an explicit $defs entry, overriding
+                               {op}_{direction} (see Concepts > Container Capabilities)
   --schema-local-base <dir>    Local directory to resolve schema URLs
   --schema-remote-base <url>   URL prefix to strip when mapping to local
   --strict                     Reject unknown fields (see Concepts > Strict Mode)
@@ -422,6 +432,66 @@ Extension schemas can declare which protocol and capability versions they depend
 ```
 
 Each constraint is an object with a required `min` and optional `max` (both inclusive). Keys in `requires.capabilities` must be a subset of `$defs` keys. Schemas without `requires` compose as before — the composer asserts compatibility.
+
+### Container Capabilities
+
+Typically a capability's request and response are the **same object** — you send a checkout, you get a checkout back. Fields differ by direction and operation (clients omit server-set fields), but it's one shape, handled by [visibility annotations](#visibility-rules). `checkout.json` is that object; validate against it directly.
+
+Sometimes they're **different objects**: a search request is a query, a search response is a list of products — too different for one annotated object to cover both. Then a single file carries each shape under `$defs`, named `{op}_{direction}`:
+
+```json
+{
+  "name": "dev.ucp.shopping.catalog.search",
+  "type": "object",
+  "$defs": {
+    "search_request": {},
+    "search_response": {}
+  }
+}
+```
+
+Such a schema is a **container**: the root is just a namespace of shapes. A file can hold more than two — `catalog_lookup.json` has a request and response for both `lookup` and `get_product`. (Detected structurally: `$defs` but no root body — no `properties`, `allOf`, or `$ref`.)
+
+**Picking the shape.** Validating a container means choosing which `$def` to match — two ways:
+
+- **By operation + direction (default).** `--op search --response` picks `search_response`. The operation matters, not just direction — `catalog.lookup` holds both `lookup` and `get_product`. A missing shape errors, never passes.
+- **By name (`--def`).** Name the `$def` directly, for shapes that aren't an operation+direction: a transport's `error_response`, a profile's `business_schema`, or a sub-object (`--def checkout` on a cart). Works on any schema; overrides the default.
+
+`validate` always picks one shape; `resolve` returns the whole schema unless given `--def`.
+
+```bash
+# Default: shape derived from operation + direction
+ucp-schema validate search-response.json --op search --response --schema-local-base ./schemas
+
+# By name: a shape that isn't an operation/direction
+ucp-schema validate envelope.json --schema transports/jsonrpc.json --op read --def error_response
+```
+
+**Extending a container.** A normal extension adds fields to one object; a container extension adds them _per shape_. Under `$defs[<capability>]`, repeat the `{op}_{direction}` keys and `allOf` each onto the base — the tool merges per shape, so `search_response` becomes `allOf[base, extension]`.
+
+```json
+{
+  "$id": "https://ucp.dev/schemas/shopping/fulfillment.json",
+  "name": "dev.ucp.shopping.fulfillment",
+  "$defs": {
+    "dev.ucp.shopping.catalog.search": {
+      "$defs": {
+        "search_response": {
+          "allOf": [
+            { "$ref": "catalog_search.json#/$defs/search_response" },
+            {
+              "type": "object",
+              "properties": {
+                "products": { "items": { "$ref": "#/$defs/ful_product" } }
+              }
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+```
 
 ### Validation Modes
 
