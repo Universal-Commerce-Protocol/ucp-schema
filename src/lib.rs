@@ -65,7 +65,8 @@ mod validator;
 pub use compose::{
     capability_short_name, check_version_constraints, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, Capability, DetectedDirection, SchemaBaseConfig, VersionViolation,
+    extract_jsonrpc_payload, is_container_schema, Capability, DetectedDirection, SchemaBaseConfig,
+    VersionViolation,
 };
 pub use error::{ComposeError, ResolveError, SchemaError, ValidateError};
 pub use linter::{lint, lint_file, Diagnostic, FileResult, FileStatus, LintResult, Severity};
@@ -75,7 +76,7 @@ pub use loader::{
 };
 pub use resolver::{resolve, strip_annotations};
 pub use types::{Direction, Requires, ResolveOptions, VersionConstraint, Visibility};
-pub use validator::{validate, validate_against_schema};
+pub use validator::{select_operation_schema, validate, validate_against_schema};
 
 #[cfg(feature = "remote")]
 pub use loader::{bundle_refs_remote, load_schema_url};

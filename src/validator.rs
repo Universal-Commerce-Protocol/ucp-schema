@@ -1,30 +1,87 @@
 //! Payload validation against resolved schemas.
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 
+use crate::compose::is_container_schema;
 use crate::error::{ResolveError, SchemaError, ValidateError};
 use crate::resolver::resolve;
 use crate::types::ResolveOptions;
 
 /// Validate a payload against a UCP schema.
 ///
-/// Resolves the schema for the given direction and operation, then validates
-/// the payload against the resolved schema.
+/// Resolves the schema for the given direction and operation, selects the
+/// operation shape for container-shaped capabilities, then validates the
+/// payload against the resulting schema.
 ///
 /// # Errors
 ///
-/// Returns `ValidateError::Resolve` if schema resolution fails, or
-/// `ValidateError::Invalid` if the payload doesn't match the schema.
+/// Returns `ValidateError::Resolve` if schema resolution or operation-shape
+/// selection fails, or `ValidateError::Invalid` if the payload doesn't match.
 pub fn validate(
     schema: &Value,
     payload: &Value,
     options: &ResolveOptions,
 ) -> Result<(), ValidateError> {
-    // First resolve the schema
     let resolved = resolve(schema, options)?;
 
-    // Then validate against resolved schema
-    validate_against_schema(&resolved, payload)
+    // The message body to validate depends on the capability's shape:
+    // single-object capabilities validate at the root; container capabilities
+    // validate at the selected operation shape.
+    let target = select_operation_schema(&resolved, options)?;
+
+    validate_against_schema(&target, payload)
+}
+
+/// Resolve a (possibly container-shaped) schema to its validation target.
+///
+/// For a single-object capability the target is the root, returned unchanged.
+/// For a container capability (see [`crate::is_container_schema`]) the target is
+/// the message body for this `(op, direction)`, held at `$defs/{op}_{direction}`;
+/// this roots validation there via a `$ref` while keeping the sibling `$defs`
+/// and `$schema` in scope so internal refs and the dialect still resolve.
+///
+/// A container root carries no body of its own, so an absent `{op}_{direction}`
+/// is reported as `OperationShapeNotFound` rather than falling through to an
+/// unconstrained root.
+pub fn select_operation_schema(
+    schema: &Value,
+    options: &ResolveOptions,
+) -> Result<Value, ResolveError> {
+    if !is_container_schema(schema) {
+        return Ok(schema.clone());
+    }
+
+    let key = format!("{}_{}", options.operation, options.direction.dir_str());
+    let defs = schema.get("$defs").and_then(|d| d.as_object());
+
+    let has_key = defs.map(|d| d.contains_key(&key)).unwrap_or(false);
+    if !has_key {
+        let available = defs
+            .map(|d| {
+                d.keys()
+                    .filter(|k| k.ends_with("_request") || k.ends_with("_response"))
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return Err(ResolveError::OperationShapeNotFound { key, available });
+    }
+
+    // Thin wrapper rooted at the operation shape. `$ref` + sibling `$defs` is
+    // valid JSON Schema 2020-12 and keeps every sibling def resolvable.
+    let mut wrapper = Map::new();
+    if let Some(s) = schema.get("$schema") {
+        wrapper.insert("$schema".to_string(), s.clone());
+    }
+    wrapper.insert(
+        "$ref".to_string(),
+        Value::String(format!("#/$defs/{}", key)),
+    );
+    if let Some(defs) = schema.get("$defs") {
+        wrapper.insert("$defs".to_string(), defs.clone());
+    }
+    Ok(Value::Object(wrapper))
 }
 
 /// Validate a payload against an already-resolved schema.

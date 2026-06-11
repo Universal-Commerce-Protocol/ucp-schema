@@ -459,7 +459,10 @@ pub fn compose_schema(
         .filter(|c| c.extends.is_some())
         .collect();
 
-    // If no extensions, just return the root schema
+    // No extensions: the capability schema stands alone. For a single-object
+    // capability this root is the message body; for a container it is the
+    // namespace of `{op}_{direction}` shapes. The operation shape, if any, is
+    // chosen downstream by `select_operation_schema`.
     if extensions.is_empty() {
         return resolve_schema_url(&root.schema_url, schema_base).map_err(|e| {
             ComposeError::SchemaFetch {
@@ -469,8 +472,19 @@ pub fn compose_schema(
         });
     }
 
-    // Compose: for each extension, extract $defs[root.name]
-    let mut all_of_schemas = Vec::new();
+    // Load the root schema to classify the capability (single-object vs
+    // container) and, for a container, to seed the per-operation merge with the
+    // base's `$defs`.
+    let root_schema = resolve_schema_url(&root.schema_url, schema_base).map_err(|e| {
+        ComposeError::SchemaFetch {
+            url: root.schema_url.clone(),
+            message: e.to_string(),
+        }
+    })?;
+    let container = is_container_schema(&root_schema);
+
+    // Compose: for each extension, extract its self-contained `$defs[root.name]`.
+    let mut ext_defs = Vec::new();
 
     for ext in &extensions {
         let ext_schema = resolve_schema_url(&ext.schema_url, schema_base).map_err(|e| {
@@ -512,11 +526,115 @@ pub fn compose_schema(
         let mut inlined = ext_def.clone();
         inline_internal_refs(&mut inlined, defs);
 
-        all_of_schemas.push(inlined);
+        ext_defs.push(inlined);
     }
 
-    // Compose into single schema with allOf
-    Ok(json!({ "allOf": all_of_schemas }))
+    // Composition follows the same single-object vs container split: a
+    // single-object body is extended once at the root; a container is extended
+    // per operation shape. Both use `allOf`, and in both the base is included
+    // because each extension re-`$ref`s it.
+    if container {
+        compose_container(&root_schema, &extensions, &ext_defs, &root.name)
+    } else {
+        Ok(json!({ "allOf": ext_defs }))
+    }
+}
+
+/// Returns true if a capability schema is "container-shaped".
+///
+/// A UCP capability schema takes one of two structural forms, and the whole
+/// compose/select pipeline branches on this distinction:
+///
+/// - **Single-object** (e.g. checkout, cart): the schema root *is* the message
+///   body. A single object serves every operation and direction; the per-op /
+///   per-direction differences are expressed with visibility annotations on
+///   that one object. The validation target is the root itself.
+/// - **Container** (e.g. catalog.search, catalog.lookup): the schema is a
+///   namespace of several distinct message bodies, each held under `$defs` and
+///   keyed `{op}_{direction}` (e.g. `search_request`, `get_product_response`).
+///   The root carries no body of its own; the body for a given operation and
+///   direction is the corresponding `$defs` entry, chosen at compose/validate
+///   time (see [`compose_container`] and `select_operation_schema`).
+///
+/// Detected structurally: a container has `$defs` but no object body at the
+/// root (no `properties`, `allOf`, or `$ref`).
+pub fn is_container_schema(schema: &Value) -> bool {
+    match schema.as_object() {
+        Some(obj) => {
+            obj.contains_key("$defs")
+                && !obj.contains_key("properties")
+                && !obj.contains_key("allOf")
+                && !obj.contains_key("$ref")
+        }
+        None => false,
+    }
+}
+
+/// Compose a container-shaped capability with its extensions, merging per
+/// operation shape.
+///
+/// The result is a container with the same `$defs/{op}_{direction}` keys as the
+/// base; for any operation an extension touches, the shape becomes an `allOf` of
+/// the extension contributions (each of which re-`$ref`s the base shape, so base
+/// constraints are preserved). Base helper defs (e.g. `lookup_variant`) and
+/// operation shapes no extension touches are carried through unchanged.
+fn compose_container(
+    root_schema: &Value,
+    extensions: &[&Capability],
+    ext_defs: &[Value],
+    capability: &str,
+) -> Result<Value, ComposeError> {
+    // Seed with the base container's $defs (operation shapes + helper defs).
+    let mut merged_defs: serde_json::Map<String, Value> = root_schema
+        .get("$defs")
+        .and_then(|d| d.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    // Collect per-operation contributions in first-seen order (deterministic).
+    let mut order: Vec<String> = Vec::new();
+    let mut per_op: HashMap<String, Vec<Value>> = HashMap::new();
+
+    for (ext, inlined) in extensions.iter().zip(ext_defs.iter()) {
+        // A container extension's $defs[<capability>] must itself be a container:
+        // { "$defs": { "<op>_<direction>": <shape>, ... } } mirroring the base.
+        let nested = inlined
+            .get("$defs")
+            .and_then(|d| d.as_object())
+            .ok_or_else(|| ComposeError::ContainerExtensionShape {
+                extension: ext.name.clone(),
+                capability: capability.to_string(),
+            })?;
+
+        for (op_key, shape) in nested {
+            if !per_op.contains_key(op_key) {
+                order.push(op_key.clone());
+            }
+            per_op
+                .entry(op_key.clone())
+                .or_default()
+                .push(shape.clone());
+        }
+    }
+
+    // Fold contributions into the base $defs (overwriting the base op shape; the
+    // extension re-`$ref`s the base, so its constraints come through the allOf).
+    for op_key in order {
+        let contribs = per_op.remove(&op_key).unwrap();
+        let merged = if contribs.len() == 1 {
+            contribs.into_iter().next().unwrap()
+        } else {
+            json!({ "allOf": contribs })
+        };
+        merged_defs.insert(op_key, merged);
+    }
+
+    let mut result = root_schema.clone();
+    result
+        .as_object_mut()
+        .expect("container root is an object")
+        .insert("$defs".to_string(), Value::Object(merged_defs));
+    Ok(result)
 }
 
 /// Inline internal `#/$defs/...` refs from the parent schema.

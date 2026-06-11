@@ -33,6 +33,19 @@ pub enum ComposeError {
         expected_key: String,
     },
 
+    /// A container-shaped capability (request/response shapes live under
+    /// `$defs/{op}_{direction}`) is extended by a schema whose `$defs[<capability>]`
+    /// is not itself a container of operation shapes. Container extensions MUST
+    /// mirror the base's operation keys (e.g. `{ "$defs": { "search_response": ... } }`).
+    #[error(
+        "extension '{extension}' does not mirror container capability '{capability}': \
+         its $defs['{capability}'] must contain a nested $defs of operation shapes"
+    )]
+    ContainerExtensionShape {
+        extension: String,
+        capability: String,
+    },
+
     #[error("failed to fetch schema from {url}: {message}")]
     SchemaFetch { url: String, message: String },
 
@@ -129,6 +142,16 @@ pub enum ResolveError {
 
     #[error("invalid schema: {message}")]
     InvalidSchema { message: String },
+
+    /// A container-shaped capability schema has no message body for the
+    /// requested `(op, direction)`. The body lives at `$defs/{op}_{direction}`;
+    /// because a container root has no body of its own, an absent key is a hard
+    /// error rather than a fall-through to an unconstrained root.
+    #[error(
+        "container schema has no operation shape '{key}' for this (op, direction); \
+         available operation shapes: [{available}]"
+    )]
+    OperationShapeNotFound { key: String, available: String },
 
     #[error("failed to bundle schema: {message}")]
     BundleError { message: String },

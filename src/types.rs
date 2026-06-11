@@ -49,6 +49,18 @@ impl Direction {
         }
     }
 
+    /// Returns the bare direction string ("request" / "response").
+    ///
+    /// Used to build container operation-shape keys (`{op}_{direction}`,
+    /// e.g. `search_response`) when selecting the validation target for
+    /// container-shaped capabilities.
+    pub fn dir_str(&self) -> &'static str {
+        match self {
+            Direction::Request => "request",
+            Direction::Response => "response",
+        }
+    }
+
     /// Create direction from a request flag (true = Request, false = Response).
     pub fn from_request_flag(is_request: bool) -> Self {
         if is_request {
