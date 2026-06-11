@@ -34,49 +34,82 @@ pub fn validate(
 
 /// Resolve a (possibly container-shaped) schema to its validation target.
 ///
-/// For a single-object capability the target is the root, returned unchanged.
-/// For a container capability (see [`crate::is_container_schema`]) the target is
-/// the message body for this `(op, direction)`, held at `$defs/{op}_{direction}`;
-/// this roots validation there via a `$ref` while keeping the sibling `$defs`
-/// and `$schema` in scope so internal refs and the dialect still resolve.
+/// Selection has two modes:
 ///
-/// A container root carries no body of its own, so an absent `{op}_{direction}`
-/// is reported as `OperationShapeNotFound` rather than falling through to an
-/// unconstrained root.
+/// - **Explicit** (`options.def_name`): root at the named `$defs` entry,
+///   regardless of schema shape. Names non-derivable shapes — transport message
+///   types (`error_response`), host views (`business_schema`) — and sub-types of
+///   single-object schemas (`cart` → `checkout`), where the root has a body but
+///   a fragment is being validated. Absent name → `DefNotFound`.
+/// - **Derived** (no `def_name`): single-object capabilities validate at the
+///   root unchanged; for a container capability (see
+///   [`crate::is_container_schema`]) the target is the message body for this
+///   `(op, direction)`, held at `$defs/{op}_{direction}`. A container root has
+///   no body of its own, so an absent shape → `OperationShapeNotFound` rather
+///   than a fall-through to an unconstrained root.
+///
+/// Either way the chosen `$def` is rooted via a `$ref` that keeps the sibling
+/// `$defs` and `$schema` in scope, so internal refs and the dialect resolve.
 pub fn select_operation_schema(
     schema: &Value,
     options: &ResolveOptions,
 ) -> Result<Value, ResolveError> {
+    if let Some(def) = &options.def_name {
+        return select_def(schema, def, SelectMode::Explicit);
+    }
     if !is_container_schema(schema) {
         return Ok(schema.clone());
     }
-
     let key = format!("{}_{}", options.operation, options.direction.dir_str());
-    let defs = schema.get("$defs").and_then(|d| d.as_object());
+    select_def(schema, &key, SelectMode::Derived)
+}
 
-    let has_key = defs.map(|d| d.contains_key(&key)).unwrap_or(false);
-    if !has_key {
+/// Whether the selected `$def` name was authored (`--def`) or computed from
+/// `(op, direction)`. Only affects which "available" hint and error variant a
+/// miss produces.
+enum SelectMode {
+    Explicit,
+    Derived,
+}
+
+/// Root validation at `$defs/{name}` via a `$ref` wrapper that retains the
+/// sibling `$defs` and `$schema`.
+fn select_def(schema: &Value, name: &str, mode: SelectMode) -> Result<Value, ResolveError> {
+    let defs = schema.get("$defs").and_then(|d| d.as_object());
+    let present = defs.map(|d| d.contains_key(name)).unwrap_or(false);
+    if !present {
         let available = defs
-            .map(|d| {
-                d.keys()
+            .map(|d| match mode {
+                // Derived selection only ever targets operation shapes, so the
+                // hint lists those; explicit selection can name any $def.
+                SelectMode::Derived => d
+                    .keys()
                     .filter(|k| k.ends_with("_request") || k.ends_with("_response"))
                     .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                    .collect::<Vec<_>>(),
+                SelectMode::Explicit => d.keys().cloned().collect::<Vec<_>>(),
             })
-            .unwrap_or_default();
-        return Err(ResolveError::OperationShapeNotFound { key, available });
+            .unwrap_or_default()
+            .join(", ");
+        return Err(match mode {
+            SelectMode::Derived => ResolveError::OperationShapeNotFound {
+                key: name.to_string(),
+                available,
+            },
+            SelectMode::Explicit => ResolveError::DefNotFound {
+                def: name.to_string(),
+                available,
+            },
+        });
     }
 
-    // Thin wrapper rooted at the operation shape. `$ref` + sibling `$defs` is
-    // valid JSON Schema 2020-12 and keeps every sibling def resolvable.
     let mut wrapper = Map::new();
     if let Some(s) = schema.get("$schema") {
         wrapper.insert("$schema".to_string(), s.clone());
     }
     wrapper.insert(
         "$ref".to_string(),
-        Value::String(format!("#/$defs/{}", key)),
+        Value::String(format!("#/$defs/{}", name)),
     );
     if let Some(defs) = schema.get("$defs") {
         wrapper.insert("$defs".to_string(), defs.clone());

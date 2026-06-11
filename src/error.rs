@@ -153,6 +153,13 @@ pub enum ResolveError {
     )]
     OperationShapeNotFound { key: String, available: String },
 
+    /// An explicit `--def` / `def_name` selector names a `$defs` entry that the
+    /// resolved schema does not contain. Used for non-derivable shapes (transport
+    /// message types, host views, sub-types) where the name is authored, not
+    /// computed from `(op, direction)`.
+    #[error("schema has no $defs entry '{def}'; available: [{available}]")]
+    DefNotFound { def: String, available: String },
+
     #[error("failed to bundle schema: {message}")]
     BundleError { message: String },
 }

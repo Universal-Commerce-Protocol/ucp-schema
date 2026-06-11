@@ -127,6 +127,28 @@ fn write_fixtures(dir: &Path) {
     )
     .unwrap();
 
+    // Single-object capability with a sub-type under $defs (cart holds a
+    // `checkout` def). Exercises explicit --def on a schema that HAS a root body.
+    std::fs::write(
+        shopping.join("cart.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/cart.json",
+          "name": "dev.ucp.shopping.cart",
+          "type": "object",
+          "required": ["id"],
+          "properties": { "id": { "type": "string" } },
+          "$defs": {
+            "checkout": {
+              "type": "object",
+              "required": ["token"],
+              "properties": { "token": { "type": "string" } }
+            }
+          }
+        }"##,
+    )
+    .unwrap();
+
     // Loyalty-style extension that does NOT mirror the container (direct allOf
     // onto the response shape instead of a nested $defs of operation keys).
     std::fs::write(
@@ -414,4 +436,76 @@ fn select_wraps_container_with_ref_and_defs() {
         selected["$defs"]["search_request"].is_object(),
         "sibling defs retained"
     );
+}
+
+// --- explicit --def selection (the Job B / named-shape escape hatch) ---
+
+#[test]
+fn explicit_def_selects_subtype_on_schema_with_body() {
+    // cart has a root body AND a `checkout` sub-type. --def must select the
+    // sub-type, not fall through to the (container-check-failing) root.
+    let schema = json!({
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string" } },
+        "$defs": { "checkout": { "type": "object", "required": ["token"] } }
+    });
+    let opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("checkout".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    assert_eq!(selected["$ref"], "#/$defs/checkout");
+}
+
+#[test]
+fn explicit_def_overrides_derivation() {
+    // op/direction would derive search_response; --def search_request wins.
+    let schema = json!({
+        "type": "object",
+        "$defs": {
+            "search_request": { "type": "object", "required": ["query"] },
+            "search_response": { "type": "object", "required": ["products"] }
+        }
+    });
+    let opts = ResolveOptions::new(Direction::Response, "search")
+        .def_name(Some("search_request".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    assert_eq!(selected["$ref"], "#/$defs/search_request");
+}
+
+#[test]
+fn explicit_def_missing_is_loud() {
+    let schema = json!({ "type": "object", "$defs": { "a": {}, "b": {} } });
+    let opts = ResolveOptions::new(Direction::Request, "create").def_name(Some("nope".to_string()));
+    let err = select_operation_schema(&schema, &opts).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("nope") && msg.contains('a') && msg.contains('b'),
+        "got: {msg}"
+    );
+}
+
+#[test]
+fn explicit_def_validates_fragment_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    let cfg = config(dir.path());
+
+    let payload = json!({
+        "ucp": { "capabilities": { "dev.ucp.shopping.cart": [
+            { "version": "2026-04-08", "schema": "https://ucp.dev/schemas/shopping/cart.json" } ] } },
+        "token": "ok"
+    });
+    let schema = compose_from_payload(&payload, &cfg).unwrap();
+
+    // Against the cart root, `token` alone is invalid (id required). Against
+    // --def checkout, the same fragment is valid (token required).
+    let root_opts = ResolveOptions::new(Direction::Request, "create");
+    assert!(matches!(
+        validate(&schema, &payload, &root_opts),
+        Err(ValidateError::Invalid { .. })
+    ));
+
+    let def_opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("checkout".to_string()));
+    assert!(validate(&schema, &payload, &def_opts).is_ok());
 }

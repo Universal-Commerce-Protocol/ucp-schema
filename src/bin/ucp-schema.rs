@@ -9,9 +9,9 @@ use clap::{Parser, Subcommand};
 use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, is_url, lint, load_schema, load_schema_auto, resolve, validate,
-    ComposeError, DetectedDirection, Direction, FileStatus, ResolveError, ResolveOptions,
-    SchemaBaseConfig, ValidateError,
+    extract_jsonrpc_payload, is_url, lint, load_schema, load_schema_auto, resolve,
+    select_operation_schema, validate, ComposeError, DetectedDirection, Direction, FileStatus,
+    ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
@@ -100,6 +100,12 @@ enum Commands {
         #[arg(long, short)]
         op: String,
 
+        /// Select an explicit $defs entry to output (e.g. search_response,
+        /// business_schema, error_response), overriding the {op}_{direction}
+        /// derivation for container-shaped schemas.
+        #[arg(long)]
+        def: Option<String>,
+
         /// Output file (stdout if not specified)
         #[arg(long)]
         output: Option<PathBuf>,
@@ -168,6 +174,12 @@ enum Commands {
         #[arg(long, short)]
         op: String,
 
+        /// Validate against an explicit $defs entry (e.g. search_response,
+        /// business_schema, error_response), overriding the {op}_{direction}
+        /// derivation. Works on any schema that defines the named $def.
+        #[arg(long)]
+        def: Option<String>,
+
         /// Output results as JSON (for automation)
         #[arg(long)]
         json: bool,
@@ -235,6 +247,7 @@ fn main() -> ExitCode {
             request,
             response,
             op,
+            def,
             output,
             pretty,
             bundle,
@@ -248,6 +261,7 @@ fn main() -> ExitCode {
             request,
             response,
             op,
+            def,
             output,
             pretty,
             bundle,
@@ -283,6 +297,7 @@ fn main() -> ExitCode {
             request,
             response,
             op,
+            def,
             json,
             strict,
             verbose,
@@ -295,6 +310,7 @@ fn main() -> ExitCode {
             request,
             response,
             op,
+            def,
             json_output: json,
             strict,
             verbose,
@@ -325,6 +341,7 @@ fn run_resolve(
     request: bool,
     response: bool,
     op: String,
+    def: Option<String>,
     output: Option<PathBuf>,
     pretty: bool,
     bundle: bool,
@@ -398,7 +415,8 @@ fn run_resolve(
 
     let options = ResolveOptions::new(direction, &op)
         .strict(strict)
-        .include_future(include_future);
+        .include_future(include_future)
+        .def_name(def);
     if verbose {
         let mut flags = Vec::new();
         if strict {
@@ -424,7 +442,16 @@ fn run_resolve(
     }
     let resolved = resolve(&schema, &options).map_err(cli_err(false))?;
 
-    write_json_output(&resolved, output, pretty)
+    // `resolve` defaults to emitting the full resolved schema (container $defs
+    // intact). Only an explicit --def slices to a single $def; auto-derivation
+    // is a validate-time concern, so standalone `resolve` never auto-selects.
+    let output_value = if options.def_name.is_some() {
+        select_operation_schema(&resolved, &options).map_err(cli_err(false))?
+    } else {
+        resolved
+    };
+
+    write_json_output(&output_value, output, pretty)
 }
 
 /// Pure composition: merge capability schemas from a self-describing payload.
@@ -470,6 +497,7 @@ struct ValidateArgs {
     request: bool,
     response: bool,
     op: String,
+    def: Option<String>,
     json_output: bool,
     strict: bool,
     verbose: bool,
@@ -485,6 +513,7 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
         request,
         response,
         op,
+        def,
         json_output,
         strict,
         verbose,
@@ -632,7 +661,9 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
         }
     };
 
-    let options = ResolveOptions::new(direction, op).strict(strict);
+    let options = ResolveOptions::new(direction, op)
+        .strict(strict)
+        .def_name(def);
     if verbose {
         eprintln!(
             "[resolve] resolving for {}/{}",
