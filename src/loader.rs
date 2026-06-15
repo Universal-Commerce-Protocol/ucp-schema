@@ -597,29 +597,46 @@ mod tests {
         assert_eq!(path, Path::new("/local/schemas/foo.json"));
     }
 
-    // Remote tests - require network, use httpbin.org for reliable testing
+    // Remote tests run against a local mockito server so they're deterministic
+    // and offline — no dependency on a live third party. The connection-error
+    // case uses a reserved `.invalid` host (RFC 2606), which fails to resolve
+    // locally without touching the network.
     #[cfg(feature = "remote")]
     mod remote {
         use super::*;
 
         #[test]
         fn load_schema_url_valid() {
-            // httpbin.org/json returns a well-known JSON response
-            let result = load_schema_url("https://httpbin.org/json");
-            assert!(result.is_ok());
-            let schema = result.unwrap();
-            // httpbin returns {"slideshow": {...}}
-            assert!(schema.get("slideshow").is_some());
+            // 200 + JSON body resolves to the parsed value.
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("GET", "/schema.json")
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"type": "object"}"#)
+                .create();
+
+            let result = load_schema_url(&format!("{}/schema.json", server.url()));
+            assert_eq!(result.unwrap()["type"], "object");
+            mock.assert();
         }
 
         #[test]
         fn load_schema_url_404() {
-            let result = load_schema_url("https://httpbin.org/status/404");
+            // Non-2xx status surfaces as NetworkError (via error_for_status).
+            let mut server = mockito::Server::new();
+            server
+                .mock("GET", "/missing.json")
+                .with_status(404)
+                .create();
+
+            let result = load_schema_url(&format!("{}/missing.json", server.url()));
             assert!(matches!(result, Err(ResolveError::NetworkError { .. })));
         }
 
         #[test]
         fn load_schema_url_invalid_host() {
+            // Connection/DNS failure surfaces as NetworkError. `.invalid` (RFC
+            // 2606) fails to resolve without network access.
             let result =
                 load_schema_url("https://this-domain-does-not-exist-12345.invalid/schema.json");
             assert!(matches!(result, Err(ResolveError::NetworkError { .. })));
@@ -627,8 +644,17 @@ mod tests {
 
         #[test]
         fn load_schema_auto_url() {
-            let result = load_schema_auto("https://httpbin.org/json");
-            assert!(result.is_ok());
+            // A URL source delegates to load_schema_url.
+            let mut server = mockito::Server::new();
+            let mock = server
+                .mock("GET", "/schema.json")
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"type": "string"}"#)
+                .create();
+
+            let result = load_schema_auto(&format!("{}/schema.json", server.url()));
+            assert_eq!(result.unwrap()["type"], "string");
+            mock.assert();
         }
     }
 }
