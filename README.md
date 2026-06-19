@@ -64,6 +64,15 @@ Options:
 
 `compose` does not accept `--request`/`--response`/`--op` — those belong to `resolve` and `validate`.
 
+**Namespace authority binding.** Before any schema is fetched, `compose` (and
+`validate`/`resolve` when composing from a payload) verifies that each
+capability's `schema` URL origin matches the reverse-domain authority in its
+name — e.g. `dev.ucp.*` schemas MUST be served from `ucp.dev`. A capability that
+fails this binding is rejected (exit `2`) without dereferencing the URL. Schema
+values that are not `http(s)` URLs (local paths) have no origin and are skipped.
+This enforcement is unconditional; see the spec's Authority Binding section for
+the rule.
+
 ```bash
 # Inspect the merged schema before resolution
 ucp-schema compose response.json --schema-local-base ./schemas --pretty
@@ -188,6 +197,7 @@ Options:
 | E005 | Annotations | Invalid `ucp_*` type (must be string or object)                | Error    |
 | E006 | Requires    | Invalid `requires` structure (wrong types, bad version format) | Error    |
 | E007 | Requires    | `requires.capabilities` key not found in `$defs`               | Error    |
+| E008 | Examples    | An `examples` entry does not validate against its own schema   | Error    |
 | W002 | Hygiene     | Missing `$id` field                                            | Warning  |
 | W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`)   | Warning  |
 | W004 | Requires    | Version constraint has `min` > `max`                           | Warning  |

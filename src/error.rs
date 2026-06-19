@@ -65,6 +65,9 @@ pub enum ComposeError {
         range: String,
         actual: String,
     },
+
+    #[error("capability '{capability}' fails namespace authority binding: {message}")]
+    NamespaceBindingViolation { capability: String, message: String },
 }
 
 impl ComposeError {

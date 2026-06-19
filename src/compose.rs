@@ -409,6 +409,22 @@ pub fn compose_schema(
         return Err(ComposeError::EmptyCapabilities);
     }
 
+    // Authority binding: a capability's `schema` URL must originate from the
+    // namespace authority encoded in its name (spec §Authority Binding). Verify
+    // ALL capabilities before dereferencing any of them (validate-before-fetch).
+    // This is unconditional — the spec requires it and there is no opt-out;
+    // non-URL schema values (local paths) carry no origin, so they are skipped.
+    for cap in capabilities {
+        if is_url(&cap.schema_url) {
+            if let Err(e) = crate::namespace::validate_binding(&cap.name, &cap.schema_url) {
+                return Err(ComposeError::NamespaceBindingViolation {
+                    capability: cap.name.clone(),
+                    message: e.to_string(),
+                });
+            }
+        }
+    }
+
     // Build name -> capability map for lookups
     let cap_map: HashMap<&str, &Capability> =
         capabilities.iter().map(|c| (c.name.as_str(), c)).collect();
@@ -1045,6 +1061,59 @@ mod tests {
         };
         let result = compose_schema(&[checkout], &config);
         assert!(matches!(result, Err(ComposeError::SchemaFetch { .. })));
+    }
+
+    #[test]
+    fn compose_rejects_unbound_schema_url() {
+        // dev.ucp.* served from a non-ucp.dev host: rejected before any fetch.
+        let cap = Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-06-01".to_string(),
+            schema_url: "https://evil.example/checkout.json".to_string(),
+            extends: None,
+        };
+        let config = SchemaBaseConfig::default();
+        let err = compose_schema(&[cap], &config).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::NamespaceBindingViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn compose_skips_binding_for_non_url_schema() {
+        // A local-path schema value has no origin, so the binding does not apply;
+        // it fails later as a fetch error, never as a binding violation.
+        let cap = Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-06-01".to_string(),
+            schema_url: "checkout.json".to_string(),
+            extends: None,
+        };
+        let config = SchemaBaseConfig {
+            local_base: Some(Path::new("/nonexistent")),
+            ..Default::default()
+        };
+        let err = compose_schema(&[cap], &config).unwrap_err();
+        assert!(matches!(err, ComposeError::SchemaFetch { .. }));
+    }
+
+    #[test]
+    fn compose_allows_correctly_bound_schema_url() {
+        // ucp.dev authority matches dev.ucp.*: binding passes, so the error is a
+        // (local-mapped) fetch miss, NOT a binding violation — and stays offline.
+        let cap = Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-06-01".to_string(),
+            schema_url: "https://ucp.dev/draft/schemas/shopping/checkout.json".to_string(),
+            extends: None,
+        };
+        let config = SchemaBaseConfig {
+            local_base: Some(Path::new("/nonexistent")),
+            remote_base: Some("https://ucp.dev/draft"),
+        };
+        let err = compose_schema(&[cap], &config).unwrap_err();
+        assert!(matches!(err, ComposeError::SchemaFetch { .. }));
     }
 
     #[test]

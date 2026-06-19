@@ -58,6 +58,7 @@ mod compose;
 mod error;
 mod linter;
 mod loader;
+mod namespace;
 mod resolver;
 mod types;
 mod validator;
@@ -74,6 +75,7 @@ pub use loader::{
     bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema, load_schema_auto,
     load_schema_str, navigate_fragment,
 };
+pub use namespace::{reverse_labels, validate_binding, BindingError};
 pub use resolver::{resolve, strip_annotations};
 pub use types::{Direction, Requires, ResolveOptions, VersionConstraint, Visibility};
 pub use validator::{select_operation_schema, validate, validate_against_schema};

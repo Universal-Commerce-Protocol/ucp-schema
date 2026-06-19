@@ -156,6 +156,9 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     // Check `requires` field (version constraints on extension schemas)
     check_requires(&schema, file, &mut diagnostics);
 
+    // Check that `examples` entries validate against their own (sub)schema
+    check_examples(&schema, file, "", &mut diagnostics);
+
     // Check for missing $id (warning)
     if schema.get("$id").is_none() {
         diagnostics.push(Diagnostic {
@@ -182,6 +185,53 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
         file: file.strip_prefix(base_path).unwrap_or(file).to_path_buf(),
         status,
         diagnostics,
+    }
+}
+
+/// Validate that every `examples` entry conforms to its enclosing (sub)schema.
+///
+/// `examples` is an annotation that validators ignore, so a listed value that
+/// does not satisfy the schema is an authoring bug or a grammar regression
+/// (e.g., narrowing a `pattern` until a documented-valid value stops matching).
+/// This turns `examples` into an executable, drift-free conformance battery that
+/// lives next to the grammar it documents.
+///
+/// Best-effort: a sub-schema whose validator cannot be compiled in isolation
+/// (e.g., unresolved external `$ref`s) is skipped here — broken refs are already
+/// reported by the `$ref` checks.
+fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    match value {
+        Value::Object(map) => {
+            if let Some(Value::Array(examples)) = map.get("examples") {
+                if let Ok(validator) = jsonschema::validator_for(value) {
+                    for (i, example) in examples.iter().enumerate() {
+                        if !validator.is_valid(example) {
+                            diagnostics.push(Diagnostic {
+                                severity: Severity::Error,
+                                code: "E008".to_string(),
+                                file: file.to_path_buf(),
+                                path: format!("{}/examples/{}", path, i),
+                                message: format!(
+                                    "example does not validate against its schema: {}",
+                                    example
+                                ),
+                            });
+                        }
+                    }
+                }
+            }
+            for (key, child) in map {
+                let child_path = format!("{}/{}", path, key);
+                check_examples(child, file, &child_path, diagnostics);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                let child_path = format!("{}/{}", path, i);
+                check_examples(item, file, &child_path, diagnostics);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -759,6 +809,60 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Ok);
         assert!(result.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn lint_valid_examples_pass() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/rdn.json",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9](?:[a-z0-9_-]*[a-z0-9_])?)+$",
+            "examples": ["dev.ucp.shopping.checkout", "com.example-shop.checkout", "co.uk"]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E008"),
+            "valid examples should not produce E008: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_invalid_example_fails() {
+        // A documented-valid example that no longer matches the pattern (e.g.,
+        // after a grammar regression) MUST be flagged.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/rdn.json",
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:\\.[a-z0-9](?:[a-z0-9_-]*[a-z0-9_])?)+$",
+            "examples": ["dev.ucp.shopping.checkout", "com.-INVALID"]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        let e008: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .collect();
+        assert_eq!(
+            e008.len(),
+            1,
+            "expected one E008, got {:?}",
+            result.diagnostics
+        );
+        assert_eq!(e008[0].path, "/examples/1");
     }
 
     #[test]
