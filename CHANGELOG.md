@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.3.0...v1.4.0) (2026-06-25)
+
+
+### Features
+
+* enforce namespace authority binding ([#34](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/34)) ([6c3fb58](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/6c3fb583ce801e28b4f4ffd85fea7de8798b281c))
+
 ## [1.3.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.2.0...v1.3.0) (2026-06-16)
 
 
