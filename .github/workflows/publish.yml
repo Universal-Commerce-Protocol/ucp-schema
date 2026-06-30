@@ -26,7 +26,7 @@ jobs:
       - name: Verify Cargo.toml matches Tag
         run: |
           TAG_VERSION=${{ steps.get_version.outputs.VERSION }}
-          CARGO_VERSION=$(grep '^version =' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          CARGO_VERSION=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')
           
           echo "Tag version: $TAG_VERSION"
           echo "Cargo version: $CARGO_VERSION"
