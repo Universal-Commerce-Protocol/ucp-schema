@@ -66,8 +66,8 @@ mod validator;
 pub use compose::{
     capability_short_name, check_version_constraints, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, is_container_schema, Capability, DetectedDirection, SchemaBaseConfig,
-    VersionViolation,
+    extract_jsonrpc_payload, is_container_schema, verify_bindings, Capability, DetectedDirection,
+    SchemaBaseConfig, VersionViolation,
 };
 pub use error::{ComposeError, ResolveError, SchemaError, ValidateError};
 pub use linter::{lint, lint_file, Diagnostic, FileResult, FileStatus, LintResult, Severity};
