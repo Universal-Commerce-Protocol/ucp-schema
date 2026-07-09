@@ -1355,9 +1355,9 @@ mod compose {
     }
 
     #[test]
-    fn unknown_parent_error() {
+    fn orphan_extension_error() {
         let dir = TempDir::new().unwrap();
-        // Extension references parent not in capabilities (but has a root)
+        // Extension has no active path to the declared root.
         let payload = write_temp_file(
             &dir,
             "payload.json",
@@ -1390,7 +1390,9 @@ mod compose {
             ])
             .assert()
             .code(2)
-            .stderr(predicate::str::contains("unknown parent"));
+            .stderr(predicate::str::contains(
+                "extension 'dev.ucp.shopping.discount' does not connect to root 'dev.ucp.shopping.checkout'",
+            ));
     }
 
     #[test]
@@ -1489,6 +1491,48 @@ mod compose_command {
             stdout.contains("ucp_response") || stdout.contains("ucp_request"),
             "compose should preserve UCP annotations"
         );
+    }
+
+    #[test]
+    fn compose_multi_parent_selects_checkout_def_with_absent_cart() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_discount_checkout_multi_parent.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let all_of = schema["allOf"].as_array().unwrap();
+
+        assert_eq!(all_of.len(), 1);
+        assert_eq!(all_of[0]["title"], "Checkout with Discount");
+        assert!(all_of[0]["properties"]["line_items"].is_object());
+    }
+
+    #[test]
+    fn compose_multi_parent_selects_cart_def_with_absent_checkout() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_discount_cart_multi_parent.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let all_of = schema["allOf"].as_array().unwrap();
+
+        assert_eq!(all_of.len(), 1);
+        assert_eq!(all_of[0]["title"], "Cart with Discount");
+        assert!(all_of[0]["properties"]["items"].is_object());
     }
 
     #[test]

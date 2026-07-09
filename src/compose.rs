@@ -77,7 +77,8 @@ pub struct Capability {
     pub version: String,
     /// URL to the JSON Schema for this capability.
     pub schema_url: String,
-    /// Parent capability names this extends. None for root capabilities.
+    /// Alternative parent capability paths. During composition, only parents in
+    /// the active capability set are traversed. None for root capabilities.
     pub extends: Option<Vec<String>>,
 }
 
@@ -395,12 +396,15 @@ pub fn check_version_constraints(
     violations
 }
 
-/// Compose schema from capability declarations.
+/// Compose a schema from an already-negotiated active capability set.
 ///
-/// 1. Finds root capability (no extends)
-/// 2. Validates graph connectivity
+/// 1. Finds the single root capability (no extends)
+/// 2. Validates that every extension has at least one active path to the root
 /// 3. Fetches schemas and extracts $defs[root] entries
 /// 4. Composes using allOf
+///
+/// An extension's `extends` entries are alternative paths. Parents absent from
+/// the active set are ignored as long as another active path reaches the root.
 pub fn compose_schema(
     capabilities: &[Capability],
     schema_base: &SchemaBaseConfig,
@@ -445,21 +449,9 @@ pub fn compose_schema(
         }
     };
 
-    // Validate graph: all extends references must exist in capabilities
-    for cap in capabilities {
-        if let Some(parents) = &cap.extends {
-            for parent in parents {
-                if !cap_map.contains_key(parent.as_str()) {
-                    return Err(ComposeError::UnknownParent {
-                        extension: cap.name.clone(),
-                        parent: parent.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Validate graph connectivity: all extensions must reach root
+    // Validate active-graph connectivity: every extension needs at least one
+    // declared parent path that transitively reaches the root. Absent alternative
+    // parents are ignored by reaches_root.
     for cap in capabilities {
         if cap.extends.is_some() && !reaches_root(cap, &cap_map, &root.name) {
             return Err(ComposeError::OrphanExtension {
@@ -714,7 +706,9 @@ fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut Has
     }
 }
 
-/// Check if a capability transitively reaches the root via extends chain.
+/// Check whether any alternative parent path reaches the root through the active set.
+///
+/// Parent names absent from `cap_map` are ignored, and cycles terminate via `visited`.
 fn reaches_root(cap: &Capability, cap_map: &HashMap<&str, &Capability>, root_name: &str) -> bool {
     let mut visited = HashSet::new();
     let mut queue = vec![cap];
@@ -1155,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_unknown_parent_error() {
+    fn compose_orphan_extension_error() {
         let checkout = Capability {
             name: "dev.ucp.shopping.checkout".to_string(),
             version: "2026-01-11".to_string(),
@@ -1171,7 +1165,12 @@ mod tests {
 
         let config = SchemaBaseConfig::default();
         let result = compose_schema(&[checkout, discount], &config);
-        assert!(matches!(result, Err(ComposeError::UnknownParent { .. })));
+        assert!(matches!(
+            result,
+            Err(ComposeError::OrphanExtension { extension, root })
+                if extension == "dev.ucp.shopping.discount"
+                    && root == "dev.ucp.shopping.checkout"
+        ));
     }
 
     #[test]
@@ -1286,6 +1285,42 @@ mod tests {
         .collect();
 
         // discount extends nonexistent, which doesn't connect to checkout
+        assert!(!reaches_root(
+            &discount,
+            &cap_map,
+            "dev.ucp.shopping.checkout"
+        ));
+    }
+
+    #[test]
+    fn reaches_root_terminates_on_cycle() {
+        let checkout = Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "checkout.json".to_string(),
+            extends: None,
+        };
+        let discount = Capability {
+            name: "dev.ucp.shopping.discount".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "discount.json".to_string(),
+            extends: Some(vec!["com.example.loyalty".to_string()]),
+        };
+        let loyalty = Capability {
+            name: "com.example.loyalty".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "loyalty.json".to_string(),
+            extends: Some(vec!["dev.ucp.shopping.discount".to_string()]),
+        };
+
+        let cap_map: HashMap<&str, &Capability> = vec![
+            ("dev.ucp.shopping.checkout", &checkout),
+            ("dev.ucp.shopping.discount", &discount),
+            ("com.example.loyalty", &loyalty),
+        ]
+        .into_iter()
+        .collect();
+
         assert!(!reaches_root(
             &discount,
             &cap_map,
