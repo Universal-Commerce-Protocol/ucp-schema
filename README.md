@@ -65,13 +65,13 @@ Options:
 `compose` does not accept `--request`/`--response`/`--op` — those belong to `resolve` and `validate`.
 
 **Namespace authority binding.** Before any schema is fetched, `compose` (and
-`validate`/`resolve` when composing from a payload) verifies that each
-capability's `schema` URL origin matches the reverse-domain authority in its
-name — e.g. `dev.ucp.*` schemas MUST be served from `ucp.dev`. A capability that
-fails this binding is rejected (exit `2`) without dereferencing the URL. Schema
-values that are not `http(s)` URLs (local paths) have no origin and are skipped.
-This enforcement is unconditional; see the spec's Authority Binding section for
-the rule.
+`validate`/`resolve` when composing from a payload) verifies that every entity's
+`schema` URL origin matches the reverse-domain authority in its name — across
+**capabilities, services, and payment handlers** — e.g. `dev.ucp.*` schemas MUST
+be served from `ucp.dev`. An entity that fails this binding is rejected (exit
+`2`) without dereferencing the URL. Schema values that are not `http(s)` URLs
+(local paths) have no origin and are skipped. This enforcement is unconditional;
+see the spec's Authority Binding section for the rule.
 
 ```bash
 # Inspect the merged schema before resolution

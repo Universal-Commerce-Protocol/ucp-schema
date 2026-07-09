@@ -160,6 +160,8 @@ pub fn extract_capabilities_from_profile(
     schema_base: &SchemaBaseConfig,
 ) -> Result<Vec<Capability>, ComposeError> {
     let profile = fetch_profile(profile_url, schema_base)?;
+    // Bind every entity the fetched profile declares before composing.
+    verify_bindings(&profile)?;
     let caps = profile
         .get("ucp")
         .and_then(|u| u.get("capabilities"))
@@ -422,7 +424,7 @@ pub fn compose_schema(
         if is_url(&cap.schema_url) {
             if let Err(e) = crate::namespace::validate_binding(&cap.name, &cap.schema_url) {
                 return Err(ComposeError::NamespaceBindingViolation {
-                    capability: cap.name.clone(),
+                    entity: cap.name.clone(),
                     message: e.to_string(),
                 });
             }
@@ -739,8 +741,56 @@ pub fn compose_from_payload(
     payload: &Value,
     schema_base: &SchemaBaseConfig,
 ) -> Result<Value, ComposeError> {
+    // Authority binding is a common substrate: every entity in a self-describing
+    // payload (capabilities, services, payment handlers) is bound before any
+    // schema is dereferenced. Profile-fetch payloads are covered in
+    // `extract_capabilities_from_profile`.
+    verify_bindings(payload)?;
     let capabilities = extract_capabilities(payload, schema_base)?;
     compose_schema(&capabilities, schema_base)
+}
+
+/// Verify the namespace authority binding of every entity declared in a profile
+/// or self-describing payload.
+///
+/// Reverse-domain names are used both as identifiers and by entities
+/// (capabilities, services, payment handlers) that declare a `schema` URL. This
+/// is the entity-general binding substrate: it walks the three registries and,
+/// for each entity that declares an `http(s)` `schema` URL, requires the URL's
+/// origin to match the entity's namespace authority (see [`crate::validate_binding`]).
+/// Non-URL schema values (local paths) carry no origin and are skipped.
+///
+/// Runs during composition (`compose_from_payload`,
+/// `extract_capabilities_from_profile`) and therefore during payload validation,
+/// which composes through those paths.
+pub fn verify_bindings(value: &Value) -> Result<(), ComposeError> {
+    // Accept either a full profile (`{ ucp: { ... } }`) or a bare ucp body.
+    let ucp = value.get("ucp").unwrap_or(value);
+    for registry in ["services", "capabilities", "payment_handlers"] {
+        let Some(entries) = ucp.get(registry).and_then(|v| v.as_object()) else {
+            continue;
+        };
+        for (name, versions) in entries {
+            let list = match versions.as_array() {
+                Some(arr) => arr.clone(),
+                None => vec![versions.clone()],
+            };
+            for entry in &list {
+                let Some(schema) = entry.get("schema").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                if is_url(schema) {
+                    if let Err(e) = crate::namespace::validate_binding(name, schema) {
+                        return Err(ComposeError::NamespaceBindingViolation {
+                            entity: name.clone(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Resolve a schema URL to a Value, bundling any $ref pointers.
@@ -1108,6 +1158,84 @@ mod tests {
         };
         let err = compose_schema(&[cap], &config).unwrap_err();
         assert!(matches!(err, ComposeError::SchemaFetch { .. }));
+    }
+
+    #[test]
+    fn verify_bindings_checks_all_entity_registries() {
+        // Every entity with a correctly-bound schema URL passes; a2a service and
+        // local-path handler have no remote schema and are skipped.
+        let profile = json!({"ucp": {
+            "services": {
+                "dev.ucp.shopping": [
+                    {"transport": "rest", "endpoint": "https://ex.com/ucp",
+                     "schema": "https://ucp.dev/draft/services/shopping/rest.openapi.json"},
+                    {"transport": "a2a", "endpoint": "https://ex.com/agent.json"}
+                ]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [
+                    {"version": "2026-06-01",
+                     "schema": "https://ucp.dev/draft/schemas/shopping/checkout.json"}
+                ]
+            },
+            "payment_handlers": {
+                "com.example.processor": [
+                    {"id": "p", "version": "2026-06-01", "schema": "local/path.json"}
+                ]
+            }
+        }});
+        assert!(verify_bindings(&profile).is_ok());
+    }
+
+    #[test]
+    fn verify_bindings_rejects_unbound_service() {
+        let profile = json!({"ucp": {"services": {
+            "dev.ucp.shopping": [
+                {"transport": "rest", "schema": "https://evil.example/x.json"}
+            ]
+        }}});
+        let err = verify_bindings(&profile).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::NamespaceBindingViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_bindings_rejects_unbound_payment_handler() {
+        let profile = json!({"ucp": {"payment_handlers": {
+            "com.example.processor": [
+                {"id": "p", "version": "2026-06-01", "schema": "https://evil.example/x.json"}
+            ]
+        }}});
+        let err = verify_bindings(&profile).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::NamespaceBindingViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_bindings_rejects_unbound_capability() {
+        let profile = json!({"ucp": {"capabilities": {
+            "dev.ucp.shopping.checkout": [
+                {"version": "2026-06-01", "schema": "https://evil.example/x.json"}
+            ]
+        }}});
+        let err = verify_bindings(&profile).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::NamespaceBindingViolation { .. }
+        ));
+    }
+
+    #[test]
+    fn verify_bindings_accepts_bare_ucp_body_and_empty() {
+        let bare = json!({"capabilities": {
+            "com.example.pay": [{"version": "x", "schema": "https://example.com/p.json"}]
+        }});
+        assert!(verify_bindings(&bare).is_ok());
+        assert!(verify_bindings(&json!({"ucp": {}})).is_ok());
     }
 
     #[test]

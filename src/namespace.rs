@@ -1,7 +1,9 @@
 //! Namespace authority binding validation (UCP §Authority Binding).
 //!
-//! Validates that a capability's `schema` URL origin matches the reverse-domain
-//! authority encoded in the capability name.
+//! Validates that an entity's `schema` URL origin (a capability, service, or
+//! payment handler) matches the reverse-domain authority encoded in its name.
+//! The check is name-agnostic — [`validate_binding`] takes any reverse-domain
+//! name and a URL.
 //!
 //! # Why the *inverted* strategy
 //!
@@ -95,7 +97,7 @@ impl std::fmt::Display for BindingError {
                 expected_prefix,
             } => write!(
                 f,
-                "capability '{name}' is not namespaced under host '{host}' \
+                "'{name}' is not namespaced under host '{host}' \
                  (expected name to start with '{expected_prefix}.') for URL '{url}'"
             ),
         }
