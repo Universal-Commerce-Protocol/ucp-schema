@@ -55,6 +55,7 @@
 //! ```
 
 mod compose;
+mod constraints;
 mod error;
 mod linter;
 mod loader;
@@ -68,6 +69,9 @@ pub use compose::{
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
     extract_jsonrpc_payload, is_container_schema, verify_bindings, Capability, DetectedDirection,
     SchemaBaseConfig, VersionViolation,
+};
+pub use constraints::{
+    compile_constraint, ConstraintError, ConstraintKind, ConstraintPlan, OpaqueConstraint,
 };
 pub use error::{ComposeError, ResolveError, SchemaError, ValidateError};
 pub use linter::{lint, lint_file, Diagnostic, FileResult, FileStatus, LintResult, Severity};
