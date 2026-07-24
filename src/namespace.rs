@@ -27,10 +27,16 @@
 //! 1. `U` MUST parse, use scheme `https`, and carry no userinfo (`user:pass@`).
 //! 2. `U`'s host MUST be a registered domain name: at least two labels, not an
 //!    IP literal.
-//! 3. `reverse_labels(host)` MUST be a **label-boundary** prefix of `name`
-//!    (i.e. `name` starts with `reverse_labels(host) + "."`). The trailing dot
-//!    both prevents sibling-prefix spoofing (`examplepay.com` vs `example.com`) and
-//!    guarantees a non-empty service/capability remainder.
+//! 3. `reverse_labels(host)` MUST match `name` as an authority: either `name`
+//!    EQUALS `reverse_labels(host)` — an entity whose name is itself a bare
+//!    controlled domain, e.g. `com.example.pay` served from `pay.example.com` —
+//!    or `name` starts with `reverse_labels(host) + "."` (a label-boundary
+//!    prefix). The separating `.` in the prefix case keeps the match on a label
+//!    boundary, preventing sibling-prefix spoofing (`examplepay.com` vs
+//!    `example.com`). A local service/capability
+//!    segment is NOT required: that is a separate naming convention for
+//!    capabilities and services (overview §Naming Convention), not part of the
+//!    provenance binding, and it does not apply to payment handlers.
 //!
 //! This binding applies to the **`schema`** URL — the machine-fetched artifact
 //! that defines the wire contract and the thing compose dereferences. The
@@ -98,7 +104,8 @@ impl std::fmt::Display for BindingError {
             } => write!(
                 f,
                 "'{name}' is not namespaced under host '{host}' \
-                 (expected name to start with '{expected_prefix}.') for URL '{url}'"
+                 (expected name to equal '{expected_prefix}' or start with \
+                 '{expected_prefix}.') for URL '{url}'"
             ),
         }
     }
@@ -162,9 +169,12 @@ pub fn validate_binding(name: &str, url: &str) -> Result<(), BindingError> {
     }
 
     let expected_prefix = reverse_labels(&host);
-    // Label-boundary prefix: the trailing dot defeats `com.examplepay` matching
-    // `com.example` and guarantees a non-empty capability remainder.
-    if name.starts_with(&format!("{expected_prefix}.")) {
+    // Valid when the name IS the authority (exact match — e.g. `com.example.pay`
+    // served from `pay.example.com`) or is namespaced under it (label-boundary
+    // prefix; the separating `.` defeats `com.examplepay` matching `com.example`).
+    // Provenance only: a local capability segment is a separate naming
+    // convention, not required here.
+    if name == expected_prefix || name.starts_with(&format!("{expected_prefix}.")) {
         Ok(())
     } else {
         Err(BindingError::AuthorityMismatch {
@@ -282,10 +292,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_remainder() {
-        // Host reverses to exactly the name => no capability label => reject.
-        let err = validate_binding("com.example", "https://example.com/x.json").unwrap_err();
-        assert!(matches!(err, BindingError::AuthorityMismatch { .. }));
+    fn accepts_exact_authority_match() {
+        // Host reverses to exactly the name: the publisher provably controls the
+        // whole namespace, so the binding holds with no local segment. Provenance
+        // is the only concern; a `{service}.{capability}` remainder is a separate
+        // naming convention (and does not apply to payment handlers).
+        assert!(validate_binding("com.example", "https://example.com/x.json").is_ok());
+        // The bare-domain handler shape: `com.example.pay` served from
+        // `pay.example.com` (reversed host == the full name). A strict-remainder
+        // rule wrongly rejected this; exact match accepts it.
+        assert!(validate_binding("com.example.pay", "https://pay.example.com/config.json").is_ok());
+    }
+
+    #[test]
+    fn name_binds_from_exact_or_parent_authority() {
+        // A parent domain's reversed labels are also a prefix, so the same name
+        // binds from its exact host or a parent authority — both prove control.
+        assert!(validate_binding("com.example.pay", "https://pay.example.com/x.json").is_ok());
+        assert!(validate_binding("com.example.pay", "https://example.com/x.json").is_ok());
     }
 
     #[test]
