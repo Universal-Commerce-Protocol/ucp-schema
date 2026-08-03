@@ -114,13 +114,227 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
     Ok(current.clone())
 }
 
+/// True if any `$ref: "#"` occurs anywhere in the value.
+pub(crate) fn contains_self_root_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => {
+            if obj.get("$ref").and_then(|v| v.as_str()) == Some("#") {
+                return true;
+            }
+            obj.values().any(contains_self_root_ref)
+        }
+        Value::Array(arr) => arr.iter().any(contains_self_root_ref),
+        _ => false,
+    }
+}
+
+/// Copy of a file's root schema suitable for inlining at a `$ref: "#"` site:
+/// `$defs` is dropped (internal refs are resolved against the original file),
+/// and `$id`/`$schema` are dropped so the copy doesn't open a new resource
+/// scope at the inline site.
+pub(crate) fn root_schema_copy(file_root: &Value) -> Value {
+    let mut copy = file_root.clone();
+    if let Value::Object(obj) = &mut copy {
+        obj.remove("$defs");
+        obj.remove("$id");
+        obj.remove("$schema");
+    }
+    copy
+}
+
+/// Stable (FNV-1a) hash so synthesized resource ids are deterministic across
+/// builds, unlike `DefaultHasher`.
+pub(crate) fn stable_hash(s: &str) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in s.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Identity of a source file for cycle bookkeeping: its `$id` when present,
+/// otherwise a content hash.
+fn self_root_identity(file_root: &Value) -> String {
+    match file_root.get("$id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => format!("{:016x}", stable_hash(&file_root.to_string())),
+    }
+}
+
+/// Deterministic resource id for a file that has no `$id` of its own,
+/// derived from the file's content so distinct files never collide.
+pub(crate) fn synthesized_root_id(file_root: &Value) -> String {
+    format!(
+        "urn:ucp-schema:bundled-root:{:016x}",
+        stable_hash(&file_root.to_string())
+    )
+}
+
+/// Attach a schema resolved from a `$ref: "#"` site to that site's object
+/// (whose `$ref` has already been removed). With no sibling keywords the
+/// schema is spliced in directly; with siblings, 2020-12 requires the ref'd
+/// schema to apply in CONJUNCTION with them, so it is pushed into `allOf`.
+/// Returns false when the site has a malformed (non-array) `allOf`, in which
+/// case the caller should use the embedded-resource form instead.
+pub(crate) fn attach_resolved_self_root(
+    obj: &mut serde_json::Map<String, Value>,
+    resolved: Value,
+) -> bool {
+    if obj.is_empty() {
+        if let Value::Object(root_obj) = resolved {
+            for (k, v) in root_obj {
+                obj.insert(k, v);
+            }
+        }
+        return true;
+    }
+    match obj.get_mut("allOf") {
+        None => {
+            obj.insert("allOf".to_string(), Value::Array(vec![resolved]));
+            true
+        }
+        Some(Value::Array(arr)) => {
+            arr.push(resolved);
+            true
+        }
+        Some(_) => false,
+    }
+}
+
+/// Resolve a `$ref: "#"` site inside content extracted from source file
+/// `src_root` so it keeps meaning that file's root after bundling (issue #43).
+///
+/// Sibling keywords at the site are bundled first — they are ordinary
+/// subschemas written in the same source file. Preferred strategy for the ref
+/// itself: inline a copy of the source file's root schema at the site (in
+/// conjunction with any siblings). When that cannot terminate (the root itself
+/// contains `$ref: "#"`, or resolving it cycles back into this site), fall
+/// back to embedding the whole source file as a `$defs` resource with its
+/// `$id` intact (synthesized when missing) and rewriting the ref to that id —
+/// under 2020-12 embedded-resource rules, `#` inside the embedded copy then
+/// resolves against its own `$id`, and the rewritten `$ref` applies in
+/// conjunction with the remaining siblings.
+fn inline_self_root_ref(
+    obj: &mut serde_json::Map<String, Value>,
+    src_root: &Value,
+    base_dir: &Path,
+    url_local_base: Option<&Path>,
+    url_remote_base: Option<&str>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<(), ResolveError> {
+    obj.remove("$ref");
+    for value in obj.values_mut() {
+        bundle_refs_inner(
+            value,
+            base_dir,
+            Some(src_root),
+            Some(src_root),
+            url_local_base,
+            url_remote_base,
+            visited,
+        )?;
+    }
+
+    let visit_key = format!("self-root|{}", self_root_identity(src_root));
+    let root_copy = root_schema_copy(src_root);
+    if !visited.contains(&visit_key) && !contains_self_root_ref(&root_copy) {
+        // Attempt the inline on cloned state so a cycle detected mid-way can
+        // fall back cleanly without corrupting the caller's bookkeeping.
+        let mut attempt = root_copy;
+        let mut attempt_visited = visited.clone();
+        attempt_visited.insert(visit_key.clone());
+        if bundle_refs_inner(
+            &mut attempt,
+            base_dir,
+            Some(src_root),
+            Some(src_root),
+            url_local_base,
+            url_remote_base,
+            &mut attempt_visited,
+        )
+        .is_ok()
+        {
+            attempt_visited.remove(&visit_key);
+            let committed = attach_resolved_self_root(obj, attempt);
+            if committed {
+                *visited = attempt_visited;
+                return Ok(());
+            }
+        }
+    }
+    embed_self_root_resource(
+        obj,
+        src_root,
+        base_dir,
+        url_local_base,
+        url_remote_base,
+        visited,
+    )
+}
+
+/// Fallback for [`inline_self_root_ref`]: embed the source file as a `$defs`
+/// resource (with `$id`) and point the ref at it. The embedded copy is only
+/// materialized once per source file; later sites just reuse the id.
+fn embed_self_root_resource(
+    obj: &mut serde_json::Map<String, Value>,
+    src_root: &Value,
+    base_dir: &Path,
+    url_local_base: Option<&Path>,
+    url_remote_base: Option<&str>,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<(), ResolveError> {
+    let id = match src_root.get("$id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => synthesized_root_id(src_root),
+    };
+    let embed_marker = format!("embedded|{}", id);
+    if !visited.contains(&embed_marker) {
+        visited.insert(embed_marker);
+        let mut resource = src_root.clone();
+        if let Value::Object(res_obj) = &mut resource {
+            res_obj
+                .entry("$id")
+                .or_insert_with(|| Value::String(id.clone()));
+        }
+        // Bundle only the embedded copy's external refs. Its internal refs
+        // ("#" and "#/...") now sit under the resource's own $id and already
+        // mean the right thing, so no file_root/self context is passed.
+        bundle_refs_inner(
+            &mut resource,
+            base_dir,
+            None,
+            None,
+            url_local_base,
+            url_remote_base,
+            visited,
+        )?;
+        let defs = obj
+            .entry("$defs")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Value::Object(defs_obj) = defs {
+            let mut key = "bundled_self_root".to_string();
+            let mut n = 1;
+            while defs_obj.contains_key(&key) {
+                n += 1;
+                key = format!("bundled_self_root_{}", n);
+            }
+            defs_obj.insert(key, resource);
+        }
+    }
+    obj.insert("$ref".to_string(), Value::String(id));
+    Ok(())
+}
+
 /// Recursively resolve and inline external $ref pointers.
 ///
 /// Walks the schema tree, finds `$ref` values pointing to external files,
 /// loads them, and replaces the $ref with the loaded content.
 /// Internal refs (`#/...`) in the root schema are left for the validator.
 /// Internal refs in loaded external files are resolved against that file.
-/// Self-root refs (`$ref: "#"`) are left as-is (recursive type definitions).
+/// A `$ref: "#"` at document level is left as-is (it keeps meaning the
+/// document root); inside inlined fragments it is resolved against the file
+/// it was written in (see [`inline_self_root_ref`]).
 ///
 /// # Arguments
 /// * `schema` - The schema to process (modified in place)
@@ -132,6 +346,7 @@ pub fn bundle_refs(schema: &mut Value, base_dir: &Path) -> Result<(), ResolveErr
         schema,
         base_dir,
         Some(&root_snapshot),
+        None,
         None,
         None,
         &mut std::collections::HashSet::new(),
@@ -161,6 +376,7 @@ pub fn bundle_refs_with_url_mapping(
         schema,
         base_dir,
         Some(&root_snapshot),
+        None,
         Some(local_base),
         Some(remote_base),
         &mut std::collections::HashSet::new(),
@@ -171,6 +387,8 @@ fn bundle_refs_inner(
     schema: &mut Value,
     base_dir: &Path,
     file_root: Option<&Value>, // Root of external file for resolving internal refs
+    self_root: Option<&Value>, // Set when processing a fragment extracted from an
+    // external file: the root that `$ref: "#"` refers to
     url_local_base: Option<&Path>,
     url_remote_base: Option<&str>,
     visited: &mut std::collections::HashSet<String>,
@@ -181,9 +399,23 @@ fn bundle_refs_inner(
             if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
                 if ref_val.starts_with('#') {
                     // Internal ref - only resolve if we have a file_root context
-                    // Skip self-root refs ($ref: "#") - these are recursive type defs
                     if ref_val == "#" {
-                        // Leave as-is - can't inline recursive self-reference
+                        if let Some(src) = self_root {
+                            // Inside an inlined fragment "#" means the SOURCE
+                            // file's root, which is about to disappear from
+                            // scope — resolve it now (issue #43).
+                            inline_self_root_ref(
+                                obj,
+                                src,
+                                base_dir,
+                                url_local_base,
+                                url_remote_base,
+                                visited,
+                            )?;
+                            return Ok(());
+                        }
+                        // Document-level "#" keeps meaning the document root
+                        // after bundling — leave as-is.
                     } else if let Some(root) = file_root {
                         let mut target = navigate_fragment(root, ref_val)?;
                         // Recursively process (may have nested refs)
@@ -191,6 +423,7 @@ fn bundle_refs_inner(
                             &mut target,
                             base_dir,
                             file_root,
+                            self_root,
                             url_local_base,
                             url_remote_base,
                             visited,
@@ -251,12 +484,37 @@ fn bundle_refs_inner(
                         loaded.clone()
                     };
 
+                    // Self-root ("#") context for the inlined content:
+                    // - A fragment loses its file's $id, so "#" inside it must
+                    //   be resolved against the source file (issue #43).
+                    // - A whole-file inline keeps the file's $id (the merge
+                    //   below carries it over), which is exactly what "#"
+                    //   binds to — but if the file has no $id, synthesize one
+                    //   so "#" doesn't escape to the inlining document root.
+                    let sub_self_root = if fragment.is_some() {
+                        Some(&loaded)
+                    } else {
+                        if loaded.get("$id").is_none() && contains_self_root_ref(&target) {
+                            if let Value::Object(target_obj) = &mut target {
+                                // Content-derived id: two different $id-less
+                                // files inlined under the same relative ref
+                                // text must not collide.
+                                target_obj.insert(
+                                    "$id".to_string(),
+                                    Value::String(synthesized_root_id(&loaded)),
+                                );
+                            }
+                        }
+                        None
+                    };
+
                     visited.insert(visit_key.clone());
                     // Pass loaded file as file_root so internal refs resolve against it
                     bundle_refs_inner(
                         &mut target,
                         &ref_dir_owned,
                         Some(&loaded),
+                        sub_self_root,
                         url_local_base,
                         url_remote_base,
                         visited,
@@ -279,6 +537,7 @@ fn bundle_refs_inner(
                     value,
                     base_dir,
                     file_root,
+                    self_root,
                     url_local_base,
                     url_remote_base,
                     visited,
@@ -291,6 +550,7 @@ fn bundle_refs_inner(
                     item,
                     base_dir,
                     file_root,
+                    self_root,
                     url_local_base,
                     url_remote_base,
                     visited,
@@ -342,8 +602,87 @@ pub fn bundle_refs_remote(schema: &mut Value, base_url: &str) -> Result<(), Reso
         schema,
         base_url,
         Some(&root_snapshot),
+        None,
         &mut std::collections::HashSet::new(),
     )
+}
+
+/// Remote twin of [`inline_self_root_ref`]: same strategy, HTTP loading.
+#[cfg(feature = "remote")]
+fn inline_self_root_ref_remote(
+    obj: &mut serde_json::Map<String, Value>,
+    src_root: &Value,
+    base_url: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<(), ResolveError> {
+    obj.remove("$ref");
+    for value in obj.values_mut() {
+        bundle_refs_remote_inner(value, base_url, Some(src_root), Some(src_root), visited)?;
+    }
+
+    let visit_key = format!("self-root|{}", self_root_identity(src_root));
+    let root_copy = root_schema_copy(src_root);
+    if !visited.contains(&visit_key) && !contains_self_root_ref(&root_copy) {
+        let mut attempt = root_copy;
+        let mut attempt_visited = visited.clone();
+        attempt_visited.insert(visit_key.clone());
+        if bundle_refs_remote_inner(
+            &mut attempt,
+            base_url,
+            Some(src_root),
+            Some(src_root),
+            &mut attempt_visited,
+        )
+        .is_ok()
+        {
+            attempt_visited.remove(&visit_key);
+            let committed = attach_resolved_self_root(obj, attempt);
+            if committed {
+                *visited = attempt_visited;
+                return Ok(());
+            }
+        }
+    }
+    embed_self_root_resource_remote(obj, src_root, base_url, visited)
+}
+
+/// Remote twin of [`embed_self_root_resource`].
+#[cfg(feature = "remote")]
+fn embed_self_root_resource_remote(
+    obj: &mut serde_json::Map<String, Value>,
+    src_root: &Value,
+    base_url: &str,
+    visited: &mut std::collections::HashSet<String>,
+) -> Result<(), ResolveError> {
+    let id = match src_root.get("$id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => synthesized_root_id(src_root),
+    };
+    let embed_marker = format!("embedded|{}", id);
+    if !visited.contains(&embed_marker) {
+        visited.insert(embed_marker);
+        let mut resource = src_root.clone();
+        if let Value::Object(res_obj) = &mut resource {
+            res_obj
+                .entry("$id")
+                .or_insert_with(|| Value::String(id.clone()));
+        }
+        bundle_refs_remote_inner(&mut resource, base_url, None, None, visited)?;
+        let defs = obj
+            .entry("$defs")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Value::Object(defs_obj) = defs {
+            let mut key = "bundled_self_root".to_string();
+            let mut n = 1;
+            while defs_obj.contains_key(&key) {
+                n += 1;
+                key = format!("bundled_self_root_{}", n);
+            }
+            defs_obj.insert(key, resource);
+        }
+    }
+    obj.insert("$ref".to_string(), Value::String(id));
+    Ok(())
 }
 
 #[cfg(feature = "remote")]
@@ -351,6 +690,7 @@ fn bundle_refs_remote_inner(
     schema: &mut Value,
     base_url: &str,
     file_root: Option<&Value>,
+    self_root: Option<&Value>,
     visited: &mut std::collections::HashSet<String>,
 ) -> Result<(), ResolveError> {
     match schema {
@@ -359,10 +699,22 @@ fn bundle_refs_remote_inner(
                 if ref_val.starts_with('#') {
                     // Internal ref
                     if ref_val == "#" {
-                        // Self-reference, leave as-is
+                        if let Some(src) = self_root {
+                            // "#" inside an inlined fragment means the source
+                            // file's root — resolve it now (issue #43).
+                            inline_self_root_ref_remote(obj, src, base_url, visited)?;
+                            return Ok(());
+                        }
+                        // Document-level self-reference, leave as-is
                     } else if let Some(root) = file_root {
                         let mut target = navigate_fragment(root, ref_val)?;
-                        bundle_refs_remote_inner(&mut target, base_url, file_root, visited)?;
+                        bundle_refs_remote_inner(
+                            &mut target,
+                            base_url,
+                            file_root,
+                            self_root,
+                            visited,
+                        )?;
                         obj.remove("$ref");
                         if let Value::Object(ref_obj) = target {
                             for (k, v) in ref_obj {
@@ -397,9 +749,30 @@ fn bundle_refs_remote_inner(
                         loaded.clone()
                     };
 
+                    // Same self-root handling as the local bundler: fragments
+                    // need "#" resolved against their source file; whole-file
+                    // inlines keep (or gain) an $id that "#" binds to.
+                    let sub_self_root = if fragment.is_some() {
+                        Some(&loaded)
+                    } else {
+                        if loaded.get("$id").is_none() && contains_self_root_ref(&target) {
+                            if let Value::Object(target_obj) = &mut target {
+                                target_obj
+                                    .insert("$id".to_string(), Value::String(resolved_url.clone()));
+                            }
+                        }
+                        None
+                    };
+
                     visited.insert(visit_key.clone());
                     // Recursively bundle with new base URL
-                    bundle_refs_remote_inner(&mut target, &resolved_url, Some(&loaded), visited)?;
+                    bundle_refs_remote_inner(
+                        &mut target,
+                        &resolved_url,
+                        Some(&loaded),
+                        sub_self_root,
+                        visited,
+                    )?;
                     visited.remove(&visit_key);
 
                     obj.remove("$ref");
@@ -414,12 +787,12 @@ fn bundle_refs_remote_inner(
 
             // Recurse into all values
             for value in obj.values_mut() {
-                bundle_refs_remote_inner(value, base_url, file_root, visited)?;
+                bundle_refs_remote_inner(value, base_url, file_root, self_root, visited)?;
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                bundle_refs_remote_inner(item, base_url, file_root, visited)?;
+                bundle_refs_remote_inner(item, base_url, file_root, self_root, visited)?;
             }
         }
         _ => {}

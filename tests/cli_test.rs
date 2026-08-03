@@ -848,6 +848,532 @@ mod bundle {
             .success()
             // Self-root ref should be preserved (can't inline recursive)
             .stdout(predicate::str::contains(r##""$ref":"#""##));
+
+        // Preserving the "#" text is not enough: after bundling it must still
+        // RESOLVE to node.json's root, not to the bundled document root. A
+        // nested child with a non-string "value" violates node.json's schema;
+        // the bundled document root knows nothing about "value", so this
+        // rejection only happens when "#" keeps its original meaning.
+        let bad = write_temp_file(
+            &dir,
+            "bad.json",
+            r#"{"tree": {"value": "a", "children": [{"value": 1}]}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            r#"{"tree": {"value": "a", "children": [{"value": "b", "children": []}]}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+    }
+
+    // Fixture mirroring the UCP payment chain (issue #43): outer.json ->
+    // mid.json -> types/instrument.json#/$defs/selected, where "selected" is
+    // an allOf whose first branch is {"$ref": "#"} — the instrument file's OWN
+    // root. After bundling, "#" must keep meaning the instrument root; the
+    // nearest enclosing $id at the inlined site belongs to mid.json, so a
+    // dangling "#" wrongly binds there.
+    fn write_self_root_ref_chain(dir: &TempDir) -> std::path::PathBuf {
+        fs::create_dir_all(dir.path().join("types")).unwrap();
+        fs::write(
+            dir.path().join("types/instrument.json"),
+            r##"{
+                "$id": "https://example.com/types/instrument.json",
+                "type": "object",
+                "required": ["id", "type"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "type": { "type": "string" }
+                },
+                "additionalProperties": true,
+                "$defs": {
+                    "selected": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "selected": { "type": "boolean" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("mid.json"),
+            r##"{
+                "$id": "https://example.com/mid.json",
+                "type": "object",
+                "properties": {
+                    "instruments": {
+                        "type": "array",
+                        "items": { "$ref": "types/instrument.json#/$defs/selected" }
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        write_temp_file(
+            dir,
+            "outer.json",
+            r#"{
+                "type": "object",
+                "properties": {
+                    "payment": { "$ref": "mid.json" }
+                }
+            }"#,
+        )
+    }
+
+    #[test]
+    fn bundled_fragment_self_root_ref_rejects_missing_required() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_self_root_ref_chain(&dir);
+
+        // Instrument with NONE of the required fields must be rejected: the
+        // required list lives at instrument.json's root, reached via "#".
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{"payment": {"instruments": [{"selected": true}]}}"#,
+        );
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+    }
+
+    #[test]
+    fn bundled_fragment_self_root_ref_accepts_extra_sibling_named_key() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_self_root_ref_chain(&dir);
+
+        // instrument.json's root allows additional properties, so an extra
+        // property that happens to share a name with a property of the
+        // INLINING file (mid.json's "instruments": array) must be accepted.
+        // If "#" wrongly binds to mid.json, "bogus" fails its array type.
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{"payment": {"instruments": [{"id": "i1", "type": "card", "instruments": "bogus"}]}}"#,
+        );
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+    }
+
+    #[test]
+    fn bundled_fragment_self_root_ref_strict_accepts_valid_instrument() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_self_root_ref_chain(&dir);
+
+        // Strict mode closes schemas against their declared properties. Those
+        // properties (id, type) are only visible when "#" resolves to
+        // instrument.json's root; a dangling "#" leaves every instrument field
+        // unevaluated and rejects even fully valid instruments.
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{"payment": {"instruments": [{"id": "i1", "type": "card", "selected": true}]}}"#,
+        );
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--response",
+                "--op",
+                "create",
+                "--strict",
+                "true",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+    }
+
+    #[test]
+    fn bundle_self_root_site_siblings_conjoin_with_source_root() {
+        let dir = TempDir::new().unwrap();
+
+        // The "#" site carries sibling keywords that collide with the source
+        // root's keys (required, properties). 2020-12 applies $ref in
+        // conjunction with its siblings, so BOTH required lists must hold; a
+        // key-wise merge would drop the root's required:["a"].
+        fs::create_dir_all(dir.path().join("types")).unwrap();
+        fs::write(
+            dir.path().join("types/thing.json"),
+            r##"{
+                "$id": "https://example.com/thing.json",
+                "type": "object",
+                "required": ["a"],
+                "properties": { "a": { "type": "string" } },
+                "$defs": {
+                    "strict_thing": {
+                        "$ref": "#",
+                        "required": ["b"],
+                        "properties": { "b": { "type": "number" } }
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "outer.json",
+            r##"{
+                "type": "object",
+                "properties": {
+                    "item": { "$ref": "types/thing.json#/$defs/strict_thing" }
+                }
+            }"##,
+        );
+
+        let bad = write_temp_file(&dir, "bad.json", r#"{"item": {"b": 1}}"#);
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+
+        let good = write_temp_file(&dir, "good.json", r#"{"item": {"a": "x", "b": 2}}"#);
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+    }
+
+    #[test]
+    fn bundle_self_root_site_sibling_refs_still_bundled() {
+        let dir = TempDir::new().unwrap();
+
+        // The "#" site has a sibling subtree containing its own external ref
+        // (other.json). Resolving "#" must not stop the bundler from also
+        // bundling the siblings — a dangling other.json ref makes the whole
+        // bundle uncompilable.
+        fs::create_dir_all(dir.path().join("types")).unwrap();
+        fs::write(
+            dir.path().join("types/thing.json"),
+            r##"{
+                "$id": "https://example.com/thing.json",
+                "type": "object",
+                "properties": { "a": { "type": "string" } },
+                "$defs": {
+                    "wrapped": {
+                        "$ref": "#",
+                        "properties": { "extra": { "$ref": "other.json" } }
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("types/other.json"),
+            r#"{ "type": "string", "minLength": 3 }"#,
+        )
+        .unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "outer.json",
+            r##"{
+                "type": "object",
+                "properties": {
+                    "item": { "$ref": "types/thing.json#/$defs/wrapped" }
+                }
+            }"##,
+        );
+
+        let good = write_temp_file(&dir, "good.json", r#"{"item": {"extra": "abc"}}"#);
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+
+        let bad = write_temp_file(&dir, "bad.json", r#"{"item": {"extra": "ab"}}"#);
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("/item/extra"));
+    }
+
+    #[test]
+    fn bundle_synthesized_ids_distinct_for_distinct_files() {
+        let dir = TempDir::new().unwrap();
+
+        // Two DIFFERENT $id-less files are both referenced as "inner.json"
+        // (from different directories). Their synthesized resource ids must
+        // not collide, or "#" in one subtree binds to the other file's root.
+        fs::create_dir_all(dir.path().join("a")).unwrap();
+        fs::create_dir_all(dir.path().join("b")).unwrap();
+        fs::write(
+            dir.path().join("a/entry.json"),
+            r#"{"type":"object","properties":{"na":{"$ref":"inner.json"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("a/inner.json"),
+            r##"{"type":"object","required":["name"],"properties":{"name":{"type":"string"},"next":{"$ref":"#"}}}"##,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b/entry.json"),
+            r#"{"type":"object","properties":{"nb":{"$ref":"inner.json"}}}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("b/inner.json"),
+            r##"{"type":"object","required":["count"],"properties":{"count":{"type":"number"},"next":{"$ref":"#"}}}"##,
+        )
+        .unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "outer.json",
+            r#"{
+                "type": "object",
+                "properties": {
+                    "pa": { "$ref": "a/entry.json" },
+                    "pb": { "$ref": "b/entry.json" }
+                }
+            }"#,
+        );
+
+        // Recursion inside the "a" subtree follows a/inner.json's rules.
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            r#"{"pa":{"na":{"name":"x","next":{"name":"y"}}},"pb":{"nb":{"count":1,"next":{"count":2}}}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+
+        // An a-subtree recursion step matching b/inner.json's shape (count,
+        // no name) must be rejected.
+        let bad = write_temp_file(
+            &dir,
+            "bad.json",
+            r#"{"pa":{"na":{"name":"x","next":{"count":123}}}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+    }
+
+    #[test]
+    fn bundle_self_root_ref_cycle_through_defs_terminates() {
+        let dir = TempDir::new().unwrap();
+
+        // The source file's root references back into the very $defs entry
+        // being extracted, so inlining the root at the "#" site can never
+        // terminate by textual expansion. Bundling must still terminate and
+        // keep "#" meaning looper.json's root.
+        fs::create_dir_all(dir.path().join("types")).unwrap();
+        fs::write(
+            dir.path().join("types/looper.json"),
+            r##"{
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "next": { "$ref": "#/$defs/wrapped" }
+                },
+                "$defs": {
+                    "wrapped": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "wrapped": { "type": "boolean" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "outer.json",
+            r#"{
+                "type": "object",
+                "properties": {
+                    "thing": { "$ref": "types/looper.json#/$defs/wrapped" }
+                }
+            }"#,
+        );
+
+        cmd()
+            .args([
+                "resolve",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--bundle",
+            ])
+            .assert()
+            .success();
+
+        // "name" is typed at looper.json's root, reached via "#"; the outer
+        // document root does not type it.
+        let bad = write_temp_file(
+            &dir,
+            "bad.json",
+            r#"{"thing": {"name": 1, "wrapped": true}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            r#"{"thing": {"name": "a", "wrapped": true, "next": {"name": "b", "wrapped": false}}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
     }
 
     #[test]
@@ -1113,6 +1639,109 @@ mod remote {
     }
 
     #[test]
+    fn remote_bundle_resolves_fragment_self_root_ref_with_siblings() {
+        // Remote twin of the self-root-ref bundling fixes: a fragment fetched
+        // over HTTP whose "#" must keep meaning its source file's root, at a
+        // site that also carries a sibling subtree with its own external ref.
+        let mut server = mockito::Server::new();
+        let _outer = server
+            .mock("GET", "/schema.json")
+            .with_body(
+                r##"{
+                    "type": "object",
+                    "properties": {
+                        "item": { "$ref": "types/thing.json#/$defs/wrapped" }
+                    }
+                }"##,
+            )
+            .expect_at_least(1)
+            .create();
+        let _thing = server
+            .mock("GET", "/types/thing.json")
+            .with_body(
+                r##"{
+                    "type": "object",
+                    "required": ["root_marker"],
+                    "properties": { "root_marker": { "type": "string" } },
+                    "$defs": {
+                        "wrapped": {
+                            "$ref": "#",
+                            "properties": { "extra": { "$ref": "other.json" } }
+                        }
+                    }
+                }"##,
+            )
+            .expect_at_least(1)
+            .create();
+        let _other = server
+            .mock("GET", "/types/other.json")
+            .with_body(r#"{ "type": "string", "minLength": 3 }"#)
+            .expect_at_least(1)
+            .create();
+
+        let url = format!("{}/schema.json", server.url());
+        let dir = TempDir::new().unwrap();
+
+        // Source-root constraint enforced through "#".
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            r#"{"item": {"root_marker": "x", "extra": "abc"}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema",
+                &url,
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+
+        let missing_marker = write_temp_file(&dir, "bad1.json", r#"{"item": {"extra": "abc"}}"#);
+        cmd()
+            .args([
+                "validate",
+                missing_marker.to_str().unwrap(),
+                "--schema",
+                &url,
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+
+        // Sibling subtree's external ref must still be bundled and enforced.
+        let short_extra = write_temp_file(
+            &dir,
+            "bad2.json",
+            r#"{"item": {"root_marker": "x", "extra": "ab"}}"#,
+        );
+        cmd()
+            .args([
+                "validate",
+                short_extra.to_str().unwrap(),
+                "--schema",
+                &url,
+                "--request",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("/item/extra"));
+    }
+
+    #[test]
     fn validate_with_remote_schema() {
         let mut server = mockito::Server::new();
         let mock = server
@@ -1143,6 +1772,193 @@ mod remote {
 /// Schema composition tests - self-describing payloads
 mod compose {
     use super::*;
+
+    // Fixture for the compose-path self-root-ref tests: a root capability plus
+    // an extension whose $defs entry references the EXTENSION file's own root
+    // via "#" and carries colliding sibling keywords.
+    fn write_self_root_ref_capability_fixture(dir: &TempDir) {
+        fs::create_dir_all(dir.path().join("shopping")).unwrap();
+        fs::write(
+            dir.path().join("shopping/testbase.json"),
+            r#"{
+                "type": "object",
+                "additionalProperties": true,
+                "properties": { "core": { "type": "string" } }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("shopping/testext.json"),
+            r##"{
+                "type": "object",
+                "required": ["mark"],
+                "properties": { "mark": { "type": "string" } },
+                "additionalProperties": true,
+                "$defs": {
+                    "dev.ucp.shopping.testbase": {
+                        "$ref": "#",
+                        "required": ["flag"],
+                        "properties": { "flag": { "type": "boolean" } }
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+    }
+
+    const SELF_ROOT_REF_CAPS: &str = r#""ucp": {
+        "capabilities": {
+            "dev.ucp.shopping.testbase": [{
+                "version": "2026-01-11",
+                "schema": "https://ucp.dev/schemas/shopping/testbase.json"
+            }],
+            "dev.ucp.shopping.testext": [{
+                "version": "2026-01-11",
+                "schema": "https://ucp.dev/schemas/shopping/testext.json",
+                "extends": "dev.ucp.shopping.testbase"
+            }]
+        }
+    }"#;
+
+    #[test]
+    fn compose_extension_self_root_site_siblings_conjoin_with_extension_root() {
+        let dir = TempDir::new().unwrap();
+        write_self_root_ref_capability_fixture(&dir);
+
+        // The extension def's "#" means the extension FILE's root, whose
+        // required:["mark"] must apply in conjunction with the def site's own
+        // required:["flag"] — a key-wise merge would drop "mark".
+        let bad = write_temp_file(
+            &dir,
+            "bad.json",
+            &format!(r#"{{ {}, "flag": true }}"#, SELF_ROOT_REF_CAPS),
+        );
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema-local-base",
+                dir.path().to_str().unwrap(),
+                "--schema-remote-base",
+                "https://ucp.dev/schemas",
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            &format!(r#"{{ {}, "flag": true, "mark": "m" }}"#, SELF_ROOT_REF_CAPS),
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema-local-base",
+                dir.path().to_str().unwrap(),
+                "--schema-remote-base",
+                "https://ucp.dev/schemas",
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+    }
+
+    #[test]
+    fn compose_extension_self_root_cycle_terminates() {
+        let dir = TempDir::new().unwrap();
+        fs::create_dir_all(dir.path().join("shopping")).unwrap();
+        fs::write(
+            dir.path().join("shopping/testbase.json"),
+            r#"{
+                "type": "object",
+                "additionalProperties": true,
+                "properties": { "core": { "type": "string" } }
+            }"#,
+        )
+        .unwrap();
+        // The extension file's root references back into the very $defs entry
+        // being extracted; composition must terminate with no dangling refs.
+        fs::write(
+            dir.path().join("shopping/testext.json"),
+            r##"{
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "next": { "$ref": "#/$defs/dev.ucp.shopping.testbase" }
+                },
+                "$defs": {
+                    "dev.ucp.shopping.testbase": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            {
+                                "type": "object",
+                                "properties": { "wrapped": { "type": "boolean" } }
+                            }
+                        ]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+
+        let good = write_temp_file(
+            &dir,
+            "good.json",
+            &format!(
+                r#"{{ {}, "name": "a", "wrapped": true, "next": {{ "name": "b", "wrapped": false }} }}"#,
+                SELF_ROOT_REF_CAPS
+            ),
+        );
+        cmd()
+            .args([
+                "validate",
+                good.to_str().unwrap(),
+                "--schema-local-base",
+                dir.path().to_str().unwrap(),
+                "--schema-remote-base",
+                "https://ucp.dev/schemas",
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""valid":true"#));
+
+        // "name" is typed at the extension file's root, reached via "#".
+        let bad = write_temp_file(
+            &dir,
+            "bad.json",
+            &format!(r#"{{ {}, "name": 1 }}"#, SELF_ROOT_REF_CAPS),
+        );
+        cmd()
+            .args([
+                "validate",
+                bad.to_str().unwrap(),
+                "--schema-local-base",
+                dir.path().to_str().unwrap(),
+                "--schema-remote-base",
+                "https://ucp.dev/schemas",
+                "--response",
+                "--op",
+                "create",
+                "--json",
+            ])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains(r#""valid":false"#));
+    }
 
     #[test]
     fn self_describing_checkout_only() {

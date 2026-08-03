@@ -542,7 +542,7 @@ pub fn compose_schema(
 
         // Inline internal #/$defs/... refs so the extracted def is self-contained
         let mut inlined = ext_def.clone();
-        inline_internal_refs(&mut inlined, defs);
+        inline_internal_refs(&mut inlined, defs, &ext_schema);
 
         ext_defs.push(inlined);
     }
@@ -660,20 +660,98 @@ fn compose_container(
 /// When extracting a single definition from a schema, that definition may have
 /// internal refs to other definitions in the same schema. This function
 /// recursively inlines those refs so the extracted definition is self-contained.
+/// A `$ref: "#"` means the SOURCE file's root; it is resolved the same way the
+/// bundler does it (issue #43): inline the source root when that terminates,
+/// otherwise embed the source file as an `$id`'d `$defs` resource.
 ///
 /// # Arguments
 /// * `value` - The value to process (modified in place)
 /// * `defs` - The `$defs` object to resolve refs against
-fn inline_internal_refs(value: &mut Value, defs: &Value) {
-    inline_internal_refs_inner(value, defs, &mut HashSet::new());
+/// * `source_root` - Root of the schema file `value` was extracted from
+fn inline_internal_refs(value: &mut Value, defs: &Value, source_root: &Value) {
+    inline_internal_refs_inner(value, defs, source_root, &mut HashSet::new());
 }
 
-fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut HashSet<String>) {
+/// Resolve a `$ref: "#"` site in an extracted definition (compose twin of the
+/// loader's `inline_self_root_ref`; the source schema is already bundled here,
+/// so no file loading is involved).
+fn inline_self_root_ref_composed(
+    obj: &mut serde_json::Map<String, Value>,
+    defs: &Value,
+    source_root: &Value,
+    visited: &mut HashSet<String>,
+) {
+    obj.remove("$ref");
+    // Sibling keywords at the site are ordinary subschemas from the same
+    // source file; resolve their refs too.
+    for value in obj.values_mut() {
+        inline_internal_refs_inner(value, defs, source_root, visited);
+    }
+
+    const VISIT_KEY: &str = "self-root|";
+    let root_copy = crate::loader::root_schema_copy(source_root);
+    if !visited.contains(VISIT_KEY) && !crate::loader::contains_self_root_ref(&root_copy) {
+        let mut attempt = root_copy;
+        // The attempt is committed unconditionally: nested "#" sites that
+        // cycle back here (VISIT_KEY present) are settled inside the attempt
+        // by the embedded-resource fallback below. Discarding an attempt
+        // would leak that fallback's bookkeeping in `visited` and leave a
+        // `$ref` pointing at a resource that was never materialized.
+        visited.insert(VISIT_KEY.to_string());
+        inline_internal_refs_inner(&mut attempt, defs, source_root, visited);
+        visited.remove(VISIT_KEY);
+        let committed = crate::loader::attach_resolved_self_root(obj, attempt);
+        if committed {
+            return;
+        }
+    }
+    // Cycle through the source root: embed the source file with its $id
+    // (synthesized when missing) and point the ref at it — "#" inside the
+    // embedded copy then resolves against that $id, and the rewritten `$ref`
+    // applies in conjunction with the remaining siblings.
+    let id = match source_root.get("$id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => crate::loader::synthesized_root_id(source_root),
+    };
+    let embed_marker = format!("embedded|{}", id);
+    if !visited.contains(&embed_marker) {
+        visited.insert(embed_marker);
+        let mut resource = source_root.clone();
+        if let Value::Object(res_obj) = &mut resource {
+            res_obj
+                .entry("$id")
+                .or_insert_with(|| Value::String(id.clone()));
+        }
+        let defs_slot = obj
+            .entry("$defs")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if let Value::Object(defs_obj) = defs_slot {
+            let mut key = "bundled_self_root".to_string();
+            let mut n = 1;
+            while defs_obj.contains_key(&key) {
+                n += 1;
+                key = format!("bundled_self_root_{}", n);
+            }
+            defs_obj.insert(key, resource);
+        }
+    }
+    obj.insert("$ref".to_string(), Value::String(id));
+}
+
+fn inline_internal_refs_inner(
+    value: &mut Value,
+    defs: &Value,
+    source_root: &Value,
+    visited: &mut HashSet<String>,
+) {
     match value {
         Value::Object(obj) => {
             // Check if this object has an internal $ref
             if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
-                // Only handle internal refs to $defs (not self-root "#" refs)
+                if ref_val == "#" {
+                    inline_self_root_ref_composed(obj, defs, source_root, visited);
+                    return;
+                }
                 if let Some(def_name) = ref_val.strip_prefix("#/$defs/") {
                     // Guard against circular refs
                     if visited.contains(def_name) {
@@ -686,7 +764,7 @@ fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut Has
 
                         // Clone and recursively inline
                         let mut inlined = def.clone();
-                        inline_internal_refs_inner(&mut inlined, defs, visited);
+                        inline_internal_refs_inner(&mut inlined, defs, source_root, visited);
 
                         visited.remove(def_name);
 
@@ -704,12 +782,12 @@ fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut Has
 
             // Recurse into all values
             for v in obj.values_mut() {
-                inline_internal_refs_inner(v, defs, visited);
+                inline_internal_refs_inner(v, defs, source_root, visited);
             }
         }
         Value::Array(arr) => {
             for item in arr {
-                inline_internal_refs_inner(item, defs, visited);
+                inline_internal_refs_inner(item, defs, source_root, visited);
             }
         }
         _ => {}
@@ -926,6 +1004,48 @@ fn extract_url_path(url: &str) -> Result<String, ComposeError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn inline_internal_refs_cycle_commits_attempt_without_dangling_refs() {
+        // Un-bundled source: the root references back into the very $defs
+        // entry being extracted, and that entry references the root via "#".
+        // Extraction must terminate with every emitted $ref backed by a
+        // materialized resource — a discarded inline attempt that leaks its
+        // embed bookkeeping leaves a $ref to a resource that was never
+        // materialized, and the extracted def no longer compiles.
+        let source: Value = serde_json::from_str(
+            r##"{
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "next": { "$ref": "#/$defs/wrapped" }
+                },
+                "$defs": {
+                    "wrapped": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            {
+                                "type": "object",
+                                "properties": { "wrapped": { "type": "boolean" } }
+                            }
+                        ]
+                    }
+                }
+            }"##,
+        )
+        .unwrap();
+        let defs = source.get("$defs").unwrap().clone();
+        let mut extracted = defs.get("wrapped").unwrap().clone();
+        inline_internal_refs(&mut extracted, &defs, &source);
+
+        let validator = jsonschema::validator_for(&extracted)
+            .expect("extracted def must compile (no dangling refs)");
+        assert!(validator.is_valid(
+            &json!({"name": "a", "wrapped": true, "next": {"name": "b", "wrapped": false}})
+        ));
+        // "name" is typed at the source root, reached via "#".
+        assert!(!validator.is_valid(&json!({"name": 1})));
+    }
 
     #[test]
     fn detect_direction_response() {
