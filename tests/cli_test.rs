@@ -1954,3 +1954,274 @@ mod verbose {
             .stderr(predicate::str::contains("[resolve]").not());
     }
 }
+
+mod validate_def_selection {
+    use super::*;
+
+    // Mirrors the shipped shopping/types/payment_instrument.json shape: the
+    // selected_payment_instrument def references its file root via $ref: "#".
+    // Selecting it with --def used to re-bind "#" to the selection wrapper and
+    // crash with a stack overflow (issue #45).
+    const SELF_ROOT_SCHEMA: &str = r##"{
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://ucp.dev/schemas/shopping/types/payment_instrument.json",
+        "type": "object",
+        "required": ["handler_id", "type"],
+        "properties": {
+            "handler_id": { "type": "string" },
+            "type": { "type": "string" }
+        },
+        "additionalProperties": true,
+        "$defs": {
+            "selected_payment_instrument": {
+                "allOf": [
+                    { "$ref": "#" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "selected": { "type": "boolean" }
+                        }
+                    }
+                ]
+            }
+        }
+    }"##;
+
+    #[test]
+    fn validate_def_with_self_root_ref_accepts_valid_payload() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(&dir, "payment_instrument.json", SELF_ROOT_SCHEMA);
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{"handler_id": "h", "type": "card", "selected": true}"#,
+        );
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "selected_payment_instrument",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Valid"));
+    }
+
+    #[test]
+    fn validate_def_with_self_root_ref_rejects_invalid_payload() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(&dir, "payment_instrument.json", SELF_ROOT_SCHEMA);
+        // Missing "handler_id", which is required by the file ROOT — reachable
+        // only if "#" inside the def still means the source file's root.
+        let payload = write_temp_file(
+            &dir,
+            "payload.json",
+            r#"{"type": "card", "selected": true}"#,
+        );
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "selected_payment_instrument",
+            ])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("Validation failed"));
+    }
+
+    #[test]
+    fn validate_def_with_self_root_ref_and_no_id_synthesizes_root() {
+        // Same shape but the file has NO $id: selection must synthesize a
+        // stable root id so "#" still binds to the source root.
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "type": "object",
+                "required": ["handler_id"],
+                "properties": {
+                    "handler_id": { "type": "string" }
+                },
+                "$defs": {
+                    "selected": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "selected": { "type": "boolean" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }"##,
+        );
+        let valid = write_temp_file(
+            &dir,
+            "valid.json",
+            r#"{"handler_id": "h", "selected": true}"#,
+        );
+        let invalid = write_temp_file(&dir, "invalid.json", r#"{"selected": true}"#);
+
+        cmd()
+            .args([
+                "validate",
+                valid.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "selected",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Valid"));
+
+        cmd()
+            .args([
+                "validate",
+                invalid.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "selected",
+            ])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("Validation failed"));
+    }
+
+    #[test]
+    fn validate_def_without_self_root_ref_unchanged() {
+        // A def that never references the file root must keep validating
+        // exactly as before the #45 fix.
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "$defs": {
+                    "error_response": {
+                        "type": "object",
+                        "required": ["code"],
+                        "properties": {
+                            "code": { "type": "string" },
+                            "detail": { "$ref": "#/$defs/detail" }
+                        }
+                    },
+                    "detail": { "type": "string" }
+                }
+            }"##,
+        );
+        let valid = write_temp_file(&dir, "valid.json", r#"{"code": "oops", "detail": "broke"}"#);
+        let invalid = write_temp_file(&dir, "invalid.json", r#"{"detail": 5}"#);
+
+        cmd()
+            .args([
+                "validate",
+                valid.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "error_response",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("Valid"));
+
+        cmd()
+            .args([
+                "validate",
+                invalid.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "error_response",
+            ])
+            .assert()
+            .code(1)
+            .stderr(predicate::str::contains("Validation failed"));
+    }
+}
+
+mod resolve_def_shape {
+    use super::*;
+
+    #[test]
+    fn resolve_def_without_root_dependency_keeps_plain_wrapper_despite_sibling_root_ref() {
+        // Selecting a def with NO root dependency must emit the plain
+        // pre-#45 wrapper even when a SIBLING def carries `$ref: "#"` —
+        // root-reference detection is scoped to the selected def's
+        // reachable subgraph, not the whole file.
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "type": "object",
+                "required": ["handler_id"],
+                "properties": { "handler_id": { "type": "string" } },
+                "$defs": {
+                    "selected": {
+                        "allOf": [
+                            { "$ref": "#" },
+                            { "properties": { "selected": { "type": "boolean" } } }
+                        ]
+                    },
+                    "error_response": {
+                        "type": "object",
+                        "required": ["code"],
+                        "properties": { "code": { "type": "string" } }
+                    }
+                }
+            }"##,
+        );
+
+        cmd()
+            .args([
+                "resolve",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--def",
+                "error_response",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                r##""$ref":"#/$defs/error_response""##,
+            ))
+            .stdout(predicate::str::contains("ucp_selected_def_source").not())
+            .stdout(predicate::str::contains("urn:").not());
+    }
+}
