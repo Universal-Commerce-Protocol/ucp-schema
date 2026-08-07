@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.4.1](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.0...v1.4.1) (2026-07-24)
+
+
+### Bug Fixes
+
+* accept exact authority match in binding ([#41](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/41)) ([9b5c320](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/9b5c32066f0fe5f50918ec612ba43ad70e2547e3))
+
 ## [1.4.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.3.0...v1.4.0) (2026-06-25)
 
 
