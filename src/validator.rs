@@ -107,6 +107,9 @@ fn select_def(schema: &Value, name: &str, mode: SelectMode) -> Result<Value, Res
     if let Some(s) = schema.get("$schema") {
         wrapper.insert("$schema".to_string(), s.clone());
     }
+    if let Some(id) = schema.get("$id") {
+        wrapper.insert("$id".to_string(), id.clone());
+    }
     wrapper.insert(
         "$ref".to_string(),
         Value::String(format!("#/$defs/{}", name)),
