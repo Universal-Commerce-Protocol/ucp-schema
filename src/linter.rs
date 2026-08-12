@@ -123,6 +123,15 @@ pub fn lint(path: &Path, strict: bool) -> LintResult {
     }
 }
 
+/// Whether a document is an OpenAPI or OpenRPC service definition rather than a
+/// JSON Schema. Both declare their version under a fixed root key (`openapi` /
+/// `openrpc`), which is how their own specifications identify the document type.
+fn is_service_definition(schema: &Value) -> bool {
+    ["openapi", "openrpc"]
+        .iter()
+        .any(|key| schema.get(key).is_some_and(Value::is_string))
+}
+
 /// Lint a single schema file.
 pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     let mut diagnostics = Vec::new();
@@ -159,8 +168,10 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     // Check that `examples` entries validate against their own (sub)schema
     check_examples(&schema, file, "", &mut diagnostics);
 
-    // Check for missing $id (warning)
-    if schema.get("$id").is_none() {
+    // Check for missing $id (warning). Service definitions are OpenAPI/OpenRPC
+    // documents, not JSON Schemas: neither root object defines $id, so requiring
+    // one would ask authors to add a key their own specification rejects.
+    if schema.get("$id").is_none() && !is_service_definition(&schema) {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             code: "W002".to_string(),
@@ -1081,6 +1092,61 @@ mod tests {
             r#"{{
             "type": "object",
             "properties": {{}}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Warning);
+        assert!(result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_openapi_service_definition_skips_missing_id_warning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "Shopping", "version": "1.0.0" }},
+            "paths": {{}}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(!result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_openrpc_service_definition_skips_missing_id_warning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "openrpc": "1.3.2",
+            "info": {{ "title": "Shopping", "version": "1.0.0" }},
+            "methods": []
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(!result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_non_string_openapi_property_still_warns() {
+        // A JSON Schema describing an OpenAPI document has an `openapi`
+        // property, but it is a subschema object, not a version string.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "type": "object",
+            "properties": {{ "openapi": {{ "type": "string" }} }}
         }}"#
         )
         .unwrap();
