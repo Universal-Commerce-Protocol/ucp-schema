@@ -45,7 +45,7 @@ use serde_json::{json, Value};
 
 use crate::error::ComposeError;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
-use crate::types::{Direction, Requires, VersionConstraint};
+use crate::types::{is_valid_version, Direction, Requires, VersionConstraint};
 
 #[cfg(feature = "remote")]
 use crate::loader::{bundle_refs_remote, load_schema_url};
@@ -249,8 +249,17 @@ fn parse_capabilities_object(caps: &Value) -> Result<Vec<Capability>, ComposeErr
             .ok_or_else(|| ComposeError::InvalidCapability {
                 name: name.clone(),
                 message: "missing version field".to_string(),
-            })?
-            .to_string();
+            })?;
+        if !is_valid_version(version) {
+            return Err(ComposeError::InvalidCapability {
+                name: name.clone(),
+                message: format!(
+                    "invalid version \"{}\" (expected a valid YYYY-MM-DD date)",
+                    version
+                ),
+            });
+        }
+        let version = version.to_string();
 
         let schema_url = entry
             .get("schema")
@@ -1001,6 +1010,24 @@ mod tests {
         assert_eq!(result[0].name, "dev.ucp.shopping.checkout");
         assert_eq!(result[0].version, "2026-01-11");
         assert!(result[0].extends.is_none());
+    }
+
+    #[test]
+    fn parse_capabilities_rejects_invalid_version() {
+        let caps = json!({
+            "dev.ucp.shopping.checkout": [{
+                "version": "not-a-date",
+                "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+            }]
+        });
+
+        let err = parse_capabilities_object(&caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::InvalidCapability { name, message }
+                if name == "dev.ucp.shopping.checkout"
+                    && message.contains("valid YYYY-MM-DD date")
+        ));
     }
 
     #[test]
