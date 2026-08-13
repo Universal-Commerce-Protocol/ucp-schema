@@ -105,6 +105,7 @@ Options:
   --schema-local-base <dir>   Local directory for schema resolution
   --schema-remote-base <url>  URL prefix to strip when mapping to local
   --strict                    Inject additionalProperties: false (see Concepts > Strict Mode)
+  --include-future            Include planned fields with transition metadata, but not in required
   --verbose, -v               Print pipeline stages to stderr
 ```
 
