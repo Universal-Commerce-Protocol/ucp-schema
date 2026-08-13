@@ -185,7 +185,13 @@ fn bundle_refs_inner(
                     if ref_val == "#" {
                         // Leave as-is - can't inline recursive self-reference
                     } else if let Some(root) = file_root {
+                        let visit_key = internal_ref_visit_key(root, ref_val);
+                        if visited.contains(&visit_key) {
+                            return Ok(());
+                        }
+
                         let mut target = navigate_fragment(root, ref_val)?;
+                        visited.insert(visit_key.clone());
                         // Recursively process (may have nested refs)
                         bundle_refs_inner(
                             &mut target,
@@ -195,6 +201,7 @@ fn bundle_refs_inner(
                             url_remote_base,
                             visited,
                         )?;
+                        visited.remove(&visit_key);
                         // Inline the resolved definition
                         obj.remove("$ref");
                         if let Value::Object(ref_obj) = target {
@@ -302,6 +309,10 @@ fn bundle_refs_inner(
     Ok(())
 }
 
+fn internal_ref_visit_key(root: &Value, ref_val: &str) -> String {
+    format!("internal:{:p}|{}", root, ref_val)
+}
+
 /// Resolve a $ref value to a local file path.
 ///
 /// If URL mapping is configured and the ref matches the remote base,
@@ -361,8 +372,15 @@ fn bundle_refs_remote_inner(
                     if ref_val == "#" {
                         // Self-reference, leave as-is
                     } else if let Some(root) = file_root {
+                        let visit_key = internal_ref_visit_key(root, ref_val);
+                        if visited.contains(&visit_key) {
+                            return Ok(());
+                        }
+
                         let mut target = navigate_fragment(root, ref_val)?;
+                        visited.insert(visit_key.clone());
                         bundle_refs_remote_inner(&mut target, base_url, file_root, visited)?;
+                        visited.remove(&visit_key);
                         obj.remove("$ref");
                         if let Value::Object(ref_obj) = target {
                             for (k, v) in ref_obj {
@@ -597,6 +615,28 @@ mod tests {
         assert_eq!(path, Path::new("/local/schemas/foo.json"));
     }
 
+    #[test]
+    fn bundle_refs_preserves_recursive_internal_ref() {
+        let mut schema = serde_json::json!({
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": {
+                        "next": {
+                            "$ref": "#/$defs/node"
+                        }
+                    }
+                }
+            },
+            "$ref": "#/$defs/node"
+        });
+
+        bundle_refs(&mut schema, Path::new(".")).unwrap();
+
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["next"]["$ref"], "#/$defs/node");
+    }
+
     // Remote tests run against a local mockito server so they're deterministic
     // and offline — no dependency on a live third party. The connection-error
     // case uses a reserved `.invalid` host (RFC 2606), which fails to resolve
@@ -655,6 +695,28 @@ mod tests {
             let result = load_schema_auto(&format!("{}/schema.json", server.url()));
             assert_eq!(result.unwrap()["type"], "string");
             mock.assert();
+        }
+
+        #[test]
+        fn bundle_refs_remote_preserves_recursive_internal_ref() {
+            let mut schema = serde_json::json!({
+                "$defs": {
+                    "node": {
+                        "type": "object",
+                        "properties": {
+                            "next": {
+                                "$ref": "#/$defs/node"
+                            }
+                        }
+                    }
+                },
+                "$ref": "#/$defs/node"
+            });
+
+            bundle_refs_remote(&mut schema, "https://example.com/schema.json").unwrap();
+
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["properties"]["next"]["$ref"], "#/$defs/node");
         }
     }
 }
