@@ -1424,6 +1424,76 @@ mod compose {
     }
 }
 
+mod lint_command {
+    use super::*;
+
+    #[test]
+    fn valid_schema_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }"#,
+        );
+
+        cmd()
+            .args(["lint", schema.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("all passed"));
+    }
+
+    #[test]
+    fn broken_internal_ref_fails_with_diagnostic_code() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "$ref": "#/$defs/missing"
+            }"##,
+        );
+
+        cmd()
+            .args(["lint", schema.to_str().unwrap()])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("E003"));
+    }
+
+    #[test]
+    fn json_output_is_parseable() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "type": "string"
+            }"#,
+        );
+
+        let assert = cmd()
+            .args(["lint", schema.to_str().unwrap(), "--format", "json"])
+            .assert()
+            .success();
+        let output: serde_json::Value =
+            serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+        assert_eq!(output["files_checked"], 1);
+        assert_eq!(output["errors"], 0);
+        assert_eq!(output["results"].as_array().unwrap().len(), 1);
+    }
+}
+
 /// Compose subcommand tests — output composed schemas (annotations preserved)
 mod compose_command {
     use super::*;
