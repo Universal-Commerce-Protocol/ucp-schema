@@ -31,7 +31,7 @@ For example, a field annotated with `"ucp_request": {"create": "omit", "update":
 | Validate a catalog (container) response             | `validate response.json --op search --response --schema-local-base ./schemas` |
 | Validate against a named shape (request/error/view) | `validate payload.json --schema s.json --op read --def error_response`        |
 | Check schemas for errors before runtime             | `lint schemas/`                                                               |
-| Debug what the pipeline is doing                    | Add `--verbose` to any command                                                |
+| Debug compose, resolve, or validate                 | Add `--verbose` to that command                                               |
 
 ## Installation
 
@@ -594,7 +594,8 @@ ucp-schema resolve schema.json --request --op create --strict --pretty
 
 ## Debugging with `--verbose`
 
-All commands accept `--verbose` (or `-v`) to print pipeline stages to stderr:
+The `compose`, `resolve`, and `validate` commands accept `--verbose` (or `-v`)
+to print pipeline stages to stderr:
 
 ```bash
 $ ucp-schema resolve response.json --op read --schema-local-base ./schemas --verbose
