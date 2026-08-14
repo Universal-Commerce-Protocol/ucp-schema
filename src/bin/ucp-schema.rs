@@ -796,6 +796,11 @@ fn report_error(json_output: bool, msg: &str) {
 fn run_lint(path: &Path, format: &str, strict: bool, quiet: bool) -> Result<(), u8> {
     use ucp_schema::Severity;
 
+    if !matches!(format, "text" | "json") {
+        eprintln!("Error: unsupported lint output format: {format}. Use 'text' or 'json'.");
+        return Err(2);
+    }
+
     if !path.exists() {
         eprintln!("Error: path not found: {}", path.display());
         return Err(2);
