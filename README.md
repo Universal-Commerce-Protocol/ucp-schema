@@ -127,7 +127,7 @@ ucp-schema resolve my_extension.json --response --op read --bundle \
 ucp-schema resolve my_extension.json --response --op read --bundle
 
 # Resolve from URL
-ucp-schema resolve https://ucp.dev/schemas/checkout.json --request --op create
+ucp-schema resolve https://ucp.dev/2026-04-08/schemas/shopping/checkout.json --request --op create
 ```
 
 ### `validate` — Validate payload against resolved schema
