@@ -345,8 +345,13 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
             }
         }
 
-        // Recurse
+        // Recurse into child schemas, but not into keywords that hold JSON
+        // instance data. Business payloads may legitimately contain fields
+        // named like UCP annotations.
         for (key, val) in map {
+            if matches!(key.as_str(), "default" | "const" | "examples" | "enum") {
+                continue;
+            }
             let child_path = format!("{}/{}", path, key);
             check_annotations(val, file, &child_path, diagnostics);
         }
@@ -935,6 +940,31 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Error);
         assert!(result.diagnostics.iter().any(|d| d.code == "E004"));
+    }
+
+    #[test]
+    fn lint_does_not_check_annotations_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "ucp_request": "invalid_value" }},
+            "const": {{ "ucp_response": "invalid_value" }},
+            "examples": [{{ "ucp_response": "invalid_value" }}],
+            "enum": [{{ "ucp_response": "invalid_value" }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E004"),
+            "instance data should not produce E004: {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
