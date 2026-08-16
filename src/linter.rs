@@ -221,6 +221,11 @@ fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<
                 }
             }
             for (key, child) in map {
+                // These keywords hold JSON instance data, not child schemas.
+                // Business fields named `examples` must not be linted as schemas.
+                if matches!(key.as_str(), "default" | "const" | "examples" | "enum") {
+                    continue;
+                }
                 let child_path = format!("{}/{}", path, key);
                 check_examples(child, file, &child_path, diagnostics);
             }
@@ -829,6 +834,31 @@ mod tests {
         assert!(
             !result.diagnostics.iter().any(|d| d.code == "E008"),
             "valid examples should not produce E008: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_does_not_check_examples_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "type": "string", "examples": [123] }},
+            "const": {{ "type": "string", "examples": [123] }},
+            "examples": [{{ "type": "string", "examples": [123] }}],
+            "enum": [{{ "type": "string", "examples": [123] }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E008"),
+            "instance data should not produce E008: {:?}",
             result.diagnostics
         );
     }
