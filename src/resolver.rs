@@ -321,6 +321,11 @@ fn resolve_object(
                 // Will be handled at the end after processing properties
                 continue;
             }
+            "default" | "const" | "examples" | "enum" => {
+                // These keywords hold JSON instance data, not child schemas.
+                // Preserve business fields that happen to share UCP annotation names.
+                result.insert(key.clone(), value.clone());
+            }
             _ => {
                 // Other keys - recurse if object/array, otherwise copy
                 let resolved = resolve_value(value, options, &child_path)?;
@@ -640,9 +645,15 @@ fn strip_annotations_recursive(value: &Value) -> Value {
         Value::Object(map) => {
             let mut result = Map::new();
             for (k, v) in map {
-                if !UCP_ANNOTATIONS.contains(&k.as_str()) {
-                    result.insert(k.clone(), strip_annotations_recursive(v));
+                if UCP_ANNOTATIONS.contains(&k.as_str()) {
+                    continue;
                 }
+                let value = if matches!(k.as_str(), "default" | "const" | "examples" | "enum") {
+                    v.clone()
+                } else {
+                    strip_annotations_recursive(v)
+                };
+                result.insert(k.clone(), value);
             }
             Value::Object(result)
         }
