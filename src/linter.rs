@@ -251,6 +251,11 @@ fn check_refs(
             }
 
             for (key, val) in map {
+                // These keywords hold JSON instance data, not child schemas.
+                // A business payload field named `$ref` should not be resolved.
+                if matches!(key.as_str(), "default" | "const" | "examples" | "enum") {
+                    continue;
+                }
                 let child_path = format!("{}/{}", path, key);
                 check_refs(val, file, file_dir, &child_path, root, diagnostics);
             }
@@ -913,6 +918,31 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Error);
         assert!(result.diagnostics.iter().any(|d| d.code == "E002"));
+    }
+
+    #[test]
+    fn lint_does_not_check_refs_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "$ref": "business-id" }},
+            "const": {{ "$ref": "business-id" }},
+            "examples": [{{ "$ref": "business-id" }}],
+            "enum": [{{ "$ref": "business-id" }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E002"),
+            "instance data should not produce E002: {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
