@@ -221,6 +221,11 @@ fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<
                 }
             }
             for (key, child) in map {
+                // `examples` contains instance data, not nested schemas. Walking
+                // into it can reinterpret business fields as schema keywords.
+                if key == "examples" {
+                    continue;
+                }
                 let child_path = format!("{}/{}", path, key);
                 check_examples(child, file, &child_path, diagnostics);
             }
@@ -863,6 +868,27 @@ mod tests {
             result.diagnostics
         );
         assert_eq!(e008[0].path, "/examples/1");
+    }
+
+    #[test]
+    fn lint_does_not_recurse_into_example_instances() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/config.json",
+            "type": "object",
+            "examples": [{{
+                "type": "string",
+                "examples": [123]
+            }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(result.diagnostics.is_empty());
     }
 
     #[test]
