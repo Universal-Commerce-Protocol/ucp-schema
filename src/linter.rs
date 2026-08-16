@@ -188,6 +188,11 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     }
 }
 
+fn pointer_path(path: &str, token: &str) -> String {
+    let escaped = token.replace('~', "~0").replace('/', "~1");
+    format!("{}/{}", path, escaped)
+}
+
 /// Validate that every `examples` entry conforms to its enclosing (sub)schema.
 ///
 /// `examples` is an annotation that validators ignore, so a listed value that
@@ -221,7 +226,7 @@ fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<
                 }
             }
             for (key, child) in map {
-                let child_path = format!("{}/{}", path, key);
+                let child_path = pointer_path(path, key);
                 check_examples(child, file, &child_path, diagnostics);
             }
         }
@@ -251,7 +256,7 @@ fn check_refs(
             }
 
             for (key, val) in map {
-                let child_path = format!("{}/{}", path, key);
+                let child_path = pointer_path(path, key);
                 check_refs(val, file, file_dir, &child_path, root, diagnostics);
             }
         }
@@ -347,7 +352,7 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
 
         // Recurse
         for (key, val) in map {
-            let child_path = format!("{}/{}", path, key);
+            let child_path = pointer_path(path, key);
             check_annotations(val, file, &child_path, diagnostics);
         }
     } else if let Value::Array(arr) = value {
@@ -366,7 +371,7 @@ fn check_annotation_value(
     path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let annotation_path = format!("{}/{}", path, key);
+    let annotation_path = pointer_path(path, key);
 
     match annotation {
         Value::String(s) => {
@@ -386,7 +391,7 @@ fn check_annotation_value(
         Value::Object(map) => {
             // Object form: { "create": "omit", "update": "required" }
             for (op, val) in map {
-                let op_path = format!("{}/{}", annotation_path, op);
+                let op_path = pointer_path(&annotation_path, op);
 
                 // Handle shorthand transition key
                 if op == "transition" {
@@ -565,7 +570,7 @@ fn check_version_constraint(
                 severity: Severity::Warning,
                 code: "W005".to_string(),
                 file: file.to_path_buf(),
-                path: format!("{}/{}", path, key),
+                path: pointer_path(path, key),
                 message: format!(
                     "unknown key \"{}\" in version constraint: expected min, max",
                     key
@@ -687,7 +692,7 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
                 severity: Severity::Warning,
                 code: "W005".to_string(),
                 file: file.to_path_buf(),
-                path: format!("{}/{}", requires_path, key),
+                path: pointer_path(requires_path, key),
                 message: format!(
                     "unknown key \"{}\" in requires: expected protocol, capabilities",
                     key
@@ -734,7 +739,7 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
             .unwrap_or_default();
 
         for (cap_name, constraint) in caps_obj {
-            let cap_path = format!("{}/{}", caps_path, cap_name);
+            let cap_path = pointer_path(&caps_path, cap_name);
 
             check_version_constraint(constraint, file, &cap_path, diagnostics);
 
@@ -831,6 +836,43 @@ mod tests {
             "valid examples should not produce E008: {:?}",
             result.diagnostics
         );
+    }
+
+    #[test]
+    fn lint_escapes_dynamic_json_pointer_tokens() {
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("schema.json");
+        std::fs::write(
+            &file_path,
+            r#"{
+                "$id": "https://example.com/test.json",
+                "type": "object",
+                "properties": {
+                    "a/b~c": {
+                        "type": "string",
+                        "ucp_request": "invalid",
+                        "examples": [123]
+                    },
+                    "ref/a~b": { "$ref": "missing.json" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = lint_file(&file_path, dir.path());
+        let expected_paths = [
+            ("E002", "/properties/ref~1a~0b"),
+            ("E004", "/properties/a~1b~0c/ucp_request"),
+            ("E008", "/properties/a~1b~0c/examples/0"),
+        ];
+        for (code, expected_path) in expected_paths {
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|d| d.code == code)
+                .unwrap_or_else(|| panic!("missing {code}: {:?}", result.diagnostics));
+            assert_eq!(diagnostic.path, expected_path);
+        }
     }
 
     #[test]
