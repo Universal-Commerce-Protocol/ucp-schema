@@ -600,13 +600,48 @@ fn inject_annotations(
     Ok(branch)
 }
 
-/// Validate that allOf branches don't declare contradictory types on the same property.
+/// Return the JSON instance types accepted by a `type` keyword.
 ///
-/// Only checks string-form `"type"` values. Array-form types (e.g. `["string", "null"]`)
-/// are intentionally skipped — they're rare and the semantic comparison is non-trivial.
+/// `number` includes integer instances. Invalid type expressions are left for
+/// JSON Schema validation rather than treated as conflicts here.
+fn accepted_json_types(value: &Value) -> Option<std::collections::HashSet<&'static str>> {
+    fn insert_type(value: &str, types: &mut std::collections::HashSet<&'static str>) -> Option<()> {
+        let value = match value {
+            "null" => "null",
+            "boolean" => "boolean",
+            "object" => "object",
+            "array" => "array",
+            "number" => "number",
+            "integer" => "integer",
+            "string" => "string",
+            _ => return None,
+        };
+        types.insert(value);
+        if value == "number" {
+            types.insert("integer");
+        }
+        Some(())
+    }
+
+    let mut types = std::collections::HashSet::new();
+    match value {
+        Value::String(value) => insert_type(value, &mut types)?,
+        Value::Array(values) if !values.is_empty() => {
+            for value in values {
+                insert_type(value.as_str()?, &mut types)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(types)
+}
+
+/// Validate that allOf branches don't declare disjoint types on the same property.
 fn validate_allof_types(branches: &[Value], path: &str) -> Result<(), ResolveError> {
-    let mut prop_types: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut prop_types: std::collections::HashMap<
+        String,
+        (std::collections::HashSet<&'static str>, String),
+    > = std::collections::HashMap::new();
     for branch in branches {
         let props = branch
             .as_object()
@@ -615,18 +650,24 @@ fn validate_allof_types(branches: &[Value], path: &str) -> Result<(), ResolveErr
         if let Some(props) = props {
             for (name, prop) in props {
                 if let Some(type_val) = prop.as_object().and_then(|p| p.get("type")) {
-                    if let Some(type_str) = type_val.as_str() {
-                        if let Some(existing) = prop_types.get(name) {
-                            if existing != type_str {
-                                return Err(ResolveError::TypeConflict {
-                                    path: format!("{}/properties/{}", path, name),
-                                    base_type: existing.clone(),
-                                    ext_type: type_str.to_string(),
-                                });
-                            }
-                        } else {
-                            prop_types.insert(name.clone(), type_str.to_string());
+                    let Some(types) = accepted_json_types(type_val) else {
+                        continue;
+                    };
+                    let display = type_val
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| type_val.to_string());
+                    if let Some((accepted, base_type)) = prop_types.get_mut(name) {
+                        accepted.retain(|value| types.contains(value));
+                        if accepted.is_empty() {
+                            return Err(ResolveError::TypeConflict {
+                                path: format!("{}/properties/{}", path, name),
+                                base_type: base_type.clone(),
+                                ext_type: display,
+                            });
                         }
+                    } else {
+                        prop_types.insert(name.clone(), (types, display));
                     }
                 }
             }

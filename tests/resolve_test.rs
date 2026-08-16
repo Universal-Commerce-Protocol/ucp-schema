@@ -1053,6 +1053,26 @@ mod allof_propagation {
     }
 
     #[test]
+    fn array_form_types_use_json_schema_intersection_semantics() {
+        let resolve_types = |base_type: Value, ext_type: Value| {
+            let schema = json!({
+                "allOf": [
+                    { "properties": { "value": { "type": base_type } } },
+                    { "properties": { "value": { "type": ext_type } } }
+                ]
+            });
+            resolve(&schema, &ResolveOptions::new(Direction::Response, "search"))
+        };
+
+        assert!(matches!(
+            resolve_types(json!(["string", "null"]), json!("number")),
+            Err(ResolveError::TypeConflict { .. })
+        ));
+        assert!(resolve_types(json!(["string", "null"]), json!("string")).is_ok());
+        assert!(resolve_types(json!("number"), json!("integer")).is_ok());
+    }
+
+    #[test]
     fn same_type_no_conflict() {
         let schema = json!({
             "allOf": [
