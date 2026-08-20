@@ -509,3 +509,61 @@ fn explicit_def_validates_fragment_end_to_end() {
         ResolveOptions::new(Direction::Request, "create").def_name(Some("checkout".to_string()));
     assert!(validate(&schema, &payload, &def_opts).is_ok());
 }
+
+/// Issue #45, library level (PR #47's territory): selecting a `$defs` entry
+/// whose subtree carries `$ref: "#"` must keep `#` meaning the SOURCE
+/// document's root. The wrapper built here replaces that root, so without
+/// anchoring, `#` resolved to the wrapper — historically a stack overflow,
+/// on jsonschema 0.49 a silent under-constraint (the source root's
+/// `required` never applied). Library callers hand select/validate an
+/// unbundled document and hit the wrapper directly; the CLI path is
+/// shielded by bundling.
+#[test]
+fn select_def_with_self_root_ref_validates_against_source_root() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.test/instrument.json",
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string" } },
+        "$defs": {
+            "selected": {
+                "allOf": [
+                    { "$ref": "#" },
+                    { "type": "object", "properties": { "selected": { "type": "boolean" } } }
+                ]
+            }
+        }
+    });
+    let opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("selected".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+    assert!(validator.is_valid(&json!({ "id": "i1", "selected": true })));
+    assert!(
+        !validator.is_valid(&json!({ "selected": true })),
+        "the source root's required[id] must reach the selected def"
+    );
+}
+
+/// Same anchoring, without `$id`: the wrapper synthesizes a URN so the
+/// embedded source stays addressable.
+#[test]
+fn select_def_self_root_ref_without_id_synthesizes_identity() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["kind"],
+        "properties": { "kind": { "type": "string" } },
+        "$defs": {
+            "variant": { "allOf": [ { "$ref": "#" } ] }
+        }
+    });
+    let opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("variant".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+    assert!(validator.is_valid(&json!({ "kind": "a" })));
+    assert!(!validator.is_valid(&json!({})));
+}
