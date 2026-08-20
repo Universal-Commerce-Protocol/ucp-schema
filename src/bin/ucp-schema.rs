@@ -114,7 +114,8 @@ enum Commands {
         #[arg(long)]
         pretty: bool,
 
-        /// Dereference all $ref pointers (bundle into single schema; schema input only)
+        /// Materialize external $refs into a self-contained schema; recursive
+        /// references are retained with their resource identity (schema input only)
         #[arg(long)]
         bundle: bool,
 

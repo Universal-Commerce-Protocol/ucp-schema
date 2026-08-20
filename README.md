@@ -101,7 +101,7 @@ Options:
                               schema (container capabilities; see Concepts)
   --pretty                    Pretty-print JSON output
   --output <path>             Write to file instead of stdout
-  --bundle                    Inline external $ref pointers (schema input only; payloads bundle automatically)
+  --bundle                    Materialize external $refs into a self-contained schema (schema input only; payloads bundle automatically)
   --schema-local-base <dir>   Local directory for schema resolution
   --schema-remote-base <url>  URL prefix to strip when mapping to local
   --strict                    Inject additionalProperties: false (see Concepts > Strict Mode)
@@ -575,11 +575,13 @@ Bundling applies to **schema file input only**. When resolving payloads, composi
 
 How it works:
 
-- File refs (`"$ref": "types/buyer.json"`) are loaded and inlined
-- Fragment refs (`"$ref": "types/common.json#/$defs/address"`) navigate to the target definition
-- Internal refs in external files (`"$ref": "#/$defs/foo"`) resolve against their source file
-- Self-referential types (`"$ref": "#"`) are preserved (can't be inlined)
-- Circular references are detected and reported as errors
+- Reference resolution (base URIs, lexical scope, fragments, anchors) is delegated to the [`jsonschema`](https://docs.rs/jsonschema) crate's referencing engine, which is tested against the official JSON Schema suite. Documents are loaded from disk relative to the referencing file's directory, through `--schema-local-base`/`--schema-remote-base` URL mapping, or over HTTP.
+- Acyclic refs — whole-file (`"$ref": "types/buyer.json"`) and fragment (`"$ref": "types/common.json#/$defs/address"`) — are materialized in place. Materialized copies shed their `$id`/`$schema`: they become ordinary subschemas (Draft 2020-12 §8.1.1).
+- Recursive references (including cycles across files) are legal and retained as `$ref`s inside an embedded copy of their resource that keeps its `$id`, so `"$ref": "#"` keeps denoting the _referenced_ resource's root — never the bundling document's.
+- `$ref` sibling keywords apply conjunctively per Draft 2020-12. Non-conflicting siblings merge flat (annotations: the use site wins); genuinely conflicting constraints are preserved as an explicit `allOf` conjunction.
+- `$ref`-shaped objects inside instance data (`const`, `enum`, `default`, `examples`) are payload, not references: they survive byte-for-byte and are never fetched.
+
+The bundled output validates identically to the unbundled multi-file schema under any conforming Draft 2020-12 validator.
 
 ### Strict Mode
 
