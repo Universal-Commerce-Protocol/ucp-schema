@@ -131,7 +131,7 @@ pub fn validate_against_schema(schema: &Value, payload: &Value) -> Result<(), Va
     let errors: Vec<SchemaError> = validator
         .iter_errors(payload)
         .map(|e| SchemaError {
-            path: e.instance_path.to_string(),
+            path: e.instance_path().to_string(),
             message: e.to_string(),
         })
         .collect();
