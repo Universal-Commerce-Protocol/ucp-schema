@@ -449,3 +449,279 @@ fn hoisting_does_not_restructure_enum_members() {
     assert!(oracle_is_valid(&bundled, &json!({ "name": "x" })));
     assert!(!oracle_is_valid(&bundled, &json!({ "name": 7 })));
 }
+
+/// The transitive closure: a fetched document's *own* external refs must
+/// also resolve (root → mid → leaf). Distilled from the corpus chain
+/// capability.json → ucp.json → common types, which the registry must be
+/// pre-populated to satisfy.
+#[test]
+fn transitively_referenced_documents_resolve() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("leaf.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/leaf.json",
+            "type": "integer",
+            "minimum": 1
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("mid.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/mid.json",
+            "type": "object",
+            "properties": { "leaf": { "$ref": "leaf.json" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("root.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/root.json",
+            "type": "object",
+            "properties": { "mid": { "$ref": "mid.json" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "root.json");
+    assert!(oracle_is_valid(&bundled, &json!({ "mid": { "leaf": 2 } })));
+    assert!(!oracle_is_valid(&bundled, &json!({ "mid": { "leaf": 0 } })));
+}
+
+/// A fragment ref into a fetched resource whose target pointer-refs a
+/// *sibling* definition: `#/$defs/wrapper` inside lib.json refs
+/// `#/$defs/base` — both pointers must keep resolving within lib.json.
+#[test]
+fn fragment_target_referencing_sibling_def_resolves_in_source_resource() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("lib.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/lib.json",
+            "$defs": {
+                "base": { "type": "string", "minLength": 2 },
+                "wrapper": {
+                    "type": "object",
+                    "properties": { "value": { "$ref": "#/$defs/base" } }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("root.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/root.json",
+            "type": "object",
+            "properties": { "w": { "$ref": "lib.json#/$defs/wrapper" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "root.json");
+    assert!(oracle_is_valid(
+        &bundled,
+        &json!({ "w": { "value": "ok" } })
+    ));
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "w": { "value": "x" } })),
+        "sibling-def minLength must survive materialization"
+    );
+}
+
+/// Materialization must not swallow UCP resolver diagnostics: a base
+/// requirement weakened by an extension branch is a monotonicity violation
+/// whether the base arrives inline or through an external `$ref`.
+#[test]
+fn external_allof_monotonicity_violation_still_errors() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("base.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/base.json",
+            "type": "object",
+            "required": ["id"],
+            "properties": { "id": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ext.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/ext.json",
+            "allOf": [
+                { "$ref": "base.json" },
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string", "ucp_response": "omit" }
+                    }
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "ext.json");
+    let opts = ucp_schema::ResolveOptions::new(ucp_schema::Direction::Response, "search");
+    assert!(
+        matches!(
+            ucp_schema::resolve(&bundled, &opts),
+            Err(ucp_schema::ResolveError::MonotonicityViolation { .. })
+        ),
+        "omitting a base-required field must stay a monotonicity violation after bundling"
+    );
+}
+
+/// Same for type conflicts across externally referenced allOf branches.
+#[test]
+fn external_allof_type_conflict_still_errors() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("base.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/base.json",
+            "type": "object",
+            "properties": { "count": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ext.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/ext.json",
+            "allOf": [
+                { "$ref": "base.json" },
+                {
+                    "type": "object",
+                    "properties": { "count": { "type": "number" } }
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "ext.json");
+    let opts = ucp_schema::ResolveOptions::new(ucp_schema::Direction::Response, "search");
+    assert!(matches!(
+        ucp_schema::resolve(&bundled, &opts),
+        Err(ucp_schema::ResolveError::TypeConflict { .. })
+    ));
+}
+
+/// Strict resolution across a materialized external ref: the composed
+/// schema must reject unknown fields while accepting fields contributed by
+/// every branch (unevaluatedProperties semantics over allOf).
+#[test]
+fn strict_mode_closes_bundled_composition() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("base.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/base.json",
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("ext.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/ext.json",
+            "allOf": [
+                { "$ref": "base.json" },
+                {
+                    "type": "object",
+                    "properties": { "note": { "type": "string" } }
+                }
+            ]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "ext.json");
+    let opts =
+        ucp_schema::ResolveOptions::new(ucp_schema::Direction::Response, "search").strict(true);
+    let resolved = ucp_schema::resolve(&bundled, &opts).expect("strict resolve succeeds");
+
+    assert!(oracle_is_valid(
+        &resolved,
+        &json!({ "id": "a", "note": "b" })
+    ));
+    assert!(
+        !oracle_is_valid(&resolved, &json!({ "id": "a", "unknown": true })),
+        "strict mode must reject fields no branch declares"
+    );
+}
+
+/// The #744 shape over HTTP: remote bundling must preserve the fetched
+/// resource's root for its internal `$ref: "#"` exactly like local bundling.
+#[cfg(feature = "remote")]
+#[test]
+fn remote_fragment_ref_preserves_target_resource_root() {
+    let mut server = mockito::Server::new();
+    let a = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": format!("{}/a.json", server.url()),
+        "type": "object",
+        "properties": {
+            "properties": {
+                "type": "object",
+                "additionalProperties": { "$ref": "#" }
+            }
+        },
+        "additionalProperties": false
+    });
+    let _a = server
+        .mock("GET", "/a.json")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(a.to_string())
+        .create();
+
+    let mut schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": format!("{}/b.json", server.url()),
+        "type": "object",
+        "properties": {
+            "path": { "type": "string" },
+            "properties": { "$ref": "a.json#/properties/properties" }
+        },
+        "additionalProperties": false
+    });
+    ucp_schema::bundle_refs_remote(&mut schema, &format!("{}/b.json", server.url()))
+        .expect("remote bundling succeeds");
+
+    assert!(!oracle_is_valid(
+        &schema,
+        &json!({ "properties": { "line": { "path": "$" } } })
+    ));
+    assert!(oracle_is_valid(
+        &schema,
+        &json!({ "path": "$", "properties": { "line": { "properties": {} } } })
+    ));
+}
