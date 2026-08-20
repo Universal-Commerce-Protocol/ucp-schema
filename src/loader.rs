@@ -446,8 +446,6 @@ fn flatten(
 /// dereference, which walks `const`/`enum`/`default` values as if they were
 /// schemas and tries to resolve payload that merely looks like a reference.
 const INSTANCE_REF_SENTINEL: &str = "__ucp_instance_ref__";
-/// Keywords whose values are instance data, not subschemas.
-const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
 /// Rename `$ref` keys inside instance-data subtrees so no resolver touches
 /// them. Restored verbatim by [`unmask_instance_refs`] on the final output
@@ -525,85 +523,58 @@ fn unmask_instance_refs(value: &mut Value) {
     }
 }
 
-/// Keywords whose object values map names to subschemas.
-const MAP_SCHEMA_KEYWORDS: &[&str] = &[
-    "$defs",
-    "properties",
-    "patternProperties",
-    "dependentSchemas",
-];
-/// Keywords whose array elements are subschemas.
-const ARRAY_SCHEMA_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
-/// Keywords whose value is a single subschema.
-const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
-    "items",
-    "not",
-    "if",
-    "then",
-    "else",
-    "contains",
-    "additionalProperties",
-    "propertyNames",
-    "unevaluatedProperties",
-    "unevaluatedItems",
-    "contentSchema",
-];
+/// Keywords whose values are instance data, not subschemas.
+const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
-/// Visit `schema` and every subschema reachable through known applicator and
-/// storage keywords, mutating each visited node.
+/// Visit `schema` and every object reachable from it, *except* subtrees under
+/// instance-data keywords (`const`, `enum`, `default`, `examples`).
 ///
-/// The structural passes (sibling hoisting, allOf collapse, identity
-/// stripping, external-ref crawling) must not treat *instance data* as
-/// schema: a `$ref`-shaped object inside `const`, `enum`, `default`, or an
-/// unknown extension keyword is payload, not a reference. Upstream
-/// dereference is keyword-aware for the same reason; a blind walk would
-/// corrupt such values or chase phantom documents.
+/// Deliberately default-open rather than keyword-guided: UCP nests schemas
+/// under domain positions no keyword table can enumerate — capability
+/// containers (`$defs/<name>/platform_schema`), embedded-transport method
+/// declarations (`embedded.methods.<m>.result.schema`), and future
+/// extension carriers. A closed walker silently skips those, leaving their
+/// refs uncrawled and their siblings unprotected. The only positions that
+/// must never be treated as schema are instance data, which is exactly what
+/// the exclusion list names. `$ref`-shaped payload under *non-standard*
+/// carriers remains out of reach of any static rule; upstream dereference
+/// walks blindly there too, so behavior matches the validator.
 fn for_each_subschema_mut(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
-    let Value::Object(obj) = schema else { return };
-    f(obj);
-    for keyword in MAP_SCHEMA_KEYWORDS {
-        if let Some(Value::Object(children)) = obj.get_mut(*keyword) {
-            for child in children.values_mut() {
+    match schema {
+        Value::Object(obj) => {
+            f(obj);
+            for (key, child) in obj.iter_mut() {
+                if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                    for_each_subschema_mut(child, f);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
                 for_each_subschema_mut(child, f);
             }
         }
-    }
-    for keyword in ARRAY_SCHEMA_KEYWORDS {
-        if let Some(Value::Array(children)) = obj.get_mut(*keyword) {
-            for child in children.iter_mut() {
-                for_each_subschema_mut(child, f);
-            }
-        }
-    }
-    for keyword in SINGLE_SCHEMA_KEYWORDS {
-        if let Some(child) = obj.get_mut(*keyword) {
-            for_each_subschema_mut(child, f);
-        }
+        _ => {}
     }
 }
 
 /// Immutable twin of [`for_each_subschema_mut`].
 fn for_each_subschema(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
-    let Value::Object(obj) = schema else { return };
-    f(obj);
-    for keyword in MAP_SCHEMA_KEYWORDS {
-        if let Some(Value::Object(children)) = obj.get(*keyword) {
-            for child in children.values() {
+    match schema {
+        Value::Object(obj) => {
+            f(obj);
+            for (key, child) in obj {
+                if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                    for_each_subschema(child, f);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr {
                 for_each_subschema(child, f);
             }
         }
-    }
-    for keyword in ARRAY_SCHEMA_KEYWORDS {
-        if let Some(Value::Array(children)) = obj.get(*keyword) {
-            for child in children {
-                for_each_subschema(child, f);
-            }
-        }
-    }
-    for keyword in SINGLE_SCHEMA_KEYWORDS {
-        if let Some(child) = obj.get(*keyword) {
-            for_each_subschema(child, f);
-        }
+        _ => {}
     }
 }
 
@@ -639,25 +610,13 @@ fn collapse_and_strip(schema: &mut Value, is_root: bool) {
     let Value::Object(_) = schema else { return };
 
     // Children first so nested one-branch allOfs collapse before parents.
+    // Same default-open traversal as the walkers: recurse everywhere except
+    // instance-data subtrees, whose values must survive byte-for-byte.
     {
         let obj = schema.as_object_mut().expect("checked above");
-        for keyword in MAP_SCHEMA_KEYWORDS {
-            if let Some(Value::Object(children)) = obj.get_mut(*keyword) {
-                for child in children.values_mut() {
-                    collapse_and_strip(child, false);
-                }
-            }
-        }
-        for keyword in ARRAY_SCHEMA_KEYWORDS {
-            if let Some(Value::Array(children)) = obj.get_mut(*keyword) {
-                for child in children.iter_mut() {
-                    collapse_and_strip(child, false);
-                }
-            }
-        }
-        for keyword in SINGLE_SCHEMA_KEYWORDS {
-            if let Some(child) = obj.get_mut(*keyword) {
-                collapse_and_strip(child, false);
+        for (key, child) in obj.iter_mut() {
+            if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                collapse_children(child);
             }
         }
     }
@@ -701,6 +660,15 @@ fn collapse_and_strip(schema: &mut Value, is_root: bool) {
         let obj = schema.as_object_mut().expect("checked above");
         obj.remove("$id");
         obj.remove("$schema");
+    }
+}
+
+/// Recurse [`collapse_and_strip`] through arrays and objects uniformly.
+fn collapse_children(value: &mut Value) {
+    match value {
+        Value::Object(_) => collapse_and_strip(value, false),
+        Value::Array(arr) => arr.iter_mut().for_each(collapse_children),
+        _ => {}
     }
 }
 

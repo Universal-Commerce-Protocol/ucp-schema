@@ -725,3 +725,65 @@ fn remote_fragment_ref_preserves_target_resource_root() {
         &json!({ "path": "$", "properties": { "line": { "properties": {} } } })
     ));
 }
+
+/// The UCP capability-container convention: `$defs/<capability-name>` is a
+/// *container* whose named members (actor schemas, operation shapes) are
+/// schemas one level deeper — the same shape `select_operation_schema`
+/// selects through. Refs live only inside container members here, so the
+/// crawl, sibling protection, and identity stripping must all traverse it.
+#[test]
+fn capability_container_members_bundle_with_protected_siblings() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("capability.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/capability.json",
+            "$defs": {
+                "platform_schema": {
+                    "type": "object",
+                    "required": ["version"],
+                    "properties": { "version": { "type": "string" } }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("cap.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/cap.json",
+            "$defs": {
+                "dev.example.capability": {
+                    "platform_schema": {
+                        "$ref": "capability.json#/$defs/platform_schema",
+                        "description": "use-site annotation",
+                        "ucp_response": "optional"
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "cap.json");
+    let member = &bundled["$defs"]["dev.example.capability"]["platform_schema"];
+
+    // Ref materialized: target constraints present, no $ref left behind.
+    assert_eq!(
+        member["required"],
+        json!(["version"]),
+        "target must materialize: {member}"
+    );
+    // Siblings survived (annotation + UCP applicability annotation).
+    assert_eq!(member["description"], json!("use-site annotation"));
+    assert_eq!(member["ucp_response"], json!("optional"));
+    // Materialized copy shed the source's resource identity.
+    assert!(
+        member.get("$id").is_none() && member.get("$schema").is_none(),
+        "container member must not inherit the source resource identity: {member}"
+    );
+}
