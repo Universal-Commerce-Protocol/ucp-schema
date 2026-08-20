@@ -1155,3 +1155,102 @@ fn internal_recursive_pointer_ref_bundles_remotely() {
     ));
     assert!(!oracle_is_valid(&schema, &json!({ "root": { "oops": 1 } })));
 }
+
+/// Compose-path twin of the resource-identity fix (issue #43's third organ,
+/// PR #44's territory): an extension whose contribution uses a *recursive
+/// helper def* (`#/$defs/tree_node` self-cycle). The bundler retains the
+/// cycle; extraction into a composed document must anchor it to the source
+/// document instead of letting it dangle
+/// (`Pointer '/$defs/tree_node' does not exist`) or rebind.
+#[test]
+fn composed_extension_with_recursive_helper_def_validates() {
+    let dir = TempDir::new().unwrap();
+    let schemas = dir.path().join("schemas/shopping");
+    fs::create_dir_all(&schemas).unwrap();
+    fs::copy(
+        "tests/fixtures/compose/schemas/shopping/checkout.json",
+        schemas.join("checkout.json"),
+    )
+    .unwrap();
+    fs::write(
+        schemas.join("treeext.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/treeext.json",
+            "name": "dev.ucp.shopping.treeext",
+            "version": "2026-01-11",
+            "title": "Tree Extension",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "category_tree": { "$ref": "#/$defs/tree_node" }
+                    }
+                },
+                "tree_node": {
+                    "type": "object",
+                    "properties": {
+                        "label": { "type": "string" },
+                        "children": { "type": "array", "items": { "$ref": "#/$defs/tree_node" } }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let payload = json!({
+        "ucp": {
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [
+                    { "version": "2026-01-11", "schema": "https://ucp.dev/schemas/shopping/checkout.json" }
+                ],
+                "dev.ucp.shopping.treeext": [
+                    { "version": "2026-01-11", "schema": "https://ucp.dev/schemas/shopping/treeext.json", "extends": "dev.ucp.shopping.checkout" }
+                ]
+            }
+        },
+        "id": "chk_1",
+        "status": "incomplete",
+        "category_tree": { "label": "root", "children": [ { "label": "kid", "children": [] } ] }
+    });
+    fs::write(dir.path().join("good.json"), payload.to_string()).unwrap();
+    let mut bad = payload;
+    bad["category_tree"]["children"][0]["bogus_key"] = json!(1);
+    fs::write(dir.path().join("bad.json"), bad.to_string()).unwrap();
+
+    let run = |name: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ucp-schema"))
+            .current_dir(dir.path())
+            .args([
+                "validate",
+                name,
+                "--response",
+                "--op",
+                "create",
+                "--schema-local-base",
+                ".",
+                "--schema-remote-base",
+                "https://ucp.dev",
+                "--json",
+            ])
+            .output()
+            .expect("binary runs")
+    };
+    let good = run("good.json");
+    let verdict: Value = serde_json::from_slice(&good.stdout).expect("json output");
+    assert_eq!(
+        verdict["valid"],
+        json!(true),
+        "recursive extension must compose: {verdict}"
+    );
+    let bad_out = run("bad.json");
+    let verdict: Value = serde_json::from_slice(&bad_out.stdout).expect("json output");
+    assert_eq!(
+        verdict["valid"],
+        json!(false),
+        "violations inside the recursion must be caught: {verdict}"
+    );
+}

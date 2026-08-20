@@ -275,7 +275,7 @@ fn crawl_external_refs(
         // Guided walk: `$ref`-shaped instance data inside `const`/`enum`/
         // unknown keywords is payload, not a reference — chasing it would
         // fetch phantom documents or fail bundling on legal schemas.
-        for_each_subschema(value, &mut |obj| {
+        for_each_schema_object(value, &mut |obj| {
             if let Some(Value::String(r)) = obj.get("$ref") {
                 if !r.starts_with('#') {
                     out.push(r.clone());
@@ -524,7 +524,7 @@ fn mask_instance_refs(schema: &mut Value) -> Result<(), ResolveError> {
         }
     }
     let mut result = Ok(());
-    for_each_subschema_mut(schema, &mut |obj| {
+    for_each_schema_object_mut(schema, &mut |obj| {
         for keyword in INSTANCE_DATA_KEYWORDS {
             if let Some(v) = obj.get_mut(*keyword) {
                 if result.is_ok() {
@@ -577,19 +577,22 @@ const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"
 /// the exclusion list names. `$ref`-shaped payload under *non-standard*
 /// carriers remains out of reach of any static rule; upstream dereference
 /// walks blindly there too, so behavior matches the validator.
-fn for_each_subschema_mut(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
+pub(crate) fn for_each_schema_object_mut(
+    schema: &mut Value,
+    f: &mut impl FnMut(&mut Map<String, Value>),
+) {
     match schema {
         Value::Object(obj) => {
             f(obj);
             for (key, child) in obj.iter_mut() {
                 if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
-                    for_each_subschema_mut(child, f);
+                    for_each_schema_object_mut(child, f);
                 }
             }
         }
         Value::Array(arr) => {
             for child in arr.iter_mut() {
-                for_each_subschema_mut(child, f);
+                for_each_schema_object_mut(child, f);
             }
         }
         _ => {}
@@ -597,19 +600,19 @@ fn for_each_subschema_mut(schema: &mut Value, f: &mut impl FnMut(&mut Map<String
 }
 
 /// Immutable twin of [`for_each_subschema_mut`].
-fn for_each_subschema(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
+pub(crate) fn for_each_schema_object(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
     match schema {
         Value::Object(obj) => {
             f(obj);
             for (key, child) in obj {
                 if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
-                    for_each_subschema(child, f);
+                    for_each_schema_object(child, f);
                 }
             }
         }
         Value::Array(arr) => {
             for child in arr {
-                for_each_subschema(child, f);
+                for_each_schema_object(child, f);
             }
         }
         _ => {}
@@ -625,7 +628,7 @@ fn for_each_subschema(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
 /// dereference; `collapse_and_strip` re-merges afterwards. Only schema
 /// positions are visited: `$ref`-shaped instance data stays untouched.
 fn hoist_ref_siblings(value: &mut Value) {
-    for_each_subschema_mut(value, &mut |obj| {
+    for_each_schema_object_mut(value, &mut |obj| {
         let has_ref = matches!(obj.get("$ref"), Some(Value::String(_)));
         if !has_ref || obj.len() == 1 {
             return;
@@ -752,7 +755,7 @@ fn is_annotation_keyword(keyword: &str) -> bool {
 /// `$ref`-shaped instance data (inside `const`, `enum`, …) does not count.
 fn contains_schema_ref(schema: &Value) -> bool {
     let mut found = false;
-    for_each_subschema(schema, &mut |obj| {
+    for_each_schema_object(schema, &mut |obj| {
         found |= obj.contains_key("$ref");
     });
     found
