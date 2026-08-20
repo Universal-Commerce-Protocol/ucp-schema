@@ -901,3 +901,257 @@ fn sentinel_member_name_is_rejected_anywhere() {
     let err = bundle_refs(&mut schema, path.parent().unwrap()).unwrap_err();
     assert!(err.to_string().contains("reserved member name"));
 }
+
+// ---------------------------------------------------------------------------
+// Scenarios adopted from the reported bundler defects (issues #43, #45, #46
+// and the accompanying PRs #44, #47, #51), distilled to self-contained
+// fixtures and locked as verdict assertions. Fixture shape mirrors the
+// shipped chain: checkout.json -> payment.json ->
+// payment_instrument.json#/$defs/selected_payment_instrument, whose
+// allOf[0] is `$ref: "#"` (the instrument file's own root).
+// ---------------------------------------------------------------------------
+
+fn write_instrument_chain(dir: &Path) {
+    fs::write(
+        dir.join("instrument.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/instrument.json",
+            "type": "object",
+            "required": ["id", "handler_id", "type"],
+            "properties": {
+                "id": { "type": "string" },
+                "handler_id": { "type": "string" },
+                "type": { "type": "string" }
+            },
+            "$defs": {
+                "selected": {
+                    "allOf": [
+                        { "$ref": "#" },
+                        {
+                            "type": "object",
+                            "properties": { "selected": { "type": "boolean" } }
+                        }
+                    ]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("payment.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/payment.json",
+            "type": "object",
+            "properties": {
+                // Deliberately shares the name `instruments` with an
+                // instrument-level extra property in the false-reject case.
+                "instruments": {
+                    "type": "array",
+                    "items": { "$ref": "instrument.json#/$defs/selected" }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("checkout.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/checkout.json",
+            "type": "object",
+            "properties": { "payment": { "$ref": "payment.json" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+/// Issue #43, false accept: an instrument with none of the required fields
+/// must fail — under the old bundler `#` bound to the inlining file, so the
+/// instrument base schema never applied.
+#[test]
+fn instrument_chain_rejects_missing_required_fields() {
+    let dir = TempDir::new().unwrap();
+    write_instrument_chain(dir.path());
+    let bundled = bundle(dir.path(), "checkout.json");
+
+    let bad = json!({ "payment": { "instruments": [ { "selected": true } ] } });
+    let good = json!({ "payment": { "instruments": [
+        { "id": "i1", "handler_id": "h1", "type": "card", "selected": true }
+    ] } });
+    assert!(
+        !oracle_is_valid(&bundled, &bad),
+        "instrument base schema must apply"
+    );
+    assert!(oracle_is_valid(&bundled, &good));
+}
+
+/// Issue #43, false reject: a spec-valid instrument carrying an extra
+/// property that happens to share a name with the *inlining* file's property
+/// (`instruments`) must stay valid. Under the old bundler `#` bound to
+/// payment.json, which types that name as an array.
+#[test]
+fn instrument_chain_accepts_extra_property_aliasing_outer_schema() {
+    let dir = TempDir::new().unwrap();
+    write_instrument_chain(dir.path());
+    let bundled = bundle(dir.path(), "checkout.json");
+
+    let aliased = json!({ "payment": { "instruments": [
+        { "id": "i1", "handler_id": "h1", "type": "card",
+          "instruments": "bogus-string" }
+    ] } });
+    assert!(
+        oracle_is_valid(&bundled, &aliased),
+        "instrument-level extra property must be judged by instrument.json's root, not payment.json's"
+    );
+}
+
+/// Issue #43, strict mode: a valid instrument must stay valid under strict
+/// resolution. The old bundler closed objects against the wrong root, so
+/// every instrument field counted as unevaluated.
+#[test]
+fn instrument_chain_strict_accepts_valid_instrument() {
+    let dir = TempDir::new().unwrap();
+    write_instrument_chain(dir.path());
+    let bundled = bundle(dir.path(), "checkout.json");
+    let opts =
+        ucp_schema::ResolveOptions::new(ucp_schema::Direction::Response, "create").strict(true);
+    let resolved = ucp_schema::resolve(&bundled, &opts).expect("strict resolve succeeds");
+
+    assert!(oracle_is_valid(
+        &resolved,
+        &json!({ "payment": { "instruments": [
+        { "id": "i1", "handler_id": "h1", "type": "card", "selected": true }
+    ] } })
+    ));
+    assert!(!oracle_is_valid(
+        &resolved,
+        &json!({ "payment": { "instruments": [
+        { "id": "i1", "handler_id": "h1", "type": "card", "unknown_field": 1 }
+    ] } })
+    ));
+}
+
+/// Issue #45 as filed (CLI): `validate --def` on a def whose subtree carries
+/// `$ref: "#"` must not crash and must validate against the *source* root.
+#[test]
+fn validate_def_cli_with_self_root_ref() {
+    let dir = TempDir::new().unwrap();
+    write_instrument_chain(dir.path());
+    fs::write(
+        dir.path().join("good-inst.json"),
+        json!({ "id": "i1", "handler_id": "h", "type": "card" }).to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("bad-inst.json"),
+        json!({ "selected": true }).to_string(),
+    )
+    .unwrap();
+
+    let run = |payload: &str| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_ucp-schema"))
+            .current_dir(dir.path())
+            .args([
+                "validate",
+                payload,
+                "--op",
+                "create",
+                "--schema",
+                "instrument.json",
+                "--def",
+                "selected",
+                "--json",
+            ])
+            .output()
+            .expect("binary runs")
+    };
+    let good = run("good-inst.json");
+    assert!(
+        good.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&good.stderr)
+    );
+    let bad = run("bad-inst.json");
+    let verdict: Value = serde_json::from_slice(&bad.stdout).expect("json output");
+    assert_eq!(
+        verdict["valid"],
+        json!(false),
+        "the source root's required fields must reach the selected def: {verdict}"
+    );
+}
+
+/// Issue #46: an internal recursive pointer ref (`#/$defs/node` self-cycle)
+/// is legal Draft 2020-12 and must bundle and validate, not overflow the
+/// stack. (The old bundler guarded only the external-ref branch.)
+#[test]
+fn internal_recursive_pointer_ref_bundles_and_validates() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("recursive.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/recursive.json",
+            "type": "object",
+            "properties": { "root": { "$ref": "#/$defs/node" } },
+            "$defs": {
+                "node": {
+                    "type": "object",
+                    "properties": { "child": { "$ref": "#/$defs/node" } },
+                    "additionalProperties": false
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "recursive.json");
+    assert!(oracle_is_valid(
+        &bundled,
+        &json!({ "root": { "child": { "child": {} } } })
+    ));
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "root": { "child": { "oops": 1 } } })),
+        "violations deep in the recursion must be caught"
+    );
+}
+
+/// Issue #46's remote twin: the same internal self-cycle fetched over HTTP.
+#[cfg(feature = "remote")]
+#[test]
+fn internal_recursive_pointer_ref_bundles_remotely() {
+    let mut server = mockito::Server::new();
+    let doc = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": format!("{}/recursive.json", server.url()),
+        "type": "object",
+        "properties": { "root": { "$ref": "#/$defs/node" } },
+        "$defs": {
+            "node": {
+                "type": "object",
+                "properties": { "child": { "$ref": "#/$defs/node" } },
+                "additionalProperties": false
+            }
+        }
+    });
+    let _m = server
+        .mock("GET", "/recursive.json")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(doc.to_string())
+        .create();
+
+    let mut schema = doc.clone();
+    ucp_schema::bundle_refs_remote(&mut schema, &format!("{}/recursive.json", server.url()))
+        .expect("remote bundling succeeds");
+    assert!(oracle_is_valid(
+        &schema,
+        &json!({ "root": { "child": {} } })
+    ));
+    assert!(!oracle_is_valid(&schema, &json!({ "root": { "oops": 1 } })));
+}
