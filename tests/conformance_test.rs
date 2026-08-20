@@ -787,3 +787,117 @@ fn capability_container_members_bundle_with_protected_siblings() {
         "container member must not inherit the source resource identity: {member}"
     );
 }
+
+/// An authored `allOf` coexisting with a `$ref` and colliding use-site
+/// constraints: everything is one conjunction. The ref joins the authored
+/// branches; the use site's stricter `minLength` must keep applying.
+#[test]
+fn authored_allof_with_ref_sibling_applies_conjunctively() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("target.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/target.json",
+            "type": "string",
+            "minLength": 5
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("host.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/host.json",
+            "type": "object",
+            "properties": {
+                "v": {
+                    "$ref": "target.json",
+                    "allOf": [ { "maxLength": 10 } ],
+                    "minLength": 7
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "host.json");
+
+    // Effective: minLength 7 (use site) AND minLength 5 (target) AND maxLength 10.
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "v": "123456" })),
+        "len 6 violates use-site minLength 7"
+    );
+    assert!(oracle_is_valid(&bundled, &json!({ "v": "1234567" })));
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "v": "12345678901" })),
+        "len 11 violates branch maxLength 10"
+    );
+}
+
+/// Two different documents claiming the same canonical `$id` is an
+/// authoring error; silent first-wins would bind `$id`-relative refs to
+/// whichever file the crawl reached first.
+#[test]
+fn duplicate_canonical_id_claims_error() {
+    let dir = TempDir::new().unwrap();
+    for (file, max) in [("one.json", 1), ("two.json", 2)] {
+        fs::write(
+            dir.path().join(file),
+            json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.test/shared.json",
+                "type": "integer",
+                "maximum": max
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+    fs::write(
+        dir.path().join("root.json"),
+        json!({
+            "type": "object",
+            "properties": {
+                "a": { "$ref": "one.json" },
+                "b": { "$ref": "two.json" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let path = dir.path().join("root.json");
+    let mut schema = load_schema(&path).unwrap();
+    let err = bundle_refs(&mut schema, path.parent().unwrap()).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("claim the same canonical $id"),
+        "expected duplicate-$id diagnostic, got: {message}"
+    );
+}
+
+/// The masking sentinel is reserved everywhere: a schema key with that name
+/// would otherwise be silently rewritten to `$ref` by the final unmask.
+#[test]
+fn sentinel_member_name_is_rejected_anywhere() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("schema.json"),
+        json!({
+            "type": "object",
+            "properties": {
+                "__ucp_instance_ref__": { "type": "string" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let path = dir.path().join("schema.json");
+    let mut schema = load_schema(&path).unwrap();
+    let err = bundle_refs(&mut schema, path.parent().unwrap()).unwrap_err();
+    assert!(err.to_string().contains("reserved member name"));
+}

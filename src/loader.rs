@@ -260,7 +260,7 @@ fn split_origin(uri: &str) -> Option<(&str, &str)> {
     Some((&uri[..path_start], &uri[path_start..]))
 }
 
-/// Breadth-first crawl of every externally referenced schema document,
+/// Depth-first crawl of every externally referenced schema document,
 /// resolving each `$ref` against its containing document's base URI
 /// (`$id` when declared, retrieval URI otherwise), fetching through the
 /// UCP retriever. Returns each document keyed by the URI it resolves under.
@@ -292,6 +292,7 @@ fn crawl_external_refs(
 
     let mut resources = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    let mut claimed: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let mut queue = vec![(root.clone(), base(root, root_base))];
     while let Some((doc, doc_base)) = queue.pop() {
         let mut found = Vec::new();
@@ -324,9 +325,26 @@ fn crawl_external_refs(
             let fetched_base = base(&fetched, &uri);
             queue.push((fetched.clone(), fetched_base.clone()));
             resources.push((uri.clone(), fetched.clone()));
-            // Register under the declared `$id` too when it differs.
-            if fetched_base != uri && seen.insert(fetched_base.clone()) {
-                resources.push((fetched_base, fetched));
+            // Register under the declared `$id` too when it differs — and
+            // refuse two *different* documents claiming the same canonical
+            // `$id`: silent first-wins would bind `$id`-relative refs to
+            // whichever file the crawl happened to reach first.
+            if fetched_base != uri {
+                match claimed.get(&fetched_base) {
+                    None => {
+                        claimed.insert(fetched_base.clone(), uri.clone());
+                        seen.insert(fetched_base.clone());
+                        resources.push((fetched_base, fetched));
+                    }
+                    Some(first) if *first != uri => {
+                        return Err(ResolveError::BundleError {
+                            message: format!(
+                                "distinct schema documents claim the same canonical $id {fetched_base}: {first} and {uri}"
+                            ),
+                        });
+                    }
+                    Some(_) => {}
+                }
             }
         }
     }
@@ -396,6 +414,10 @@ fn flatten(
 ) -> Result<(), ResolveError> {
     // Work on a copy: the input must stay untouched on any error path.
     let mut work = schema.clone();
+    // The sentinel name is reserved everywhere, not only inside instance
+    // data: the final unmask is a blind whole-tree rename, so a schema key
+    // with this name would silently become `$ref` in the output.
+    reject_sentinel_members(&work)?;
 
     let mut prefixes = Vec::new();
     if let (Some(id), Some(dir)) = (work.get("$id").and_then(Value::as_str), &base_dir) {
@@ -440,6 +462,22 @@ fn flatten(
     unmask_instance_refs(&mut flat);
     *schema = flat;
     Ok(())
+}
+
+/// Refuse any member named like the masking sentinel anywhere in the input.
+fn reject_sentinel_members(value: &Value) -> Result<(), ResolveError> {
+    match value {
+        Value::Object(obj) => {
+            if obj.contains_key(INSTANCE_REF_SENTINEL) {
+                return Err(ResolveError::BundleError {
+                    message: format!("reserved member name: {INSTANCE_REF_SENTINEL}"),
+                });
+            }
+            obj.values().try_for_each(reject_sentinel_members)
+        }
+        Value::Array(arr) => arr.iter().try_for_each(reject_sentinel_members),
+        _ => Ok(()),
+    }
 }
 
 /// Sentinel used to hide `$ref` keys inside instance data from upstream
@@ -589,12 +627,31 @@ fn for_each_subschema(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
 fn hoist_ref_siblings(value: &mut Value) {
     for_each_subschema_mut(value, &mut |obj| {
         let has_ref = matches!(obj.get("$ref"), Some(Value::String(_)));
-        if has_ref && obj.len() > 1 && !obj.contains_key("allOf") {
-            let r = obj.remove("$ref").expect("checked above");
-            obj.insert(
-                "allOf".to_string(),
-                Value::Array(vec![serde_json::json!({ "$ref": r })]),
-            );
+        if !has_ref || obj.len() == 1 {
+            return;
+        }
+        match obj.get_mut("allOf") {
+            None => {
+                let r = obj.remove("$ref").expect("checked above");
+                obj.insert(
+                    "allOf".to_string(),
+                    Value::Array(vec![serde_json::json!({ "$ref": r })]),
+                );
+            }
+            // An authored allOf coexisting with `$ref`: the ref joins the
+            // conjunction as one more branch. Skipping it here would hand
+            // the object to upstream dereference, which replaces it wholesale
+            // and silently drops colliding use-site constraints.
+            Some(Value::Array(_)) => {
+                let r = obj.remove("$ref").expect("checked above");
+                let Some(Value::Array(branches)) = obj.get_mut("allOf") else {
+                    unreachable!("matched above");
+                };
+                branches.push(serde_json::json!({ "$ref": r }));
+            }
+            // Malformed allOf (not an array): leave untouched for the
+            // validator to reject.
+            Some(_) => {}
         }
     });
 }
