@@ -567,3 +567,59 @@ fn select_def_self_root_ref_without_id_synthesizes_identity() {
     assert!(validator.is_valid(&json!({ "kind": "a" })));
     assert!(!validator.is_valid(&json!({})));
 }
+
+/// Anchoring discriminates ref classes: in one selected def, a bare `#`
+/// (source root) is anchored while `#/$defs/other` keeps resolving against
+/// the carried defs. Both constraints must bite.
+#[test]
+fn select_def_mixed_root_and_defs_refs_both_apply() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.test/mixed.json",
+        "type": "object",
+        "required": ["kind"],
+        "properties": { "kind": { "type": "string" } },
+        "$defs": {
+            "other": {
+                "type": "object",
+                "properties": { "n": { "type": "integer", "maximum": 5 } },
+                "additionalProperties": false
+            },
+            "sel": {
+                "allOf": [
+                    { "$ref": "#" },
+                    { "type": "object", "properties": { "extra": { "$ref": "#/$defs/other" } } }
+                ]
+            }
+        }
+    });
+    let opts = ResolveOptions::new(Direction::Request, "create").def_name(Some("sel".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+
+    assert!(validator.is_valid(&json!({ "kind": "a", "extra": { "n": 3 } })));
+    assert!(
+        !validator.is_valid(&json!({ "extra": { "n": 3 } })),
+        "root required[kind] via bare #"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "kind": "a", "extra": { "n": 9 } })),
+        "defs-relative maximum via #/$defs/other"
+    );
+}
+
+/// The reserved embedding key is rejected loudly, never silently shadowed.
+#[test]
+fn select_def_reserved_source_key_errors() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "$defs": {
+            "__ucp_selected_source": { "type": "object" },
+            "sel": { "allOf": [ { "$ref": "#" } ] }
+        }
+    });
+    let opts = ResolveOptions::new(Direction::Request, "create").def_name(Some("sel".to_string()));
+    let err = select_operation_schema(&schema, &opts).unwrap_err();
+    assert!(err.to_string().contains("reserved"), "got: {err}");
+}

@@ -1254,3 +1254,84 @@ fn composed_extension_with_recursive_helper_def_validates() {
         "violations inside the recursion must be caught: {verdict}"
     );
 }
+
+/// Compose anchoring stays dormant for acyclic helpers: the bundler
+/// pre-materializes them, so the extracted contribution carries no
+/// root-local refs and passes through without any embedded source
+/// (no urn: markers, no capability-name $defs entry).
+#[test]
+fn composed_extension_with_acyclic_helper_needs_no_anchor() {
+    let dir = TempDir::new().unwrap();
+    let schemas = dir.path().join("schemas/shopping");
+    fs::create_dir_all(&schemas).unwrap();
+    fs::copy(
+        "tests/fixtures/compose/schemas/shopping/checkout.json",
+        schemas.join("checkout.json"),
+    )
+    .unwrap();
+    fs::write(
+        schemas.join("acycext.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/acycext.json",
+            "name": "dev.ucp.shopping.acycext",
+            "version": "2026-01-11",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": { "badge": { "$ref": "#/$defs/badge" } }
+                },
+                "badge": {
+                    "type": "object",
+                    "properties": { "label": { "type": "string" } },
+                    "additionalProperties": false
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let payload = json!({
+        "ucp": { "capabilities": {
+            "dev.ucp.shopping.checkout": [
+                { "version": "2026-01-11", "schema": "https://ucp.dev/schemas/shopping/checkout.json" }
+            ],
+            "dev.ucp.shopping.acycext": [
+                { "version": "2026-01-11", "schema": "https://ucp.dev/schemas/shopping/acycext.json", "extends": "dev.ucp.shopping.checkout" }
+            ]
+        } },
+        "id": "c1", "status": "incomplete",
+        "badge": { "label": "x" }
+    });
+    fs::write(dir.path().join("good.json"), payload.to_string()).unwrap();
+
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_ucp-schema"))
+        .current_dir(dir.path())
+        .args([
+            "resolve",
+            "good.json",
+            "--response",
+            "--op",
+            "create",
+            "--schema-local-base",
+            ".",
+            "--schema-remote-base",
+            "https://ucp.dev",
+        ])
+        .output()
+        .expect("binary runs");
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !text.contains("urn:ucp-schema") && !text.contains("acycext.json\""),
+        "anchoring must stay dormant for acyclic helpers"
+    );
+    let resolved: Value = serde_json::from_str(&text).unwrap();
+    let validator = jsonschema::validator_for(&resolved).unwrap();
+    assert!(validator
+        .is_valid(&json!({ "id": "c1", "status": "incomplete", "badge": { "label": "x" } })));
+    assert!(
+        !validator.is_valid(&json!({ "id": "c1", "status": "incomplete", "badge": { "oops": 1 } }))
+    );
+}
