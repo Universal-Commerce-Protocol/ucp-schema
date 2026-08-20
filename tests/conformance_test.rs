@@ -29,9 +29,15 @@ fn bundle(dir: &Path, root: &str) -> Value {
 
 /// Compile the bundled schema with the oracle and classify an instance.
 fn oracle_is_valid(schema: &Value, instance: &Value) -> bool {
-    jsonschema::validator_for(schema)
-        .expect("bundled output must compile under a Draft 2020-12 validator")
-        .is_valid(instance)
+    let v = jsonschema::validator_for(schema)
+        .expect("bundled output must compile under a Draft 2020-12 validator");
+    let ok = v.is_valid(instance);
+    if !ok {
+        for e in v.iter_errors(instance) {
+            eprintln!("oracle: {} at {}", e, e.instance_path());
+        }
+    }
+    ok
 }
 
 /// The #744 shape: an external *fragment* ref whose target contains a
@@ -342,4 +348,104 @@ fn count_nested_identity(value: &Value) -> usize {
         }
     }
     walk(value, true)
+}
+
+/// `$ref`-shaped objects inside instance-data keywords (`const`, `enum`,
+/// `default`) are payload, not references. Bundling must neither rewrite
+/// them structurally nor try to load the documents they appear to name.
+#[test]
+fn ref_shaped_instance_data_is_left_verbatim() {
+    let dir = TempDir::new().unwrap();
+    // `./phantom.json` deliberately does not exist: chasing it fails loudly.
+    fs::write(
+        dir.path().join("schema.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/schema.json",
+            "type": "object",
+            "properties": {
+                "template": {
+                    "const": { "$ref": "phantom.json", "note": "instance data" }
+                },
+                "kind": {
+                    "enum": [ { "$ref": "#" }, "plain" ],
+                    "default": { "$ref": "also-not-a-ref.json" }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "schema.json");
+
+    assert_eq!(
+        bundled["properties"]["template"]["const"],
+        json!({ "$ref": "phantom.json", "note": "instance data" }),
+        "const value must survive byte-identical"
+    );
+    assert_eq!(
+        bundled["properties"]["kind"]["enum"][0],
+        json!({ "$ref": "#" }),
+        "enum member must survive byte-identical"
+    );
+
+    // And the oracle agrees the instance data still matches exactly.
+    assert!(oracle_is_valid(
+        &bundled,
+        &json!({ "template": { "$ref": "phantom.json", "note": "instance data" } })
+    ));
+    assert!(!oracle_is_valid(
+        &bundled,
+        &json!({ "template": { "$ref": "phantom.json" } })
+    ));
+}
+
+/// Sibling hoisting must also skip instance data: an object value that
+/// happens to contain a `$ref` key plus other members would otherwise be
+/// rewritten into an `allOf` conjunction, corrupting the payload.
+#[test]
+fn hoisting_does_not_restructure_enum_members() {
+    let dir = TempDir::new().unwrap();
+    fs::write(
+        dir.path().join("leaf.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/leaf.json",
+            "type": "string"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("schema.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/schema.json",
+            "type": "object",
+            "properties": {
+                // Real reference with siblings: must hoist + re-merge.
+                "name": { "$ref": "leaf.json", "description": "display name" },
+                // Instance data that merely looks like one: must not move.
+                "shape": { "const": { "$ref": "leaf.json", "extra": 1 } }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "schema.json");
+
+    assert_eq!(
+        bundled["properties"]["shape"]["const"],
+        json!({ "$ref": "leaf.json", "extra": 1 })
+    );
+    // The real ref materialized with its sibling annotation intact.
+    assert_eq!(bundled["properties"]["name"]["type"], json!("string"));
+    assert_eq!(
+        bundled["properties"]["name"]["description"],
+        json!("display name")
+    );
+    assert!(oracle_is_valid(&bundled, &json!({ "name": "x" })));
+    assert!(!oracle_is_valid(&bundled, &json!({ "name": 7 })));
 }

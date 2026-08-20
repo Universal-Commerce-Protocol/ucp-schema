@@ -4,7 +4,7 @@
 
 use std::path::{Path, PathBuf};
 
-use serde_json::Value;
+use serde_json::{Map, Value};
 use url::Url;
 
 use crate::error::ResolveError;
@@ -155,9 +155,11 @@ impl UcpRetriever {
     /// directory.
     fn load_and_learn(&self, path: &Path) -> Result<Value, ResolveError> {
         let mut doc = load_schema(path)?;
-        // Protect `$ref` siblings in *every* document that enters the
-        // registry, not only the root: upstream dereference replaces a
-        // ref-carrying object with its target, dropping siblings.
+        // Protect `$ref` siblings and instance-data refs in *every* document
+        // that enters the registry, not only the root: upstream dereference
+        // replaces a ref-carrying object with its target (dropping siblings)
+        // and chases `$ref`-shaped payload inside `const`/`enum`.
+        mask_instance_refs(&mut doc)?;
         hoist_ref_siblings(&mut doc);
         if let (Some(id), Some(dir)) = (doc.get("$id").and_then(Value::as_str), path.parent()) {
             if let Some((id_dir, _)) = id.rsplit_once('/') {
@@ -213,6 +215,7 @@ impl jsonschema::Retrieve for UcpRetriever {
         #[cfg(feature = "remote")]
         if is_url(uri) {
             let mut doc = load_schema_url(uri)?;
+            mask_instance_refs(&mut doc)?;
             hoist_ref_siblings(&mut doc);
             return Ok(doc);
         }
@@ -269,18 +272,16 @@ fn crawl_external_refs(
     use jsonschema::Retrieve;
 
     fn refs(value: &Value, out: &mut Vec<String>) {
-        match value {
-            Value::Object(obj) => {
-                if let Some(Value::String(r)) = obj.get("$ref") {
-                    if !r.starts_with('#') {
-                        out.push(r.clone());
-                    }
+        // Guided walk: `$ref`-shaped instance data inside `const`/`enum`/
+        // unknown keywords is payload, not a reference — chasing it would
+        // fetch phantom documents or fail bundling on legal schemas.
+        for_each_subschema(value, &mut |obj| {
+            if let Some(Value::String(r)) = obj.get("$ref") {
+                if !r.starts_with('#') {
+                    out.push(r.clone());
                 }
-                obj.values().for_each(|v| refs(v, out));
             }
-            Value::Array(arr) => arr.iter().for_each(|v| refs(v, out)),
-            _ => {}
-        }
+        });
     }
 
     let base = |doc: &Value, fallback: &str| -> String {
@@ -393,14 +394,18 @@ fn flatten(
     base_uri: String,
     mapping: Option<(PathBuf, String)>,
 ) -> Result<(), ResolveError> {
+    // Work on a copy: the input must stay untouched on any error path.
+    let mut work = schema.clone();
+
     let mut prefixes = Vec::new();
-    if let (Some(id), Some(dir)) = (schema.get("$id").and_then(Value::as_str), &base_dir) {
+    if let (Some(id), Some(dir)) = (work.get("$id").and_then(Value::as_str), &base_dir) {
         if let Some((id_dir, _)) = id.rsplit_once('/') {
             prefixes.push((format!("{id_dir}/"), dir.clone()));
         }
     }
 
-    hoist_ref_siblings(schema);
+    mask_instance_refs(&mut work)?;
+    hoist_ref_siblings(&mut work);
 
     let retriever = UcpRetriever {
         prefixes: std::sync::Mutex::new(prefixes),
@@ -411,7 +416,7 @@ fn flatten(
     // registry-build time; refs found *inside fetched documents* would hit a
     // closed registry. Pre-crawl the transitive closure so every resource is
     // present up front.
-    let resources = crawl_external_refs(schema, &base_uri, &retriever)?;
+    let resources = crawl_external_refs(&work, &base_uri, &retriever)?;
     let mut builder = jsonschema::Registry::new();
     for (uri, doc) in resources {
         builder = builder
@@ -423,17 +428,183 @@ fn flatten(
     let registry = builder.prepare().map_err(|e| ResolveError::BundleError {
         message: format!("building schema registry: {e}"),
     })?;
-    let flat = jsonschema::options()
+    let mut flat = jsonschema::options()
         .with_base_uri(base_uri)
         .with_registry(&registry)
-        .dereference(schema)
+        .dereference(&work)
         .map_err(|e| ResolveError::BundleError {
             message: format!("failed to bundle schema: {e}"),
         })?;
-    *schema = flat;
 
-    collapse_and_strip(schema, true);
+    collapse_and_strip(&mut flat, true);
+    unmask_instance_refs(&mut flat);
+    *schema = flat;
     Ok(())
+}
+
+/// Sentinel used to hide `$ref` keys inside instance data from upstream
+/// dereference, which walks `const`/`enum`/`default` values as if they were
+/// schemas and tries to resolve payload that merely looks like a reference.
+const INSTANCE_REF_SENTINEL: &str = "__ucp_instance_ref__";
+/// Keywords whose values are instance data, not subschemas.
+const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
+
+/// Rename `$ref` keys inside instance-data subtrees so no resolver touches
+/// them. Restored verbatim by [`unmask_instance_refs`] on the final output
+/// (fetched documents inline into it, so their masks unwind there too).
+fn mask_instance_refs(schema: &mut Value) -> Result<(), ResolveError> {
+    fn rename(value: &mut Value, from: &str, to: &str) -> Result<(), ResolveError> {
+        match value {
+            Value::Object(obj) => {
+                if obj.contains_key(to) {
+                    return Err(ResolveError::BundleError {
+                        message: format!("reserved member name in instance data: {to}"),
+                    });
+                }
+                // Rebuild in place so member order is preserved exactly:
+                // instance data must round-trip byte-equivalent (JSON object
+                // equality is unordered, but emitted artifacts and
+                // order-sensitive comparators must see the original bytes).
+                if obj.contains_key(from) {
+                    let entries: Vec<(String, Value)> = std::mem::take(obj)
+                        .into_iter()
+                        .map(|(k, v)| {
+                            if k == from {
+                                (to.to_string(), v)
+                            } else {
+                                (k, v)
+                            }
+                        })
+                        .collect();
+                    obj.extend(entries);
+                }
+                for v in obj.values_mut() {
+                    rename(v, from, to)?;
+                }
+                Ok(())
+            }
+            Value::Array(arr) => arr.iter_mut().try_for_each(|v| rename(v, from, to)),
+            _ => Ok(()),
+        }
+    }
+    let mut result = Ok(());
+    for_each_subschema_mut(schema, &mut |obj| {
+        for keyword in INSTANCE_DATA_KEYWORDS {
+            if let Some(v) = obj.get_mut(*keyword) {
+                if result.is_ok() {
+                    result = rename(v, "$ref", INSTANCE_REF_SENTINEL);
+                }
+            }
+        }
+    });
+    result
+}
+
+/// Inverse of [`mask_instance_refs`], applied blindly: sentinels only exist
+/// where the mask put them.
+fn unmask_instance_refs(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            if obj.contains_key(INSTANCE_REF_SENTINEL) {
+                let entries: Vec<(String, Value)> = std::mem::take(obj)
+                    .into_iter()
+                    .map(|(k, v)| {
+                        if k == INSTANCE_REF_SENTINEL {
+                            ("$ref".to_string(), v)
+                        } else {
+                            (k, v)
+                        }
+                    })
+                    .collect();
+                obj.extend(entries);
+            }
+            obj.values_mut().for_each(unmask_instance_refs);
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(unmask_instance_refs),
+        _ => {}
+    }
+}
+
+/// Keywords whose object values map names to subschemas.
+const MAP_SCHEMA_KEYWORDS: &[&str] = &[
+    "$defs",
+    "properties",
+    "patternProperties",
+    "dependentSchemas",
+];
+/// Keywords whose array elements are subschemas.
+const ARRAY_SCHEMA_KEYWORDS: &[&str] = &["allOf", "anyOf", "oneOf", "prefixItems"];
+/// Keywords whose value is a single subschema.
+const SINGLE_SCHEMA_KEYWORDS: &[&str] = &[
+    "items",
+    "not",
+    "if",
+    "then",
+    "else",
+    "contains",
+    "additionalProperties",
+    "propertyNames",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+    "contentSchema",
+];
+
+/// Visit `schema` and every subschema reachable through known applicator and
+/// storage keywords, mutating each visited node.
+///
+/// The structural passes (sibling hoisting, allOf collapse, identity
+/// stripping, external-ref crawling) must not treat *instance data* as
+/// schema: a `$ref`-shaped object inside `const`, `enum`, `default`, or an
+/// unknown extension keyword is payload, not a reference. Upstream
+/// dereference is keyword-aware for the same reason; a blind walk would
+/// corrupt such values or chase phantom documents.
+fn for_each_subschema_mut(schema: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
+    let Value::Object(obj) = schema else { return };
+    f(obj);
+    for keyword in MAP_SCHEMA_KEYWORDS {
+        if let Some(Value::Object(children)) = obj.get_mut(*keyword) {
+            for child in children.values_mut() {
+                for_each_subschema_mut(child, f);
+            }
+        }
+    }
+    for keyword in ARRAY_SCHEMA_KEYWORDS {
+        if let Some(Value::Array(children)) = obj.get_mut(*keyword) {
+            for child in children.iter_mut() {
+                for_each_subschema_mut(child, f);
+            }
+        }
+    }
+    for keyword in SINGLE_SCHEMA_KEYWORDS {
+        if let Some(child) = obj.get_mut(*keyword) {
+            for_each_subschema_mut(child, f);
+        }
+    }
+}
+
+/// Immutable twin of [`for_each_subschema_mut`].
+fn for_each_subschema(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
+    let Value::Object(obj) = schema else { return };
+    f(obj);
+    for keyword in MAP_SCHEMA_KEYWORDS {
+        if let Some(Value::Object(children)) = obj.get(*keyword) {
+            for child in children.values() {
+                for_each_subschema(child, f);
+            }
+        }
+    }
+    for keyword in ARRAY_SCHEMA_KEYWORDS {
+        if let Some(Value::Array(children)) = obj.get(*keyword) {
+            for child in children {
+                for_each_subschema(child, f);
+            }
+        }
+    }
+    for keyword in SINGLE_SCHEMA_KEYWORDS {
+        if let Some(child) = obj.get(*keyword) {
+            for_each_subschema(child, f);
+        }
+    }
 }
 
 /// `{"$ref": R, ...siblings}` → `{"allOf": [{"$ref": R}], ...siblings}`.
@@ -442,83 +613,94 @@ fn flatten(
 /// `dereference` replaces the carrying object with the target, dropping
 /// siblings (43 `ucp_*` annotations ride as `$ref` siblings in the UCP
 /// corpus alone). Hoisting makes the conjunction structural before
-/// dereference; `collapse_and_strip` re-merges afterwards.
+/// dereference; `collapse_and_strip` re-merges afterwards. Only schema
+/// positions are visited: `$ref`-shaped instance data stays untouched.
 fn hoist_ref_siblings(value: &mut Value) {
-    match value {
-        Value::Object(obj) => {
-            let has_ref = matches!(obj.get("$ref"), Some(Value::String(_)));
-            if has_ref && obj.len() > 1 && !obj.contains_key("allOf") {
-                let r = obj.remove("$ref").expect("checked above");
-                obj.insert(
-                    "allOf".to_string(),
-                    Value::Array(vec![serde_json::json!({ "$ref": r })]),
-                );
-            }
-            obj.values_mut().for_each(hoist_ref_siblings);
+    for_each_subschema_mut(value, &mut |obj| {
+        let has_ref = matches!(obj.get("$ref"), Some(Value::String(_)));
+        if has_ref && obj.len() > 1 && !obj.contains_key("allOf") {
+            let r = obj.remove("$ref").expect("checked above");
+            obj.insert(
+                "allOf".to_string(),
+                Value::Array(vec![serde_json::json!({ "$ref": r })]),
+            );
         }
-        Value::Array(arr) => arr.iter_mut().for_each(hoist_ref_siblings),
-        _ => {}
-    }
+    });
 }
 
-/// Post-dereference cleanup, one walk:
+/// Post-dereference cleanup, one guided walk over schema positions:
 /// - merge single-branch `allOf` conjunctions flat when no keyword conflicts
 ///   (a one-branch `allOf` is semantically identical to inlining it);
 /// - drop non-root `$id`/`$schema` from subtrees with no retained `$ref`
 ///   (nothing needs their base once materialized; §8.1.1 forbids stray
 ///   `$schema`); keep them where a retained cyclic `$ref` still resolves
 ///   against that base.
-fn collapse_and_strip(value: &mut Value, is_root: bool) {
-    match value {
-        Value::Object(obj) => {
-            for v in obj.values_mut() {
-                collapse_and_strip(v, false);
-            }
-            // Merge {"allOf":[X], ...siblings} flat unless a *constraint*
-            // genuinely conflicts. A branch key merges when it is absent from
-            // the parent, equal-valued, or annotation-class (title,
-            // description, ucp_* …) — where the use site wins, matching how
-            // authors annotate `$ref` occurrences. Only conflicting
-            // constraints (e.g. two different `maximum`s) keep the `allOf`
-            // conjunction, which is the Draft 2020-12 sibling semantics.
-            let mergeable = match obj.get("allOf") {
-                Some(Value::Array(branches)) if branches.len() == 1 => match &branches[0] {
-                    Value::Object(branch) => {
-                        // The single-branch `allOf` wrapper itself is being
-                        // consumed, so a branch-level `allOf` does not collide
-                        // with it — it takes the wrapper's place.
-                        !branch.is_empty()
-                            && branch.iter().all(|(k, v)| {
-                                k == "allOf"
-                                    || !obj.contains_key(k)
-                                    || obj.get(k) == Some(v)
-                                    || is_annotation_keyword(k)
-                            })
-                    }
-                    _ => false,
-                },
-                _ => false,
-            };
-            if mergeable {
-                let Some(Value::Array(mut branches)) = obj.remove("allOf") else {
-                    unreachable!("checked above");
-                };
-                let Value::Object(branch) = branches.remove(0) else {
-                    unreachable!("checked above");
-                };
-                for (k, v) in branch {
-                    obj.entry(k).or_insert(v);
-                }
-            }
-            if !is_root && !contains_ref(value) {
-                if let Value::Object(obj) = value {
-                    obj.remove("$id");
-                    obj.remove("$schema");
+fn collapse_and_strip(schema: &mut Value, is_root: bool) {
+    let Value::Object(_) = schema else { return };
+
+    // Children first so nested one-branch allOfs collapse before parents.
+    {
+        let obj = schema.as_object_mut().expect("checked above");
+        for keyword in MAP_SCHEMA_KEYWORDS {
+            if let Some(Value::Object(children)) = obj.get_mut(*keyword) {
+                for child in children.values_mut() {
+                    collapse_and_strip(child, false);
                 }
             }
         }
-        Value::Array(arr) => arr.iter_mut().for_each(|v| collapse_and_strip(v, false)),
-        _ => {}
+        for keyword in ARRAY_SCHEMA_KEYWORDS {
+            if let Some(Value::Array(children)) = obj.get_mut(*keyword) {
+                for child in children.iter_mut() {
+                    collapse_and_strip(child, false);
+                }
+            }
+        }
+        for keyword in SINGLE_SCHEMA_KEYWORDS {
+            if let Some(child) = obj.get_mut(*keyword) {
+                collapse_and_strip(child, false);
+            }
+        }
+    }
+
+    let obj = schema.as_object_mut().expect("checked above");
+    // Merge {"allOf":[X], ...siblings} flat unless a *constraint* genuinely
+    // conflicts. A branch key merges when it is absent from the parent,
+    // equal-valued, or annotation-class (title, description, ucp_* …) —
+    // where the use site wins, matching how authors annotate `$ref`
+    // occurrences. Only conflicting constraints (e.g. two different
+    // `maximum`s) keep the `allOf` conjunction, which is the Draft 2020-12
+    // sibling semantics. The wrapper's own `allOf` key is being consumed,
+    // so a branch-level `allOf` takes its place rather than colliding.
+    let mergeable = match obj.get("allOf") {
+        Some(Value::Array(branches)) if branches.len() == 1 => match &branches[0] {
+            Value::Object(branch) => {
+                !branch.is_empty()
+                    && branch.iter().all(|(k, v)| {
+                        k == "allOf"
+                            || !obj.contains_key(k)
+                            || obj.get(k) == Some(v)
+                            || is_annotation_keyword(k)
+                    })
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if mergeable {
+        let Some(Value::Array(mut branches)) = obj.remove("allOf") else {
+            unreachable!("checked above");
+        };
+        let Value::Object(branch) = branches.remove(0) else {
+            unreachable!("checked above");
+        };
+        for (k, v) in branch {
+            obj.entry(k).or_insert(v);
+        }
+    }
+    if !is_root && !contains_schema_ref(schema) {
+        let obj = schema.as_object_mut().expect("checked above");
+        obj.remove("$id");
+        obj.remove("$schema");
     }
 }
 
@@ -541,12 +723,14 @@ fn is_annotation_keyword(keyword: &str) -> bool {
     )
 }
 
-fn contains_ref(value: &Value) -> bool {
-    match value {
-        Value::Object(obj) => obj.contains_key("$ref") || obj.values().any(contains_ref),
-        Value::Array(arr) => arr.iter().any(contains_ref),
-        _ => false,
-    }
+/// Whether any schema position at or below `schema` still carries a `$ref`.
+/// `$ref`-shaped instance data (inside `const`, `enum`, …) does not count.
+fn contains_schema_ref(schema: &Value) -> bool {
+    let mut found = false;
+    for_each_subschema(schema, &mut |obj| {
+        found |= obj.contains_key("$ref");
+    });
+    found
 }
 
 /// Load a schema from a file path or URL.
