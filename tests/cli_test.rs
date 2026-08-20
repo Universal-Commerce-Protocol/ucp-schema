@@ -942,36 +942,35 @@ mod bundle {
         let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
         let bundled: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
-        // The internal #/$defs/ ref should be inlined
-        let all_of = &bundled["properties"]["search_filters"]["allOf"];
-        let first_entry = &all_of[0];
-
-        // $ref should be removed (inlined)
+        // The internal #/$defs/ ref is inlined and the single-branch allOf
+        // wrapper is collapsed (a one-branch allOf is the same conjunction).
+        let filters = &bundled["properties"]["search_filters"];
         assert!(
-            first_entry.get("$ref").is_none(),
-            "Internal #/$defs/ ref should be inlined, but $ref still present: {first_entry}"
+            filters.get("$ref").is_none() && filters.get("allOf").is_none(),
+            "Internal #/$defs/ ref should be inlined flat, got: {filters}"
         );
-        // The inlined content should have the 'available' property
         assert!(
-            first_entry["properties"]["available"]["type"].as_str() == Some("boolean"),
-            "Inlined def should contain 'available: boolean', got: {first_entry}"
+            filters["properties"]["available"]["type"].as_str() == Some("boolean"),
+            "Inlined def should contain 'available: boolean', got: {filters}"
         );
     }
 
     #[test]
-    fn bundle_detects_circular_refs() {
+    fn bundle_retains_cross_file_recursion_as_refs() {
         let dir = TempDir::new().unwrap();
 
-        // Create circular reference: a.json -> b.json -> a.json
+        // Mutual recursion across files: legal JSON Schema (e.g. trees, graphs).
+        // The bundler must retain the cycle as a `$ref` with resource identity
+        // intact instead of erroring, and the result must validate correctly.
         fs::create_dir_all(dir.path().join("types")).unwrap();
         fs::write(
             dir.path().join("types/a.json"),
-            r#"{"type":"object","properties":{"b":{"$ref":"b.json"}}}"#,
+            r#"{"$id":"https://example.test/types/a.json","type":"object","properties":{"b":{"$ref":"b.json"}},"additionalProperties":false}"#,
         )
         .unwrap();
         fs::write(
             dir.path().join("types/b.json"),
-            r#"{"type":"object","properties":{"a":{"$ref":"a.json"}}}"#,
+            r#"{"$id":"https://example.test/types/b.json","type":"object","properties":{"a":{"$ref":"a.json"}},"additionalProperties":false}"#,
         )
         .unwrap();
 
@@ -981,12 +980,12 @@ mod bundle {
             r#"{
                 "type": "object",
                 "properties": {
-                    "start": { "$ref": "types/a.json" }
+                    "root": { "$ref": "types/a.json" }
                 }
             }"#,
         );
 
-        cmd()
+        let output = cmd()
             .args([
                 "resolve",
                 schema.to_str().unwrap(),
@@ -996,8 +995,18 @@ mod bundle {
                 "--bundle",
             ])
             .assert()
-            .failure()
-            .stderr(predicate::str::contains("circular"));
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let loaded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+        // Bundled output must be self-contained and compilable...
+        let validator = jsonschema::validator_for(&loaded).unwrap();
+        // ...accept valid recursion...
+        assert!(validator.is_valid(&serde_json::json!({"root": {"b": {"a": {"b": {}}}}})));
+        // ...and reject a violation deep inside the cycle.
+        assert!(!validator.is_valid(&serde_json::json!({"root": {"b": {"a": {"unknown": 1}}}})));
     }
 
     #[test]

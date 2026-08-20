@@ -2,9 +2,10 @@
 //!
 //! Handles loading schemas from files, strings, and HTTP URLs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use url::Url;
 
 use crate::error::ResolveError;
 
@@ -114,333 +115,437 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
     Ok(current.clone())
 }
 
-/// Recursively resolve and inline external $ref pointers.
+// ---------------------------------------------------------------------------
+// Bundling (flatten) — built on the upstream `jsonschema` resolution engine.
+//
+// Strategy: UCP resolution (annotations, monotonicity, strict-closing) must
+// see through external `$ref`s, so we materialize them. Reference *semantics*
+// (base URIs, lexical scope, fragments, recursion) are delegated to
+// `jsonschema::dereference`, which is tested against the official JSON Schema
+// suite. We keep three local passes it cannot do for us:
+//   1. root-internal refs stay refs (the validator resolves them; matches the
+//      long-standing output contract) — sentineled around dereference;
+//   2. `$ref` siblings are conjunctive in 2020-12; upstream dereference drops
+//      them, so we hoist siblings before and merge conjunctively after
+//      (upstream issue pending; see PR notes);
+//   3. inlined resource copies keep `$id`/`$schema` only when a retained
+//      (cyclic) `$ref` still needs that base — otherwise stripped, since
+//      Draft 2020-12 §8.1.1 forbids `$schema` outside a resource root.
+// ---------------------------------------------------------------------------
+
+/// Turns resolved reference URIs back into fetchable locations.
 ///
-/// Walks the schema tree, finds `$ref` values pointing to external files,
-/// loads them, and replaces the $ref with the loaded content.
-/// Internal refs (`#/...`) in the root schema are left for the validator.
-/// Internal refs in loaded external files are resolved against that file.
-/// Self-root refs (`$ref: "#"`) are left as-is (recursive type definitions).
-///
-/// # Arguments
-/// * `schema` - The schema to process (modified in place)
-/// * `base_dir` - Base directory for resolving relative file paths
-pub fn bundle_refs(schema: &mut Value, base_dir: &Path) -> Result<(), ResolveError> {
-    // Snapshot root schema so internal #/$defs/ refs can resolve against it.
-    let root_snapshot = schema.clone();
-    bundle_refs_inner(
-        schema,
-        base_dir,
-        Some(&root_snapshot),
-        None,
-        None,
-        &mut std::collections::HashSet::new(),
-    )
+/// Schemas declare `$id` under an HTTP authority (`https://ucp.dev/...`) while
+/// living as sibling files on disk, and references resolve against the nearest
+/// `$id` per Draft 2020-12. To honor the long-standing contract that relative
+/// refs load from the referencing *file's* directory, the retriever learns an
+/// `$id`-directory → disk-directory mapping for every document it loads and
+/// consults it (longest prefix first) before attempting network access.
+struct UcpRetriever {
+    /// Learned `$id`-directory → disk-directory prefixes, seeded with the
+    /// root document. Mutex because `Retrieve::retrieve` takes `&self`.
+    prefixes: std::sync::Mutex<Vec<(String, PathBuf)>>,
+    /// Explicit URL→path mapping (`--schema-local-base`/`--schema-remote-base`).
+    mapping: Option<(PathBuf, String)>,
 }
 
-/// Bundle external $ref pointers with URL-to-local-path mapping.
+impl UcpRetriever {
+    /// Load from disk and learn the document's own `$id` directory so that
+    /// refs *it* declares (resolved against its `$id`) map back to its
+    /// directory.
+    fn load_and_learn(&self, path: &Path) -> Result<Value, ResolveError> {
+        let mut doc = load_schema(path)?;
+        // Protect `$ref` siblings in *every* document that enters the
+        // registry, not only the root: upstream dereference replaces a
+        // ref-carrying object with its target, dropping siblings.
+        hoist_ref_siblings(&mut doc);
+        if let (Some(id), Some(dir)) = (doc.get("$id").and_then(Value::as_str), path.parent()) {
+            if let Some((id_dir, _)) = id.rsplit_once('/') {
+                let mut prefixes = self.prefixes.lock().expect("retriever mutex poisoned");
+                let entry = (format!("{id_dir}/"), dir.to_path_buf());
+                if !prefixes.contains(&entry) {
+                    prefixes.push(entry);
+                }
+            }
+        }
+        Ok(doc)
+    }
+}
+
+impl jsonschema::Retrieve for UcpRetriever {
+    fn retrieve(
+        &self,
+        uri: &jsonschema::Uri<String>,
+    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+        let uri = uri.as_str();
+        // 1. Explicit URL mapping wins.
+        if let Some((local, remote)) = &self.mapping {
+            if let Some(rest) = uri.strip_prefix(remote.trim_end_matches('/')) {
+                let path = local.join(rest.trim_start_matches('/'));
+                return Ok(self.load_and_learn(&path)?);
+            }
+        }
+        // 2. file:// URIs load directly.
+        if let Some(path) = uri.strip_prefix("file://") {
+            return Ok(self.load_and_learn(Path::new(path))?);
+        }
+        // 3. Learned `$id`-directory anchors: relocate the URI relative to a
+        //    known (`$id` dir → disk dir) pair, walking up as needed so that
+        //    `../capability.json`-style refs resolve like sibling files.
+        let candidate = {
+            let prefixes = self.prefixes.lock().expect("retriever mutex poisoned");
+            let mut hits: Vec<_> = prefixes
+                .iter()
+                .filter_map(|(id_dir, disk)| {
+                    relocate(id_dir, disk, uri).map(|path| (id_dir.len(), path))
+                })
+                .collect();
+            // Prefer the most specific anchor (longest shared $id directory).
+            hits.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+            hits.into_iter()
+                .map(|(_, path)| path)
+                .find(|path| path.exists())
+        };
+        if let Some(path) = candidate {
+            return Ok(self.load_and_learn(&path)?);
+        }
+        // 4. Remote fetch, when built with the `remote` feature.
+        #[cfg(feature = "remote")]
+        if is_url(uri) {
+            let mut doc = load_schema_url(uri)?;
+            hoist_ref_siblings(&mut doc);
+            return Ok(doc);
+        }
+        Err(format!("cannot retrieve schema resource: {uri}").into())
+    }
+}
+
+/// Map `uri` onto disk using a known (`$id` directory → disk directory) pair.
 ///
-/// Like `bundle_refs`, but handles absolute URL refs by mapping them to local paths.
-/// When a ref starts with `remote_base`, that prefix is stripped and the remainder
-/// is joined to `local_base` to form the local file path.
-///
-/// # Example
-/// ```text
-/// remote_base = "https://ucp.dev/draft"
-/// local_base = Path::new("site")
-/// $ref = "https://ucp.dev/draft/schemas/ucp.json" -> "site/schemas/ucp.json"
-/// ```
+/// Splits both URI paths on `/`, finds their common ancestor, then applies the
+/// divergence to the disk anchor: one `..` per remaining `id_dir` segment plus
+/// the URI remainder. Returns `None` when the URIs share no origin.
+fn relocate(id_dir: &str, disk: &Path, uri: &str) -> Option<PathBuf> {
+    let (id_origin, id_path) = split_origin(id_dir)?;
+    let (uri_origin, uri_path) = split_origin(uri)?;
+    if id_origin != uri_origin {
+        return None;
+    }
+    let id_segs: Vec<&str> = id_path.split('/').filter(|s| !s.is_empty()).collect();
+    let uri_segs: Vec<&str> = uri_path.split('/').filter(|s| !s.is_empty()).collect();
+    let common = id_segs
+        .iter()
+        .zip(uri_segs.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut path = disk.to_path_buf();
+    for _ in common..id_segs.len() {
+        path = path.join("..");
+    }
+    for seg in &uri_segs[common..] {
+        path = path.join(seg);
+    }
+    Some(path)
+}
+
+/// Split `scheme://authority` from the path portion of a URI.
+fn split_origin(uri: &str) -> Option<(&str, &str)> {
+    let scheme_end = uri.find("://")? + 3;
+    let path_start = uri[scheme_end..]
+        .find('/')
+        .map_or(uri.len(), |i| scheme_end + i);
+    Some((&uri[..path_start], &uri[path_start..]))
+}
+
+/// Breadth-first crawl of every externally referenced schema document,
+/// resolving each `$ref` against its containing document's base URI
+/// (`$id` when declared, retrieval URI otherwise), fetching through the
+/// UCP retriever. Returns each document keyed by the URI it resolves under.
+fn crawl_external_refs(
+    root: &Value,
+    root_base: &str,
+    retriever: &UcpRetriever,
+) -> Result<Vec<(String, Value)>, ResolveError> {
+    use jsonschema::Retrieve;
+
+    fn refs(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(obj) => {
+                if let Some(Value::String(r)) = obj.get("$ref") {
+                    if !r.starts_with('#') {
+                        out.push(r.clone());
+                    }
+                }
+                obj.values().for_each(|v| refs(v, out));
+            }
+            Value::Array(arr) => arr.iter().for_each(|v| refs(v, out)),
+            _ => {}
+        }
+    }
+
+    let base = |doc: &Value, fallback: &str| -> String {
+        doc.get("$id")
+            .and_then(Value::as_str)
+            .map_or_else(|| fallback.to_string(), ToString::to_string)
+    };
+
+    let mut resources = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut queue = vec![(root.clone(), base(root, root_base))];
+    while let Some((doc, doc_base)) = queue.pop() {
+        let mut found = Vec::new();
+        refs(&doc, &mut found);
+        for reference in found {
+            let target = reference.split('#').next().unwrap_or("");
+            if target.is_empty() {
+                continue;
+            }
+            let joined = Url::parse(&doc_base)
+                .and_then(|b| b.join(target))
+                .map_err(|e| ResolveError::BundleError {
+                    message: format!("invalid $ref {reference:?} against {doc_base}: {e}"),
+                })?;
+            let mut joined = joined;
+            joined.set_fragment(None);
+            let uri = joined.to_string();
+            if !seen.insert(uri.clone()) {
+                continue;
+            }
+            let parsed =
+                jsonschema::Uri::parse(uri.clone()).map_err(|e| ResolveError::BundleError {
+                    message: format!("invalid URI {uri}: {e:?}"),
+                })?;
+            let fetched = retriever
+                .retrieve(&parsed)
+                .map_err(|e| ResolveError::BundleError {
+                    message: format!("cannot load referenced schema {uri}: {e}"),
+                })?;
+            let fetched_base = base(&fetched, &uri);
+            queue.push((fetched.clone(), fetched_base.clone()));
+            resources.push((uri.clone(), fetched.clone()));
+            // Register under the declared `$id` too when it differs.
+            if fetched_base != uri && seen.insert(fetched_base.clone()) {
+                resources.push((fetched_base, fetched));
+            }
+        }
+    }
+    Ok(resources)
+}
+
+/// Bundle references using a local physical base directory.
+pub fn bundle_refs(schema: &mut Value, base_dir: &Path) -> Result<(), ResolveError> {
+    let base_dir = canonical_dir(base_dir);
+    let base_uri = directory_uri(&base_dir)?;
+    flatten(schema, Some(base_dir), base_uri, None)
+}
+
+/// Bundle references, mapping an absolute URL prefix to a local directory.
 pub fn bundle_refs_with_url_mapping(
     schema: &mut Value,
     base_dir: &Path,
     local_base: &Path,
     remote_base: &str,
 ) -> Result<(), ResolveError> {
-    let root_snapshot = schema.clone();
-    bundle_refs_inner(
+    let base_dir = canonical_dir(base_dir);
+    let base_uri = directory_uri(&base_dir)?;
+    flatten(
         schema,
-        base_dir,
-        Some(&root_snapshot),
-        Some(local_base),
-        Some(remote_base),
-        &mut std::collections::HashSet::new(),
+        Some(base_dir),
+        base_uri,
+        Some((local_base.to_path_buf(), remote_base.to_string())),
     )
 }
 
-fn bundle_refs_inner(
-    schema: &mut Value,
-    base_dir: &Path,
-    file_root: Option<&Value>, // Root of external file for resolving internal refs
-    url_local_base: Option<&Path>,
-    url_remote_base: Option<&str>,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<(), ResolveError> {
-    match schema {
-        Value::Object(obj) => {
-            // Check if this object has a $ref
-            if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
-                if ref_val.starts_with('#') {
-                    // Internal ref - only resolve if we have a file_root context
-                    // Skip self-root refs ($ref: "#") - these are recursive type defs
-                    if ref_val == "#" {
-                        // Leave as-is - can't inline recursive self-reference
-                    } else if let Some(root) = file_root {
-                        let mut target = navigate_fragment(root, ref_val)?;
-                        // Recursively process (may have nested refs)
-                        bundle_refs_inner(
-                            &mut target,
-                            base_dir,
-                            file_root,
-                            url_local_base,
-                            url_remote_base,
-                            visited,
-                        )?;
-                        // Inline the resolved definition
-                        obj.remove("$ref");
-                        if let Value::Object(ref_obj) = target {
-                            for (k, v) in ref_obj {
-                                obj.entry(k).or_insert(v);
-                            }
-                        }
-                        return Ok(());
-                    }
-                    // No file_root context — leave as-is
-                } else {
-                    // External ref - may be relative path or absolute URL
-                    let (file_part, fragment) = match ref_val.find('#') {
-                        Some(idx) => (&ref_val[..idx], Some(&ref_val[idx..])),
-                        None => (ref_val, None),
-                    };
-
-                    // Resolve ref to local path, handling URL mapping if configured
-                    let ref_path =
-                        resolve_ref_to_path(file_part, base_dir, url_local_base, url_remote_base);
-
-                    // If local resolution fails and the ref is a URL, try HTTP fetch
-                    #[cfg(feature = "remote")]
-                    let (loaded, ref_dir_owned) = if !ref_path.exists() && is_url(file_part) {
-                        let fetched = load_schema_url(file_part)?;
-                        // Remote schemas have no local directory; use base_dir for
-                        // any relative refs within the fetched schema
-                        (fetched, base_dir.to_path_buf())
-                    } else {
-                        let schema = load_schema(&ref_path)?;
-                        let dir = ref_path.parent().unwrap_or(base_dir).to_path_buf();
-                        (schema, dir)
-                    };
-
-                    #[cfg(not(feature = "remote"))]
-                    let (loaded, ref_dir_owned) = {
-                        let schema = load_schema(&ref_path)?;
-                        let dir = ref_path.parent().unwrap_or(base_dir).to_path_buf();
-                        (schema, dir)
-                    };
-
-                    let canonical = ref_path.canonicalize().unwrap_or(ref_path.clone());
-                    let visit_key = format!("{}|{}", canonical.display(), fragment.unwrap_or(""));
-
-                    if visited.contains(&visit_key) {
-                        return Err(ResolveError::BundleError {
-                            message: format!("circular reference detected: {}", ref_val),
-                        });
-                    }
-
-                    let mut target = if let Some(frag) = fragment {
-                        navigate_fragment(&loaded, frag)?
-                    } else {
-                        loaded.clone()
-                    };
-
-                    visited.insert(visit_key.clone());
-                    // Pass loaded file as file_root so internal refs resolve against it
-                    bundle_refs_inner(
-                        &mut target,
-                        &ref_dir_owned,
-                        Some(&loaded),
-                        url_local_base,
-                        url_remote_base,
-                        visited,
-                    )?;
-                    visited.remove(&visit_key);
-
-                    obj.remove("$ref");
-                    if let Value::Object(ref_obj) = target {
-                        for (k, v) in ref_obj {
-                            obj.entry(k).or_insert(v);
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-
-            // Recurse into all values
-            for value in obj.values_mut() {
-                bundle_refs_inner(
-                    value,
-                    base_dir,
-                    file_root,
-                    url_local_base,
-                    url_remote_base,
-                    visited,
-                )?;
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                bundle_refs_inner(
-                    item,
-                    base_dir,
-                    file_root,
-                    url_local_base,
-                    url_remote_base,
-                    visited,
-                )?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-/// Resolve a $ref value to a local file path.
-///
-/// If URL mapping is configured and the ref matches the remote base,
-/// strips the prefix and joins to local_base. Otherwise uses base_dir
-/// for relative path resolution.
-fn resolve_ref_to_path(
-    ref_val: &str,
-    base_dir: &Path,
-    url_local_base: Option<&Path>,
-    url_remote_base: Option<&str>,
-) -> std::path::PathBuf {
-    // Check if this is an absolute URL that matches our remote base
-    if let (Some(local_base), Some(remote_base)) = (url_local_base, url_remote_base) {
-        if let Some(remainder) = ref_val.strip_prefix(remote_base) {
-            // URL matches remote base - map to local path
-            return local_base.join(remainder.trim_start_matches('/'));
-        }
-    }
-
-    // Default: treat as relative path from base_dir
-    base_dir.join(ref_val)
-}
-
-/// Bundle external $ref pointers by fetching from remote URLs.
-///
-/// Like `bundle_refs`, but fetches external refs via HTTP instead of local files.
-/// This allows remote-only validation by inlining all refs before passing to
-/// the JSON Schema validator.
-///
-/// # Arguments
-/// * `schema` - The schema to process (modified in place)
-/// * `base_url` - Base URL for resolving relative refs (typically the schema's $id)
+/// Bundle references by fetching remote resources.
 #[cfg(feature = "remote")]
 pub fn bundle_refs_remote(schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
-    // Snapshot root schema so internal #/$defs/ refs can resolve against it.
-    let root_snapshot = schema.clone();
-    bundle_refs_remote_inner(
-        schema,
-        base_url,
-        Some(&root_snapshot),
-        &mut std::collections::HashSet::new(),
-    )
+    flatten(schema, None, base_url.to_string(), None)
 }
 
-#[cfg(feature = "remote")]
-fn bundle_refs_remote_inner(
-    schema: &mut Value,
-    base_url: &str,
-    file_root: Option<&Value>,
-    visited: &mut std::collections::HashSet<String>,
-) -> Result<(), ResolveError> {
-    match schema {
-        Value::Object(obj) => {
-            if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
-                if ref_val.starts_with('#') {
-                    // Internal ref
-                    if ref_val == "#" {
-                        // Self-reference, leave as-is
-                    } else if let Some(root) = file_root {
-                        let mut target = navigate_fragment(root, ref_val)?;
-                        bundle_refs_remote_inner(&mut target, base_url, file_root, visited)?;
-                        obj.remove("$ref");
-                        if let Value::Object(ref_obj) = target {
-                            for (k, v) in ref_obj {
-                                obj.entry(k).or_insert(v);
-                            }
-                        }
-                        return Ok(());
-                    }
-                    // No file_root context — leave as-is
-                } else {
-                    // External ref - resolve URL
-                    let (file_part, fragment) = match ref_val.find('#') {
-                        Some(idx) => (&ref_val[..idx], Some(&ref_val[idx..])),
-                        None => (ref_val, None),
-                    };
+/// `file://` base URI for a directory, percent-encoded by the `url` crate.
+/// `canonical_dir` has already absolutized the path (empty input anchors at
+/// the cwd), so conversion only fails on genuinely non-representable paths.
+fn directory_uri(dir: &Path) -> Result<String, ResolveError> {
+    Url::from_directory_path(dir)
+        .map(String::from)
+        .map_err(|()| bundle_error(format!("not a usable base directory: {}", dir.display())))
+}
 
-                    // Resolve to absolute URL
-                    let resolved_url = resolve_url(file_part, base_url);
-                    let visit_key = format!("{}|{}", resolved_url, fragment.unwrap_or(""));
-
-                    if visited.contains(&visit_key) {
-                        return Err(ResolveError::BundleError {
-                            message: format!("circular reference detected: {}", ref_val),
-                        });
-                    }
-
-                    // Fetch the referenced schema
-                    let loaded = load_schema_url(&resolved_url)?;
-                    let mut target = if let Some(frag) = fragment {
-                        navigate_fragment(&loaded, frag)?
-                    } else {
-                        loaded.clone()
-                    };
-
-                    visited.insert(visit_key.clone());
-                    // Recursively bundle with new base URL
-                    bundle_refs_remote_inner(&mut target, &resolved_url, Some(&loaded), visited)?;
-                    visited.remove(&visit_key);
-
-                    obj.remove("$ref");
-                    if let Value::Object(ref_obj) = target {
-                        for (k, v) in ref_obj {
-                            obj.entry(k).or_insert(v);
-                        }
-                    }
-                    return Ok(());
-                }
-            }
-
-            // Recurse into all values
-            for value in obj.values_mut() {
-                bundle_refs_remote_inner(value, base_url, file_root, visited)?;
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                bundle_refs_remote_inner(item, base_url, file_root, visited)?;
-            }
-        }
-        _ => {}
+fn bundle_error(message: impl Into<String>) -> ResolveError {
+    ResolveError::BundleError {
+        message: message.into(),
     }
+}
+
+/// Empty parent dirs (bare `schema.json` inputs) anchor at the cwd.
+fn canonical_dir(dir: &Path) -> PathBuf {
+    let dir = if dir.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        dir
+    };
+    dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf())
+}
+
+fn flatten(
+    schema: &mut Value,
+    base_dir: Option<PathBuf>,
+    base_uri: String,
+    mapping: Option<(PathBuf, String)>,
+) -> Result<(), ResolveError> {
+    let mut prefixes = Vec::new();
+    if let (Some(id), Some(dir)) = (schema.get("$id").and_then(Value::as_str), &base_dir) {
+        if let Some((id_dir, _)) = id.rsplit_once('/') {
+            prefixes.push((format!("{id_dir}/"), dir.clone()));
+        }
+    }
+
+    hoist_ref_siblings(schema);
+
+    let retriever = UcpRetriever {
+        prefixes: std::sync::Mutex::new(prefixes),
+        mapping,
+    };
+
+    // Upstream dereference resolves lazily-discovered external refs only at
+    // registry-build time; refs found *inside fetched documents* would hit a
+    // closed registry. Pre-crawl the transitive closure so every resource is
+    // present up front.
+    let resources = crawl_external_refs(schema, &base_uri, &retriever)?;
+    let mut builder = jsonschema::Registry::new();
+    for (uri, doc) in resources {
+        builder = builder
+            .add(&uri, jsonschema::Resource::from_contents(doc))
+            .map_err(|e| ResolveError::BundleError {
+                message: format!("invalid schema resource {uri}: {e}"),
+            })?;
+    }
+    let registry = builder.prepare().map_err(|e| ResolveError::BundleError {
+        message: format!("building schema registry: {e}"),
+    })?;
+    let flat = jsonschema::options()
+        .with_base_uri(base_uri)
+        .with_registry(&registry)
+        .dereference(schema)
+        .map_err(|e| ResolveError::BundleError {
+            message: format!("failed to bundle schema: {e}"),
+        })?;
+    *schema = flat;
+
+    collapse_and_strip(schema, true);
     Ok(())
 }
 
-/// Resolve a potentially relative URL against a base URL.
-#[cfg(feature = "remote")]
-fn resolve_url(url: &str, base: &str) -> String {
-    if is_url(url) {
-        // Already absolute
-        url.to_string()
-    } else {
-        // Relative - resolve against base
-        // Find the directory part of base URL
-        if let Some(idx) = base.rfind('/') {
-            format!("{}/{}", &base[..idx], url)
-        } else {
-            url.to_string()
+/// `{"$ref": R, ...siblings}` → `{"allOf": [{"$ref": R}], ...siblings}`.
+///
+/// Draft 2020-12 evaluates `$ref` siblings conjunctively; upstream
+/// `dereference` replaces the carrying object with the target, dropping
+/// siblings (43 `ucp_*` annotations ride as `$ref` siblings in the UCP
+/// corpus alone). Hoisting makes the conjunction structural before
+/// dereference; `collapse_and_strip` re-merges afterwards.
+fn hoist_ref_siblings(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            let has_ref = matches!(obj.get("$ref"), Some(Value::String(_)));
+            if has_ref && obj.len() > 1 && !obj.contains_key("allOf") {
+                let r = obj.remove("$ref").expect("checked above");
+                obj.insert(
+                    "allOf".to_string(),
+                    Value::Array(vec![serde_json::json!({ "$ref": r })]),
+                );
+            }
+            obj.values_mut().for_each(hoist_ref_siblings);
         }
+        Value::Array(arr) => arr.iter_mut().for_each(hoist_ref_siblings),
+        _ => {}
+    }
+}
+
+/// Post-dereference cleanup, one walk:
+/// - merge single-branch `allOf` conjunctions flat when no keyword conflicts
+///   (a one-branch `allOf` is semantically identical to inlining it);
+/// - drop non-root `$id`/`$schema` from subtrees with no retained `$ref`
+///   (nothing needs their base once materialized; §8.1.1 forbids stray
+///   `$schema`); keep them where a retained cyclic `$ref` still resolves
+///   against that base.
+fn collapse_and_strip(value: &mut Value, is_root: bool) {
+    match value {
+        Value::Object(obj) => {
+            for v in obj.values_mut() {
+                collapse_and_strip(v, false);
+            }
+            // Merge {"allOf":[X], ...siblings} flat unless a *constraint*
+            // genuinely conflicts. A branch key merges when it is absent from
+            // the parent, equal-valued, or annotation-class (title,
+            // description, ucp_* …) — where the use site wins, matching how
+            // authors annotate `$ref` occurrences. Only conflicting
+            // constraints (e.g. two different `maximum`s) keep the `allOf`
+            // conjunction, which is the Draft 2020-12 sibling semantics.
+            let mergeable = match obj.get("allOf") {
+                Some(Value::Array(branches)) if branches.len() == 1 => match &branches[0] {
+                    Value::Object(branch) => {
+                        // The single-branch `allOf` wrapper itself is being
+                        // consumed, so a branch-level `allOf` does not collide
+                        // with it — it takes the wrapper's place.
+                        !branch.is_empty()
+                            && branch.iter().all(|(k, v)| {
+                                k == "allOf"
+                                    || !obj.contains_key(k)
+                                    || obj.get(k) == Some(v)
+                                    || is_annotation_keyword(k)
+                            })
+                    }
+                    _ => false,
+                },
+                _ => false,
+            };
+            if mergeable {
+                let Some(Value::Array(mut branches)) = obj.remove("allOf") else {
+                    unreachable!("checked above");
+                };
+                let Value::Object(branch) = branches.remove(0) else {
+                    unreachable!("checked above");
+                };
+                for (k, v) in branch {
+                    obj.entry(k).or_insert(v);
+                }
+            }
+            if !is_root && !contains_ref(value) {
+                if let Value::Object(obj) = value {
+                    obj.remove("$id");
+                    obj.remove("$schema");
+                }
+            }
+        }
+        Value::Array(arr) => arr.iter_mut().for_each(|v| collapse_and_strip(v, false)),
+        _ => {}
+    }
+}
+
+/// Keywords that annotate rather than constrain. When a `$ref` use site and
+/// its target both carry one, the use site's copy wins on merge — authors
+/// annotate the occurrence, and validation outcomes cannot change.
+fn is_annotation_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "title"
+            | "description"
+            | "$comment"
+            | "examples"
+            | "default"
+            | "deprecated"
+            | "readOnly"
+            | "writeOnly"
+            | "ucp_request"
+            | "ucp_response"
+    )
+}
+
+fn contains_ref(value: &Value) -> bool {
+    match value {
+        Value::Object(obj) => obj.contains_key("$ref") || obj.values().any(contains_ref),
+        Value::Array(arr) => arr.iter().any(contains_ref),
+        _ => false,
     }
 }
 
@@ -535,66 +640,6 @@ mod tests {
 
         let schema = load_schema_auto(file.path().to_str().unwrap()).unwrap();
         assert_eq!(schema["type"], "string");
-    }
-
-    #[test]
-    fn resolve_ref_to_path_with_url_mapping() {
-        let base_dir = Path::new("/some/dir");
-        let local_base = Path::new("/local/schemas");
-        let remote_base = "https://ucp.dev/draft";
-
-        // URL matching remote base gets mapped to local
-        let path = resolve_ref_to_path(
-            "https://ucp.dev/draft/schemas/ucp.json",
-            base_dir,
-            Some(local_base),
-            Some(remote_base),
-        );
-        assert_eq!(path, Path::new("/local/schemas/schemas/ucp.json"));
-    }
-
-    #[test]
-    fn resolve_ref_to_path_url_not_matching_remote() {
-        let base_dir = Path::new("/some/dir");
-        let local_base = Path::new("/local/schemas");
-        let remote_base = "https://ucp.dev/draft";
-
-        // URL not matching remote base falls back to base_dir join
-        let path = resolve_ref_to_path(
-            "https://other.com/schemas/foo.json",
-            base_dir,
-            Some(local_base),
-            Some(remote_base),
-        );
-        assert_eq!(
-            path,
-            Path::new("/some/dir/https://other.com/schemas/foo.json")
-        );
-    }
-
-    #[test]
-    fn resolve_ref_to_path_relative_ref() {
-        let base_dir = Path::new("/some/dir");
-
-        // Relative ref without URL mapping
-        let path = resolve_ref_to_path("types/buyer.json", base_dir, None, None);
-        assert_eq!(path, Path::new("/some/dir/types/buyer.json"));
-    }
-
-    #[test]
-    fn resolve_ref_to_path_strips_leading_slash() {
-        let base_dir = Path::new("/some/dir");
-        let local_base = Path::new("/local");
-        let remote_base = "https://ucp.dev/draft";
-
-        // Stripping remote base leaves "/schemas/..." - leading slash should be trimmed
-        let path = resolve_ref_to_path(
-            "https://ucp.dev/draft/schemas/foo.json",
-            base_dir,
-            Some(local_base),
-            Some(remote_base),
-        );
-        assert_eq!(path, Path::new("/local/schemas/foo.json"));
     }
 
     // Remote tests run against a local mockito server so they're deterministic

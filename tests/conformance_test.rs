@@ -7,9 +7,9 @@
 //! a green suite precisely because tests asserted that `"$ref": "#"`
 //! *survived* bundling, not what it *denoted* afterwards.
 //!
-//! Cases marked `#[ignore]` document known-broken behavior of the current
-//! bundler; the commit that rebuilds bundling on the upstream referencing
-//! engine removes the attributes.
+//! These cases were introduced `#[ignore]`d against the legacy transplanting
+//! bundler; the referencing-engine rewrite made them pass and removed the
+//! attributes.
 
 use std::fs;
 use std::path::Path;
@@ -41,7 +41,6 @@ fn oracle_is_valid(schema: &Value, instance: &Value) -> bool {
 /// resource A (constraint grammar): forbids `path` everywhere.
 /// resource B (outer binding): allows `path` at its own root only.
 #[test]
-#[ignore = "resource identity is rebased by the current bundler; fixed by the referencing-engine rewrite"]
 fn fragment_ref_into_recursive_resource_preserves_target_root() {
     let dir = TempDir::new().unwrap();
     fs::write(
@@ -94,7 +93,6 @@ fn fragment_ref_into_recursive_resource_preserves_target_root() {
 /// and the sibling's constraints apply. The legacy bundler let sibling keys
 /// *replace* target keys, silently dropping the target's `maximum: 50`.
 #[test]
-#[ignore = "sibling keywords replace target constraints in the current bundler; fixed by the referencing-engine rewrite"]
 fn ref_siblings_apply_conjunctively() {
     let dir = TempDir::new().unwrap();
     fs::write(
@@ -136,7 +134,6 @@ fn ref_siblings_apply_conjunctively() {
 /// The bundler must retain the cycle with resource identity intact rather
 /// than reject the schema.
 #[test]
-#[ignore = "cross-file recursion is a hard error in the current bundler; fixed by the referencing-engine rewrite"]
 fn cross_file_recursion_bundles_and_validates() {
     let dir = TempDir::new().unwrap();
     fs::write(
@@ -191,7 +188,6 @@ fn cross_file_recursion_bundles_and_validates() {
 /// resource's `$id`/`$schema` (Draft 2020-12 §8.1.1 forbids `$schema`
 /// outside a resource root, and repeated `$id` claims are degenerate).
 #[test]
-#[ignore = "the current bundler stamps $id/$schema on every inlined copy; fixed by the referencing-engine rewrite"]
 fn materialized_copies_shed_resource_identity() {
     let dir = TempDir::new().unwrap();
     fs::write(
