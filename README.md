@@ -202,6 +202,7 @@ Options:
 | W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`)   | Warning  |
 | W004 | Requires    | Version constraint has `min` > `max`                           | Warning  |
 | W005 | Requires    | Unknown key in `requires` or version constraint                | Warning  |
+| W006 | Examples    | `examples` not validated: sub-schema could not be compiled     | Warning  |
 
 ```bash
 # Lint a directory of schemas
