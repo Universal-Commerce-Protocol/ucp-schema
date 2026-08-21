@@ -1335,3 +1335,80 @@ fn composed_extension_with_acyclic_helper_needs_no_anchor() {
         !validator.is_valid(&json!({ "id": "c1", "status": "incomplete", "badge": { "oops": 1 } }))
     );
 }
+
+/// Self-root `$ref: "#"` reached through an array `items` position — the
+/// shape UCP's Constraint Expression grammar introduces via
+/// `anyOf.items.$ref: "#"` (spec PR #757, where `anyOf` is a *property
+/// name*, not an applicator). Draft 2020-12 §8.2.1: the nested `#` denotes
+/// the *referenced* resource's root, not the referencing document's root.
+///
+/// Distinct from `fragment_ref_into_recursive_resource_preserves_target_root`
+/// in the traversal position of the recursion (array items vs
+/// `properties.additionalProperties`), which is where a position-sensitive
+/// bundling pass can diverge — the mid-stack container regression in this
+/// very branch is the existence proof for that failure mode.
+#[test]
+fn self_root_ref_under_array_items_denotes_target_root() {
+    let dir = TempDir::new().unwrap();
+    // A: the grammar. `anyOf` is a property name; its items recurse to A's root.
+    fs::write(
+        dir.path().join("a.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/a.json",
+            "type": "object",
+            "properties": {
+                "required": { "type": "array", "items": { "type": "string" } },
+                "anyOf": { "type": "array", "minItems": 1, "items": { "$ref": "#" } }
+            },
+            "additionalProperties": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+    // B: the binding. Admits `path` at its own root only.
+    fs::write(
+        dir.path().join("b.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/b.json",
+            "type": "object",
+            "properties": {
+                "path": { "type": "string" },
+                "required": { "type": "array", "items": { "type": "string" } },
+                "anyOf": { "type": "array", "minItems": 1, "items": { "$ref": "a.json" } }
+            },
+            "additionalProperties": false
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "b.json");
+
+    assert!(
+        oracle_is_valid(
+            &bundled,
+            &json!({ "path": "$", "anyOf": [{ "required": ["x"] }] })
+        ),
+        "root path plus one legal branch must validate"
+    );
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "anyOf": [{ "path": "$" }] })),
+        "depth-1 branch must not admit `path` (cross-file ref into A)"
+    );
+    assert!(
+        !oracle_is_valid(
+            &bundled,
+            &json!({ "anyOf": [{ "anyOf": [{ "path": "$" }] }] })
+        ),
+        "depth-2 branch must not admit `path` (self-root `#` inside A, via items)"
+    );
+    assert!(
+        oracle_is_valid(
+            &bundled,
+            &json!({ "anyOf": [{ "anyOf": [{ "required": ["x"] }] }] })
+        ),
+        "depth-2 legal nesting must still validate"
+    );
+}
