@@ -157,7 +157,7 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     check_requires(&schema, file, &mut diagnostics);
 
     // Check that `examples` entries validate against their own (sub)schema
-    check_examples(&schema, file, "", &mut diagnostics);
+    check_examples(&schema, &schema, file, "", &mut diagnostics);
 
     // Check for missing $id (warning)
     if schema.get("$id").is_none() {
@@ -196,14 +196,37 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
 /// This turns `examples` into an executable, drift-free conformance battery that
 /// lives next to the grammar it documents.
 ///
-/// Best-effort: a sub-schema whose validator cannot be compiled in isolation
-/// (e.g., unresolved external `$ref`s) is skipped here — broken refs are already
-/// reported by the `$ref` checks.
-fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+/// Best-effort: a sub-schema whose validator cannot be compiled with the root
+/// schema as its resource (e.g., unresolved external `$ref`s) is skipped here —
+/// broken refs are already reported by the `$ref` checks.
+fn check_examples(
+    value: &Value,
+    root: &Value,
+    file: &Path,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match value {
         Value::Object(map) => {
             if let Some(Value::Array(examples)) = map.get("examples") {
-                if let Ok(validator) = jsonschema::validator_for(value) {
+                const ROOT_URI: &str = "urn:ucp-schema:lint-root";
+                let mut root = root.clone();
+                if let Some(root) = root.as_object_mut() {
+                    root.insert("$id".to_string(), Value::String(ROOT_URI.to_string()));
+                }
+                let validator =
+                    jsonschema::Resource::from_contents(root)
+                        .ok()
+                        .and_then(|resource| {
+                            jsonschema::options()
+                                .with_resource(ROOT_URI, resource)
+                                .build(&serde_json::json!({
+                                    "$ref": format!("{}#{}", ROOT_URI, path)
+                                }))
+                                .ok()
+                        });
+
+                if let Some(validator) = validator {
                     for (i, example) in examples.iter().enumerate() {
                         if !validator.is_valid(example) {
                             diagnostics.push(Diagnostic {
@@ -221,14 +244,15 @@ fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<
                 }
             }
             for (key, child) in map {
+                let key = key.replace('~', "~0").replace('/', "~1");
                 let child_path = format!("{}/{}", path, key);
-                check_examples(child, file, &child_path, diagnostics);
+                check_examples(child, root, file, &child_path, diagnostics);
             }
         }
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
                 let child_path = format!("{}/{}", path, i);
-                check_examples(item, file, &child_path, diagnostics);
+                check_examples(item, root, file, &child_path, diagnostics);
             }
         }
         _ => {}
@@ -863,6 +887,37 @@ mod tests {
             result.diagnostics
         );
         assert_eq!(e008[0].path, "/examples/1");
+    }
+
+    #[test]
+    fn lint_referenced_examples_use_root_schema() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r##"{{
+            "$id": "https://example.com/root.json",
+            "$defs": {{
+                "positive": {{ "type": "integer", "minimum": 1 }}
+            }},
+            "properties": {{
+                "value": {{
+                    "$ref": "#/$defs/positive",
+                    "examples": [0, 2]
+                }}
+            }}
+        }}"##
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        let e008: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .collect();
+        assert_eq!(e008.len(), 1, "expected only 0 to fail: {e008:?}");
+        assert_eq!(e008[0].path, "/properties/value/examples/0");
     }
 
     #[test]
