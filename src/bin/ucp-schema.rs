@@ -705,6 +705,13 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
             report_error(json_output, &e.to_string());
             Err(e.exit_code() as u8)
         }
+        // ValidateError is non_exhaustive: a variant added later must not stop
+        // this binary compiling. Report it and exit 2, matching the schema-error
+        // class the other arms use.
+        Err(e) => {
+            report_error(json_output, &e.to_string());
+            Err(2)
+        }
     }
 }
 
