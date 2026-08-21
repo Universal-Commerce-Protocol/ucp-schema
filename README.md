@@ -575,13 +575,19 @@ Bundling applies to **schema file input only**. When resolving payloads, composi
 
 How it works:
 
-- Reference resolution (base URIs, lexical scope, fragments, anchors) is delegated to the [`jsonschema`](https://docs.rs/jsonschema) crate's referencing engine, which is tested against the official JSON Schema suite. Documents are loaded from disk relative to the referencing file's directory, through `--schema-local-base`/`--schema-remote-base` URL mapping, or over HTTP.
-- Acyclic refs — whole-file (`"$ref": "types/buyer.json"`) and fragment (`"$ref": "types/common.json#/$defs/address"`) — are materialized in place. Materialized copies shed their `$id`/`$schema`: they become ordinary subschemas (Draft 2020-12 §8.1.1).
-- Recursive references (including cycles across files) are legal and retained as `$ref`s inside an embedded copy of their resource that keeps its `$id`, so `"$ref": "#"` keeps denoting the _referenced_ resource's root — never the bundling document's.
-- `$ref` sibling keywords apply conjunctively per Draft 2020-12. Non-conflicting siblings merge flat (annotations: the use site wins); genuinely conflicting constraints are preserved as an explicit `allOf` conjunction.
-- `$ref`-shaped objects inside instance data (`const`, `enum`, `default`, `examples`) are payload, not references: they survive byte-for-byte and are never fetched.
+- External refs — whole-file (`"$ref": "types/buyer.json"`) and fragment
+  (`"$ref": "types/common.json#/$defs/address"`) — are materialized in place
+- Recursive references (`"$ref": "#"`, self-referential types, cycles across
+  files) are legal and retained — `#` keeps meaning the file it was written in
+- Keywords beside a `$ref` combine with the referenced schema instead of
+  replacing it
+- `$ref`-shaped values inside `const`/`enum`/`default`/`examples` are data,
+  not references: preserved byte-for-byte, never fetched
+- Referenced files load from the referencing file's directory, via
+  `--schema-local-base`/`--schema-remote-base` mapping, or over HTTP
 
-The bundled output validates identically to the unbundled multi-file schema under any conforming Draft 2020-12 validator.
+The bundled schema is self-contained and validates identically to the
+multi-file original under any Draft 2020-12 validator.
 
 ### Strict Mode
 
