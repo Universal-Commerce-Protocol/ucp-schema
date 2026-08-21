@@ -118,20 +118,40 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
 // ---------------------------------------------------------------------------
 // Bundling (flatten) — built on the upstream `jsonschema` resolution engine.
 //
-// Strategy: UCP resolution (annotations, monotonicity, strict-closing) must
-// see through external `$ref`s, so we materialize them. Reference *semantics*
-// (base URIs, lexical scope, fragments, recursion) are delegated to
+// UCP resolution (annotations, monotonicity, strict-closing) must see through
+// external `$ref`s, so bundling materializes them. Reference *semantics* —
+// base URIs, lexical scope, fragments, cycle identity — are delegated to
 // `jsonschema::dereference`, which is tested against the official JSON Schema
-// suite. We keep three local passes it cannot do for us:
-//   1. root-internal refs stay refs (the validator resolves them; matches the
-//      long-standing output contract) — sentineled around dereference;
-//   2. `$ref` siblings are conjunctive in 2020-12; upstream dereference drops
-//      them, so we hoist siblings before and merge conjunctively after
-//      (upstream issue pending; see PR notes);
-//   3. inlined resource copies keep `$id`/`$schema` only when a retained
-//      (cyclic) `$ref` still needs that base — otherwise stripped, since
-//      Draft 2020-12 §8.1.1 forbids `$schema` outside a resource root.
+// suite. Around it run four local passes covering what upstream cannot do:
+//
+//   1. mask_instance_refs — hide `$ref`-shaped payload inside instance data
+//      (`const`/`enum`/`default`/`examples`) from upstream, which walks those
+//      positions as if they were schemas; restored byte-identically at the
+//      end (upstream issue pending);
+//   2. hoist_ref_siblings — Draft 2020-12 evaluates `$ref` siblings
+//      conjunctively, upstream dereference drops them; hoisting makes the
+//      conjunction structural (upstream issue pending);
+//   3. crawl_external_refs — upstream resolves lazily-discovered refs only
+//      at registry-build time; pre-crawl the transitive document closure so
+//      every resource is present up front (upstream issue pending);
+//   4. collapse_and_strip — re-merge the hoisted one-branch conjunctions
+//      unless a constraint genuinely conflicts, and shed `$id`/`$schema`
+//      from materialized copies no retained ref needs (Draft 2020-12 §8.1.1
+//      forbids `$schema` outside a resource root).
+//
+// Cycles need no local handling: dereference retains them as `$ref`s inside
+// an embedded resource copy that keeps its `$id`, so `#` keeps denoting the
+// resource it was written in.
 // ---------------------------------------------------------------------------
+
+/// Sentinel used to hide `$ref` keys inside instance data from upstream
+/// dereference. Reserved everywhere in input documents: the final unmask is
+/// a blind whole-tree rename, so any pre-existing key with this name would
+/// silently become `$ref` in the output.
+const INSTANCE_REF_SENTINEL: &str = "__ucp_instance_ref__";
+
+/// Keywords whose values are instance data, not subschemas.
+const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
 /// Turns resolved reference URIs back into fetchable locations.
 ///
@@ -155,12 +175,7 @@ impl UcpRetriever {
     /// directory.
     fn load_and_learn(&self, path: &Path) -> Result<Value, ResolveError> {
         let mut doc = load_schema(path)?;
-        // Protect `$ref` siblings and instance-data refs in *every* document
-        // that enters the registry, not only the root: upstream dereference
-        // replaces a ref-carrying object with its target (dropping siblings)
-        // and chases `$ref`-shaped payload inside `const`/`enum`.
-        mask_instance_refs(&mut doc)?;
-        hoist_ref_siblings(&mut doc);
+        prepare_document(&mut doc)?;
         if let (Some(id), Some(dir)) = (doc.get("$id").and_then(Value::as_str), path.parent()) {
             if let Some((id_dir, _)) = id.rsplit_once('/') {
                 let mut prefixes = self.prefixes.lock().expect("retriever mutex poisoned");
@@ -215,8 +230,7 @@ impl jsonschema::Retrieve for UcpRetriever {
         #[cfg(feature = "remote")]
         if is_url(uri) {
             let mut doc = load_schema_url(uri)?;
-            mask_instance_refs(&mut doc)?;
-            hoist_ref_siblings(&mut doc);
+            prepare_document(&mut doc)?;
             return Ok(doc);
         }
         Err(format!("cannot retrieve schema resource: {uri}").into())
@@ -302,12 +316,11 @@ fn crawl_external_refs(
             if target.is_empty() {
                 continue;
             }
-            let joined = Url::parse(&doc_base)
+            let mut joined = Url::parse(&doc_base)
                 .and_then(|b| b.join(target))
                 .map_err(|e| ResolveError::BundleError {
                     message: format!("invalid $ref {reference:?} against {doc_base}: {e}"),
                 })?;
-            let mut joined = joined;
             joined.set_fragment(None);
             let uri = joined.to_string();
             if !seen.insert(uri.clone()) {
@@ -414,10 +427,7 @@ fn flatten(
 ) -> Result<(), ResolveError> {
     // Work on a copy: the input must stay untouched on any error path.
     let mut work = schema.clone();
-    // The sentinel name is reserved everywhere, not only inside instance
-    // data: the final unmask is a blind whole-tree rename, so a schema key
-    // with this name would silently become `$ref` in the output.
-    reject_sentinel_members(&work)?;
+    prepare_document(&mut work)?;
 
     let mut prefixes = Vec::new();
     if let (Some(id), Some(dir)) = (work.get("$id").and_then(Value::as_str), &base_dir) {
@@ -425,9 +435,6 @@ fn flatten(
             prefixes.push((format!("{id_dir}/"), dir.clone()));
         }
     }
-
-    mask_instance_refs(&mut work)?;
-    hoist_ref_siblings(&mut work);
 
     let retriever = UcpRetriever {
         prefixes: std::sync::Mutex::new(prefixes),
@@ -458,55 +465,60 @@ fn flatten(
             message: format!("failed to bundle schema: {e}"),
         })?;
 
-    collapse_and_strip(&mut flat, true);
+    let _ = collapse_and_strip(&mut flat, true);
     unmask_instance_refs(&mut flat);
     *schema = flat;
     Ok(())
 }
 
-/// Refuse any member named like the masking sentinel anywhere in the input.
-fn reject_sentinel_members(value: &Value) -> Result<(), ResolveError> {
-    match value {
-        Value::Object(obj) => {
-            if obj.contains_key(INSTANCE_REF_SENTINEL) {
-                return Err(ResolveError::BundleError {
-                    message: format!("reserved member name: {INSTANCE_REF_SENTINEL}"),
-                });
-            }
-            obj.values().try_for_each(reject_sentinel_members)
-        }
-        Value::Array(arr) => arr.iter().try_for_each(reject_sentinel_members),
-        _ => Ok(()),
-    }
+/// Prepare a document for the pipeline. Every document — the root and every
+/// fetched reference — passes through here exactly once, so the two
+/// protections upstream dereference lacks are structural, not per-call-site:
+/// instance-data `$ref`s are masked and `$ref` siblings are hoisted. A
+/// future document source that skips this function cannot exist without
+/// also skipping retrieval.
+fn prepare_document(doc: &mut Value) -> Result<(), ResolveError> {
+    mask_instance_refs(doc)?;
+    hoist_ref_siblings(doc);
+    Ok(())
 }
-
-/// Sentinel used to hide `$ref` keys inside instance data from upstream
-/// dereference, which walks `const`/`enum`/`default` values as if they were
-/// schemas and tries to resolve payload that merely looks like a reference.
-const INSTANCE_REF_SENTINEL: &str = "__ucp_instance_ref__";
 
 /// Rename `$ref` keys inside instance-data subtrees so no resolver touches
 /// them. Restored verbatim by [`unmask_instance_refs`] on the final output
 /// (fetched documents inline into it, so their masks unwind there too).
+///
+/// Rejects the sentinel name anywhere in the document first — schema or
+/// instance position, root or fetched — because the final unmask is a blind
+/// whole-tree rename.
 fn mask_instance_refs(schema: &mut Value) -> Result<(), ResolveError> {
-    fn rename(value: &mut Value, from: &str, to: &str) -> Result<(), ResolveError> {
+    fn reject_sentinels(value: &Value) -> Result<(), ResolveError> {
         match value {
             Value::Object(obj) => {
-                if obj.contains_key(to) {
+                if obj.contains_key(INSTANCE_REF_SENTINEL) {
                     return Err(ResolveError::BundleError {
-                        message: format!("reserved member name in instance data: {to}"),
+                        message: format!("reserved member name: {INSTANCE_REF_SENTINEL}"),
                     });
                 }
-                // Rebuild in place so member order is preserved exactly:
-                // instance data must round-trip byte-equivalent (JSON object
-                // equality is unordered, but emitted artifacts and
-                // order-sensitive comparators must see the original bytes).
-                if obj.contains_key(from) {
+                obj.values().try_for_each(reject_sentinels)
+            }
+            Value::Array(arr) => arr.iter().try_for_each(reject_sentinels),
+            _ => Ok(()),
+        }
+    }
+
+    /// Rebuild objects in place so member order is preserved exactly:
+    /// instance data must round-trip byte-equivalent (JSON object equality
+    /// is unordered, but emitted artifacts and order-sensitive comparators
+    /// must see the original bytes).
+    fn rename(value: &mut Value) {
+        match value {
+            Value::Object(obj) => {
+                if obj.contains_key("$ref") {
                     let entries: Vec<(String, Value)> = std::mem::take(obj)
                         .into_iter()
                         .map(|(k, v)| {
-                            if k == from {
-                                (to.to_string(), v)
+                            if k == "$ref" {
+                                (INSTANCE_REF_SENTINEL.to_string(), v)
                             } else {
                                 (k, v)
                             }
@@ -514,26 +526,22 @@ fn mask_instance_refs(schema: &mut Value) -> Result<(), ResolveError> {
                         .collect();
                     obj.extend(entries);
                 }
-                for v in obj.values_mut() {
-                    rename(v, from, to)?;
-                }
-                Ok(())
+                obj.values_mut().for_each(rename);
             }
-            Value::Array(arr) => arr.iter_mut().try_for_each(|v| rename(v, from, to)),
-            _ => Ok(()),
+            Value::Array(arr) => arr.iter_mut().for_each(rename),
+            _ => {}
         }
     }
-    let mut result = Ok(());
+
+    reject_sentinels(schema)?;
     for_each_schema_object_mut(schema, &mut |obj| {
         for keyword in INSTANCE_DATA_KEYWORDS {
             if let Some(v) = obj.get_mut(*keyword) {
-                if result.is_ok() {
-                    result = rename(v, "$ref", INSTANCE_REF_SENTINEL);
-                }
+                rename(v);
             }
         }
     });
-    result
+    Ok(())
 }
 
 /// Inverse of [`mask_instance_refs`], applied blindly: sentinels only exist
@@ -560,9 +568,6 @@ fn unmask_instance_refs(value: &mut Value) {
         _ => {}
     }
 }
-
-/// Keywords whose values are instance data, not subschemas.
-const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
 /// Visit `schema` and every object reachable from it, *except* subtrees under
 /// instance-data keywords (`const`, `enum`, `default`, `examples`).
@@ -599,7 +604,7 @@ pub(crate) fn for_each_schema_object_mut(
     }
 }
 
-/// Immutable twin of [`for_each_subschema_mut`].
+/// Immutable twin of [`for_each_schema_object_mut`].
 pub(crate) fn for_each_schema_object(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
     match schema {
         Value::Object(obj) => {
@@ -666,17 +671,24 @@ fn hoist_ref_siblings(value: &mut Value) {
 ///   (nothing needs their base once materialized; §8.1.1 forbids stray
 ///   `$schema`); keep them where a retained cyclic `$ref` still resolves
 ///   against that base.
-fn collapse_and_strip(schema: &mut Value, is_root: bool) {
-    let Value::Object(_) = schema else { return };
+///
+/// Returns whether any schema position at or below this node still carries a
+/// `$ref`, computed bottom-up during the same walk (`$ref`-shaped instance
+/// data does not count).
+fn collapse_and_strip(schema: &mut Value, is_root: bool) -> bool {
+    let Value::Object(_) = schema else {
+        return false;
+    };
 
     // Children first so nested one-branch allOfs collapse before parents.
     // Same default-open traversal as the walkers: recurse everywhere except
     // instance-data subtrees, whose values must survive byte-for-byte.
+    let mut has_ref = false;
     {
         let obj = schema.as_object_mut().expect("checked above");
         for (key, child) in obj.iter_mut() {
             if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
-                collapse_children(child);
+                has_ref |= collapse_children(child);
             }
         }
     }
@@ -716,19 +728,23 @@ fn collapse_and_strip(schema: &mut Value, is_root: bool) {
             obj.entry(k).or_insert(v);
         }
     }
-    if !is_root && !contains_schema_ref(schema) {
-        let obj = schema.as_object_mut().expect("checked above");
+    has_ref |= obj.contains_key("$ref");
+    if !is_root && !has_ref {
         obj.remove("$id");
         obj.remove("$schema");
     }
+    has_ref
 }
 
-/// Recurse [`collapse_and_strip`] through arrays and objects uniformly.
-fn collapse_children(value: &mut Value) {
+/// Recurse [`collapse_and_strip`] through arrays and objects uniformly,
+/// propagating the retained-`$ref` flag upward.
+fn collapse_children(value: &mut Value) -> bool {
     match value {
         Value::Object(_) => collapse_and_strip(value, false),
-        Value::Array(arr) => arr.iter_mut().for_each(collapse_children),
-        _ => {}
+        Value::Array(arr) => arr
+            .iter_mut()
+            .fold(false, |acc, v| acc | collapse_children(v)),
+        _ => false,
     }
 }
 
@@ -751,14 +767,81 @@ fn is_annotation_keyword(keyword: &str) -> bool {
     )
 }
 
-/// Whether any schema position at or below `schema` still carries a `$ref`.
-/// `$ref`-shaped instance data (inside `const`, `enum`, …) does not count.
-fn contains_schema_ref(schema: &Value) -> bool {
-    let mut found = false;
-    for_each_schema_object(schema, &mut |obj| {
-        found |= obj.contains_key("$ref");
+/// Anchor retained root-local refs in a subtree extracted from `source_doc`.
+///
+/// Bundling retains root-local refs only for recursion; when a subtree is
+/// transplanted into a foreign document (composition extraction, `--def`
+/// selection), those refs would rebase onto the new root — the same
+/// resource-identity bug bundling fixes. For each `$ref` matching
+/// `qualifies`, rewrite it to an absolute URI under the source document's
+/// `$id` (`fallback_uri` when it declares none), and embed one copy of the
+/// source document under `$defs/<embed_key>` with that `$id` intact so the
+/// rewritten refs resolve. The embedded copy keeps its own `$defs` even
+/// though the host may carry the same entries: refs inside the copy resolve
+/// against the copy's base, and pruning them would dangle those. Refs inside
+/// the copy are never rewritten — its `$id` anchors them.
+///
+/// Dormant (returns `Ok(false)`, subtree untouched) when nothing qualifies:
+/// every shipped UCP schema today. Errors when `$defs/<embed_key>` is
+/// already occupied or not an object.
+pub(crate) fn anchor_to_source(
+    subtree: &mut Value,
+    source_doc: &Value,
+    fallback_uri: &str,
+    embed_key: &str,
+    qualifies: impl Fn(&str) -> bool,
+) -> Result<bool, String> {
+    let mut needs_anchor = false;
+    for_each_schema_object(subtree, &mut |obj| {
+        if matches!(obj.get("$ref"), Some(Value::String(r)) if qualifies(r)) {
+            needs_anchor = true;
+        }
     });
-    found
+    if !needs_anchor {
+        return Ok(false);
+    }
+
+    let source_uri = source_doc
+        .get("$id")
+        .and_then(Value::as_str)
+        .unwrap_or(fallback_uri)
+        .to_string();
+
+    for_each_schema_object_mut(subtree, &mut |obj| {
+        if let Some(Value::String(r)) = obj.get("$ref") {
+            if qualifies(r) {
+                let fragment = r.strip_prefix('#').expect("qualifying refs are root-local");
+                let target = if fragment.is_empty() {
+                    source_uri.clone()
+                } else {
+                    format!("{source_uri}#{fragment}")
+                };
+                obj.insert("$ref".to_string(), Value::String(target));
+            }
+        }
+    });
+
+    let mut embedded = source_doc.clone();
+    if let Value::Object(doc) = &mut embedded {
+        doc.entry("$id")
+            .or_insert_with(|| Value::String(source_uri.clone()));
+    }
+    let Value::Object(subtree_obj) = subtree else {
+        return Ok(false);
+    };
+    let defs = subtree_obj
+        .entry("$defs")
+        .or_insert_with(|| Value::Object(Map::new()));
+    let Value::Object(defs) = defs else {
+        return Err("$defs must be an object to anchor retained refs".to_string());
+    };
+    if defs.contains_key(embed_key) {
+        return Err(format!(
+            "$defs/{embed_key} is reserved for anchoring the source document"
+        ));
+    }
+    defs.insert(embed_key.to_string(), embedded);
+    Ok(true)
 }
 
 /// Load a schema from a file path or URL.

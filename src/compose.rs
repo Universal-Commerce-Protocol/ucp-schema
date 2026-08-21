@@ -651,80 +651,28 @@ fn compose_container(
 /// Make an extracted `$defs` contribution self-contained.
 ///
 /// Extension schemas arrive here already bundled, so every acyclic ref is
-/// materialized. What can remain inside the extracted subtree are the
-/// *retained* root-local refs the bundler deliberately keeps for recursion:
-/// `#` (the extension document's root) or `#/$defs/<x>` (a recursive helper
-/// def). Transplanting those into a composed document rebases them onto the
-/// composed root — the same resource-identity bug the bundler fixes — where
-/// they dangle (`Pointer '/$defs/x' does not exist`) or silently bind to a
-/// foreign def.
-///
-/// When such refs exist, embed the whole source document once under the
-/// subtree's `$defs` (keyed by the extension's capability name) with its
-/// `$id` intact, and rewrite the retained refs to absolute URIs into that
-/// embedded resource. Refs *inside* the embedded copy stay untouched: its
-/// `$id` anchors them. Contributions without retained refs — every shipped
-/// UCP extension today — pass through byte-identical.
+/// materialized; what can remain are the retained root-local refs the
+/// bundler keeps for recursion (`#`, `#/$defs/<x>`). The extracted subtree
+/// loses its source document entirely, so *every* root-local ref qualifies
+/// for anchoring — unlike `--def` selection, which carries the source defs
+/// along. Embedded under the extension's capability name.
 fn anchor_extracted_def(
     subtree: &mut Value,
     source_doc: &Value,
     extension_name: &str,
 ) -> Result<(), ComposeError> {
-    let mut has_root_local = false;
-    crate::loader::for_each_schema_object(subtree, &mut |obj| {
-        if matches!(obj.get("$ref"), Some(Value::String(r)) if r.starts_with('#')) {
-            has_root_local = true;
-        }
-    });
-    if !has_root_local {
-        return Ok(());
-    }
-
-    let source_uri = source_doc.get("$id").and_then(Value::as_str).map_or_else(
-        || format!("urn:ucp-schema:extracted:{extension_name}"),
-        ToString::to_string,
-    );
-
-    // Rewrite retained root-local refs to absolute URIs into the source.
-    crate::loader::for_each_schema_object_mut(subtree, &mut |obj| {
-        if let Some(Value::String(r)) = obj.get("$ref") {
-            if let Some(fragment) = r.strip_prefix('#') {
-                let target = if fragment.is_empty() {
-                    source_uri.clone()
-                } else {
-                    format!("{source_uri}#{fragment}")
-                };
-                obj.insert("$ref".to_string(), Value::String(target));
-            }
-        }
-    });
-
-    // Embed the source document once, `$id` intact (inserted when synthesized).
-    let mut embedded = source_doc.clone();
-    if let Value::Object(doc) = &mut embedded {
-        doc.entry("$id")
-            .or_insert_with(|| Value::String(source_uri.clone()));
-    }
-    let Value::Object(subtree_obj) = subtree else {
-        return Ok(());
-    };
-    let defs = subtree_obj
-        .entry("$defs")
-        .or_insert_with(|| Value::Object(serde_json::Map::new()));
-    let Value::Object(defs) = defs else {
-        return Err(ComposeError::MissingDefEntry {
-            extension: extension_name.to_string(),
-            expected_key: "$defs must be an object to anchor recursion".to_string(),
-        });
-    };
-    if defs.contains_key(extension_name) {
-        return Err(ComposeError::MissingDefEntry {
-            extension: extension_name.to_string(),
-            expected_key: format!("$defs/{extension_name} already occupied; cannot embed source"),
-        });
-    }
-    defs.insert(extension_name.to_string(), embedded);
-    Ok(())
+    crate::loader::anchor_to_source(
+        subtree,
+        source_doc,
+        &format!("urn:ucp-schema:extracted:{extension_name}"),
+        extension_name,
+        |r| r.starts_with('#'),
+    )
+    .map(|_| ())
+    .map_err(|message| ComposeError::MissingDefEntry {
+        extension: extension_name.to_string(),
+        expected_key: message,
+    })
 }
 
 /// Check whether any alternative parent path reaches the root through the active set.

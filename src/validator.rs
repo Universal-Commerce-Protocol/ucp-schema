@@ -111,62 +111,29 @@ fn select_def(schema: &Value, name: &str, mode: SelectMode) -> Result<Value, Res
         "$ref".to_string(),
         Value::String(format!("#/$defs/{}", name)),
     );
-    let mut carried_defs = schema
-        .get("$defs")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Map::new()));
+    if let Some(defs) = schema.get("$defs") {
+        wrapper.insert("$defs".to_string(), defs.clone());
+    }
+    let mut selected = Value::Object(wrapper);
 
     // The wrapper replaces the source document's root, so refs that denote
-    // that root — bare `#`, or pointers into the root body like
-    // `#/properties/x` — would rebind to the wrapper (whose only content is
-    // the selecting `$ref`: a resolution cycle that silently drops the
-    // source root's constraints). `#/$defs/...` pointers keep working
-    // against the carried defs and stay untouched. When root-denoting refs
-    // exist, embed the whole source document (with its `$id`, synthesized
-    // when absent) and rewrite those refs to absolute URIs into it — the
-    // same anchoring the bundler and composer apply to retained recursion.
-    let mut needs_anchor = false;
-    crate::loader::for_each_schema_object(&carried_defs, &mut |obj| {
-        if let Some(Value::String(r)) = obj.get("$ref") {
-            if r == "#" || (r.starts_with("#/") && !r.starts_with("#/$defs/")) {
-                needs_anchor = true;
-            }
-        }
-    });
-    if needs_anchor {
-        let source_uri = schema.get("$id").and_then(Value::as_str).map_or_else(
-            || format!("urn:ucp-schema:selected:{name}"),
-            ToString::to_string,
-        );
-        crate::loader::for_each_schema_object_mut(&mut carried_defs, &mut |obj| {
-            if let Some(Value::String(r)) = obj.get("$ref") {
-                if r == "#" || (r.starts_with("#/") && !r.starts_with("#/$defs/")) {
-                    let target = format!(
-                        "{source_uri}{}",
-                        r.strip_prefix('#').expect("starts with #")
-                    );
-                    obj.insert("$ref".to_string(), Value::String(target));
-                }
-            }
-        });
-        let mut embedded = schema.clone();
-        if let Value::Object(doc) = &mut embedded {
-            doc.entry("$id")
-                .or_insert_with(|| Value::String(source_uri.clone()));
-        }
-        const SOURCE_KEY: &str = "__ucp_selected_source";
-        let defs = carried_defs
-            .as_object_mut()
-            .expect("carried defs constructed as an object");
-        if defs.contains_key(SOURCE_KEY) {
-            return Err(ResolveError::InvalidSchema {
-                message: format!("$defs/{SOURCE_KEY} is reserved for --def selection"),
-            });
-        }
-        defs.insert(SOURCE_KEY.to_string(), embedded);
-    }
-    wrapper.insert("$defs".to_string(), carried_defs);
-    Ok(Value::Object(wrapper))
+    // that root — bare `#`, an `#anchor`, or a pointer into the root body
+    // like `#/properties/x` — would rebind to the wrapper (whose only
+    // content is the selecting `$ref`: a resolution cycle that silently
+    // drops the source root's constraints). Anchor them to an embedded copy
+    // of the source document. `#/$defs/...` pointers — including the
+    // wrapper's own selecting `$ref` — keep working against the carried
+    // defs and are NOT anchored, unlike composition extraction, which loses
+    // the source defs entirely.
+    crate::loader::anchor_to_source(
+        &mut selected,
+        schema,
+        &format!("urn:ucp-schema:selected:{name}"),
+        "__ucp_selected_source",
+        |r| r.starts_with('#') && !r.starts_with("#/$defs/"),
+    )
+    .map_err(|message| ResolveError::InvalidSchema { message })?;
+    Ok(selected)
 }
 
 /// Validate a payload against an already-resolved schema.
