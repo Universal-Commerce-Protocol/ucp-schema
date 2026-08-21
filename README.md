@@ -395,7 +395,7 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
 2. **Extensions** — capabilities with `extends` add fields to the root
 3. **Merge** — extensions define their additions in `$defs[root_capability_name]`; the tool composes them via `allOf`
 
-**Graph rules:** exactly one root capability (no `extends`), all `extends` targets must exist in capabilities, all extensions must transitively reach the root.
+**Graph rules:** composition receives an already-negotiated active capability set with exactly one root (no `extends`). Each extension must have at least one path through active declared parents that transitively reaches that root; absent alternative parents are ignored.
 
 **Schema authoring for extensions:**
 
