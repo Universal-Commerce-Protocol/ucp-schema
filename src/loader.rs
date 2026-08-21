@@ -830,6 +830,17 @@ pub(crate) fn anchor_to_source(
     let Value::Object(subtree_obj) = subtree else {
         return Ok(false);
     };
+    // The embedded copy is about to claim `source_uri`. A host that claims it
+    // too puts two resources behind one URI, and the refs just rewritten bind
+    // to the host instead of the copy — silently dropping the source root's
+    // constraints. The host is a wrapper we synthesized; the copy is the real
+    // resource, so the host yields. Refs that relied on the host answering
+    // that URI still resolve, into the copy, which carries the same content.
+    // Distinct documents colliding on one `$id` is a different, genuine error
+    // and is rejected during bundling.
+    if subtree_obj.get("$id").and_then(Value::as_str) == Some(source_uri.as_str()) {
+        subtree_obj.remove("$id");
+    }
     let defs = subtree_obj
         .entry("$defs")
         .or_insert_with(|| Value::Object(Map::new()));
@@ -910,6 +921,68 @@ mod tests {
     fn load_schema_str_invalid() {
         let result = load_schema_str("not json");
         assert!(matches!(result, Err(ResolveError::InvalidJson { .. })));
+    }
+
+    // A caller may legitimately give the host the source's `$id` — ambient
+    // materialization does, so its absolute helper refs resolve when anchoring
+    // stays dormant. Once anchoring fires, the embedded copy must win that URI
+    // or the source root's constraints stop reaching the retained ref. Asserted
+    // as verdicts through a Draft 2020-12 validator, not as emitted text.
+    #[test]
+    fn anchoring_takes_the_uri_from_a_host_that_claims_it() {
+        let source = serde_json::json!({
+            "$id": "https://example.test/instrument.json",
+            "type": "object",
+            "required": ["handler_id"],
+            "properties": { "handler_id": { "type": "string" } }
+        });
+        let mut host = serde_json::json!({
+            "$id": "https://example.test/instrument.json",
+            "allOf": [{ "$ref": "#" }]
+        });
+
+        let anchored = anchor_to_source(
+            &mut host,
+            &source,
+            "urn:ucp-schema:test",
+            "__ucp_source",
+            |r| r == "#",
+        )
+        .unwrap();
+        assert!(anchored, "a bare `#` must trigger anchoring");
+        assert!(
+            host.get("$id").is_none(),
+            "the host must yield the URI to the embedded copy, got {host:#}"
+        );
+
+        let validator = jsonschema::validator_for(&host).expect("anchored host must compile");
+        assert!(
+            !validator.is_valid(&serde_json::json!({})),
+            "the source root's required[handler_id] must reach the retained ref"
+        );
+        assert!(validator.is_valid(&serde_json::json!({ "handler_id": "h1" })));
+    }
+
+    // Anchoring is dormant without a qualifying ref, so a host `$id` that no
+    // embedded copy contests is left alone.
+    #[test]
+    fn dormant_anchoring_leaves_a_host_id_untouched() {
+        let source = serde_json::json!({ "$id": "https://example.test/a.json" });
+        let mut host = serde_json::json!({
+            "$id": "https://example.test/a.json",
+            "$ref": "#/$defs/x",
+            "$defs": { "x": { "type": "string" } }
+        });
+
+        let anchored = anchor_to_source(&mut host, &source, "urn:x", "__ucp_source", |r| {
+            r.starts_with('#') && !r.starts_with("#/$defs/")
+        })
+        .unwrap();
+        assert!(
+            !anchored,
+            "nothing qualifies, so anchoring must stay dormant"
+        );
+        assert_eq!(host["$id"], "https://example.test/a.json");
     }
 
     #[test]
