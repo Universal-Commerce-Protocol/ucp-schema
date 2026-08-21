@@ -127,13 +127,14 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
 //   1. mask_instance_refs — hide `$ref`-shaped payload inside instance data
 //      (`const`/`enum`/`default`/`examples`) from upstream, which walks those
 //      positions as if they were schemas; restored byte-identically at the
-//      end (upstream issue pending);
+//      end. Removable if upstream stops traversing instance data;
 //   2. hoist_ref_siblings — Draft 2020-12 evaluates `$ref` siblings
 //      conjunctively, upstream dereference drops them; hoisting makes the
-//      conjunction structural (upstream issue pending);
+//      conjunction structural. Removable if upstream preserves siblings;
 //   3. crawl_external_refs — upstream resolves lazily-discovered refs only
 //      at registry-build time; pre-crawl the transitive document closure so
-//      every resource is present up front (upstream issue pending);
+//      every resource is present up front. Removable if upstream retrieves
+//      transitively;
 //   4. collapse_and_strip — re-merge the hoisted one-branch conjunctions
 //      unless a constraint genuinely conflicts, and shed `$id`/`$schema`
 //      from materialized copies no retained ref needs (Draft 2020-12 §8.1.1
