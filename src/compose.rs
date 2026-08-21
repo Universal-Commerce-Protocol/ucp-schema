@@ -678,6 +678,13 @@ fn anchor_extracted_def(
 /// Check whether any alternative parent path reaches the root through the active set.
 ///
 /// Parent names absent from `cap_map` are ignored, and cycles terminate via `visited`.
+///
+/// Ignoring absent parents means a misspelled parent name is indistinguishable
+/// from one that is simply not active in this composition. That is inherent,
+/// not a gap to close: UCP capability names are openly extensible, so there is
+/// no closed set to check a name against. A typo alongside a reachable parent
+/// is ignored; a typo that is the only declared parent still fails, as
+/// `OrphanExtension`.
 fn reaches_root(cap: &Capability, cap_map: &HashMap<&str, &Capability>, root_name: &str) -> bool {
     let mut visited = HashSet::new();
     let mut queue = vec![cap];

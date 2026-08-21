@@ -397,6 +397,8 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
 
 **Graph rules:** composition receives an already-negotiated active capability set with exactly one root (no `extends`). Each extension must have at least one path through active declared parents that transitively reaches that root; absent alternative parents are ignored.
 
+Because absent parents are ignored, a misspelled parent name is indistinguishable from a capability that is simply not active. Capability names are openly extensible, so there is no closed set to check a name against — this is a property of the model, not a missing validation. A typo listed alongside a parent that does reach the root is ignored; a typo that is an extension's only declared parent still fails, reported as an orphaned extension.
+
 **Schema authoring for extensions:**
 
 Extension schemas define their additions in `$defs` keyed by the root capability name:
