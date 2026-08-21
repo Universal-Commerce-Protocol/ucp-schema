@@ -21,9 +21,6 @@ pub enum ComposeError {
     #[error("multiple root capabilities found: {}", names.join(", "))]
     MultipleRootCapabilities { names: Vec<String> },
 
-    #[error("extension '{extension}' references unknown parent '{parent}'")]
-    UnknownParent { extension: String, parent: String },
-
     #[error("extension '{extension}' does not connect to root '{root}'")]
     OrphanExtension { extension: String, root: String },
 
