@@ -755,6 +755,43 @@ mod bundle {
             .stdout(predicate::str::contains(r#""$ref":"types/buyer.json""#).not());
     }
 
+    // The base URI is built with `Url::from_directory_path`, which percent-
+    // encodes. Decoding it by stripping the `file://` prefix as text inverts
+    // neither the encoding nor Windows' `file:///C:/x` drive-letter form, so
+    // external refs failed to load from any path needing either. A space is
+    // the portable stand-in: it reproduces on every platform, where the
+    // drive-letter half only reproduces on Windows.
+    #[test]
+    fn bundle_resolves_external_ref_from_a_percent_encoded_path() {
+        let dir = TempDir::new().unwrap();
+        let spaced = dir.path().join("schema dir");
+        fs::create_dir_all(spaced.join("types")).unwrap();
+        fs::write(
+            spaced.join("types/buyer.json"),
+            r#"{"type":"object","properties":{"email":{"type":"string"}}}"#,
+        )
+        .unwrap();
+        let schema = spaced.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{"type":"object","properties":{"buyer":{"$ref":"types/buyer.json"}}}"#,
+        )
+        .unwrap();
+
+        cmd()
+            .args([
+                "resolve",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--bundle",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""email""#));
+    }
+
     #[test]
     fn bundle_resolves_fragment_ref() {
         let dir = TempDir::new().unwrap();

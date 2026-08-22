@@ -203,9 +203,18 @@ impl jsonschema::Retrieve for UcpRetriever {
                 return Ok(self.load_and_learn(&path)?);
             }
         }
-        // 2. file:// URIs load directly.
-        if let Some(path) = uri.strip_prefix("file://") {
-            return Ok(self.load_and_learn(Path::new(path))?);
+        // 2. file:// URIs load directly. Parse rather than strip the scheme:
+        //    `to_file_path` is the inverse of the `Url::from_directory_path`
+        //    that built the base URI, so it undoes percent-encoding (`%20`
+        //    back to a space) and, on Windows, the slash preceding a drive
+        //    letter — `file:///C:/x` is `C:\x`, not `/C:/x`. Stripping the
+        //    scheme as text inverts neither.
+        if uri.starts_with("file://") {
+            let path = Url::parse(uri)
+                .ok()
+                .and_then(|url| url.to_file_path().ok())
+                .ok_or_else(|| format!("not a usable local file URI: {uri}"))?;
+            return Ok(self.load_and_learn(&path)?);
         }
         // 3. Learned `$id`-directory anchors: relocate the URI relative to a
         //    known (`$id` dir → disk dir) pair, walking up as needed so that
