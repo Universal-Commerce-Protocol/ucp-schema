@@ -532,9 +532,10 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
-        // Inline internal #/$defs/... refs so the extracted def is self-contained
+        // Anchor any root-local refs the bundler retained (recursion), so the
+        // extracted def stays correct outside its source document.
         let mut inlined = ext_def.clone();
-        inline_internal_refs(&mut inlined, defs);
+        anchor_extracted_def(&mut inlined, &ext_schema, &ext.name)?;
 
         ext_defs.push(inlined);
     }
@@ -647,70 +648,43 @@ fn compose_container(
     Ok(result)
 }
 
-/// Inline internal `#/$defs/...` refs from the parent schema.
+/// Make an extracted `$defs` contribution self-contained.
 ///
-/// When extracting a single definition from a schema, that definition may have
-/// internal refs to other definitions in the same schema. This function
-/// recursively inlines those refs so the extracted definition is self-contained.
-///
-/// # Arguments
-/// * `value` - The value to process (modified in place)
-/// * `defs` - The `$defs` object to resolve refs against
-fn inline_internal_refs(value: &mut Value, defs: &Value) {
-    inline_internal_refs_inner(value, defs, &mut HashSet::new());
-}
-
-fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut HashSet<String>) {
-    match value {
-        Value::Object(obj) => {
-            // Check if this object has an internal $ref
-            if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
-                // Only handle internal refs to $defs (not self-root "#" refs)
-                if let Some(def_name) = ref_val.strip_prefix("#/$defs/") {
-                    // Guard against circular refs
-                    if visited.contains(def_name) {
-                        return;
-                    }
-
-                    // Look up the definition
-                    if let Some(def) = defs.get(def_name) {
-                        visited.insert(def_name.to_string());
-
-                        // Clone and recursively inline
-                        let mut inlined = def.clone();
-                        inline_internal_refs_inner(&mut inlined, defs, visited);
-
-                        visited.remove(def_name);
-
-                        // Replace the $ref object with the inlined definition
-                        obj.remove("$ref");
-                        if let Value::Object(def_obj) = inlined {
-                            for (k, v) in def_obj {
-                                obj.entry(k).or_insert(v);
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-
-            // Recurse into all values
-            for v in obj.values_mut() {
-                inline_internal_refs_inner(v, defs, visited);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                inline_internal_refs_inner(item, defs, visited);
-            }
-        }
-        _ => {}
-    }
+/// Extension schemas arrive here already bundled, so every acyclic ref is
+/// materialized; what can remain are the retained root-local refs the
+/// bundler keeps for recursion (`#`, `#/$defs/<x>`). The extracted subtree
+/// loses its source document entirely, so *every* root-local ref qualifies
+/// for anchoring — unlike `--def` selection, which carries the source defs
+/// along. Embedded under the extension's capability name.
+fn anchor_extracted_def(
+    subtree: &mut Value,
+    source_doc: &Value,
+    extension_name: &str,
+) -> Result<(), ComposeError> {
+    crate::loader::anchor_to_source(
+        subtree,
+        source_doc,
+        &format!("urn:ucp-schema:extracted:{extension_name}"),
+        extension_name,
+        |r| r.starts_with('#'),
+    )
+    .map(|_| ())
+    .map_err(|message| ComposeError::MissingDefEntry {
+        extension: extension_name.to_string(),
+        expected_key: message,
+    })
 }
 
 /// Check whether any alternative parent path reaches the root through the active set.
 ///
 /// Parent names absent from `cap_map` are ignored, and cycles terminate via `visited`.
+///
+/// Ignoring absent parents means a misspelled parent name is indistinguishable
+/// from one that is simply not active in this composition. That is inherent,
+/// not a gap to close: UCP capability names are openly extensible, so there is
+/// no closed set to check a name against. A typo alongside a reachable parent
+/// is ignored; a typo that is the only declared parent still fails, as
+/// `OrphanExtension`.
 fn reaches_root(cap: &Capability, cap_map: &HashMap<&str, &Capability>, root_name: &str) -> bool {
     let mut visited = HashSet::new();
     let mut queue = vec![cap];

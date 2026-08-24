@@ -1,0 +1,19 @@
+version: 2
+
+# SHA-pinned actions are immutable, which also means they never receive fixes
+# unless something bumps them. Pinning without this file trades a rare, loud
+# risk (a tag is repointed at malicious code) for a certain, silent one (we run
+# the same action code forever). Dependabot rewrites a pinned SHA to a new SHA
+# rather than downgrading it back to a tag, so the pins survive the update.
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Compromised releases are usually yanked within days, so waiting out that
+    # window is what makes an automated bump safer than an immediate one.
+    cooldown:
+      default-days: 7
+    groups:
+      actions:
+        patterns: ["*"]

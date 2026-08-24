@@ -101,7 +101,7 @@ Options:
                               schema (container capabilities; see Concepts)
   --pretty                    Pretty-print JSON output
   --output <path>             Write to file instead of stdout
-  --bundle                    Inline external $ref pointers (schema input only; payloads bundle automatically)
+  --bundle                    Materialize external $refs into a self-contained schema (schema input only; payloads bundle automatically)
   --schema-local-base <dir>   Local directory for schema resolution
   --schema-remote-base <url>  URL prefix to strip when mapping to local
   --strict                    Inject additionalProperties: false (see Concepts > Strict Mode)
@@ -202,6 +202,8 @@ Options:
 | W003 | Hygiene     | Unknown operation in annotation (e.g., `{"delete": "omit"}`)   | Warning  |
 | W004 | Requires    | Version constraint has `min` > `max`                           | Warning  |
 | W005 | Requires    | Unknown key in `requires` or version constraint                | Warning  |
+| W006 | Examples    | `examples` not validated: sub-schema could not be compiled     | Warning  |
+| W007 | Annotations | Unrecognized `ucp_*` key (reserved prefix, inert)              | Warning  |
 
 ```bash
 # Lint a directory of schemas
@@ -397,6 +399,8 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
 
 **Graph rules:** composition receives an already-negotiated active capability set with exactly one root (no `extends`). Each extension must have at least one path through active declared parents that transitively reaches that root; absent alternative parents are ignored.
 
+Because absent parents are ignored, a misspelled parent name is indistinguishable from a capability that is simply not active. Capability names are openly extensible, so there is no closed set to check a name against — this is a property of the model, not a missing validation. A typo listed alongside a parent that does reach the root is ignored; a typo that is an extension's only declared parent still fails, reported as an orphaned extension.
+
 **Schema authoring for extensions:**
 
 Extension schemas define their additions in `$defs` keyed by the root capability name:
@@ -575,11 +579,19 @@ Bundling applies to **schema file input only**. When resolving payloads, composi
 
 How it works:
 
-- File refs (`"$ref": "types/buyer.json"`) are loaded and inlined
-- Fragment refs (`"$ref": "types/common.json#/$defs/address"`) navigate to the target definition
-- Internal refs in external files (`"$ref": "#/$defs/foo"`) resolve against their source file
-- Self-referential types (`"$ref": "#"`) are preserved (can't be inlined)
-- Circular references are detected and reported as errors
+- External refs — whole-file (`"$ref": "types/buyer.json"`) and fragment
+  (`"$ref": "types/common.json#/$defs/address"`) — are materialized in place
+- Recursive references (`"$ref": "#"`, self-referential types, cycles across
+  files) are legal and retained — `#` keeps meaning the file it was written in
+- Keywords beside a `$ref` combine with the referenced schema instead of
+  replacing it
+- `$ref`-shaped values inside `const`/`enum`/`default`/`examples` are data,
+  not references: preserved byte-for-byte, never fetched
+- Referenced files load from the referencing file's directory, via
+  `--schema-local-base`/`--schema-remote-base` mapping, or over HTTP
+
+The bundled schema is self-contained and validates identically to the
+multi-file original under any Draft 2020-12 validator.
 
 ### Strict Mode
 
