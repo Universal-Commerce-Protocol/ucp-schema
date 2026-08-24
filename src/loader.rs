@@ -152,7 +152,7 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
 const INSTANCE_REF_SENTINEL: &str = "__ucp_instance_ref__";
 
 /// Keywords whose values are instance data, not subschemas.
-const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
+pub(crate) const INSTANCE_DATA_KEYWORDS: &[&str] = &["const", "enum", "default", "examples"];
 
 /// Turns resolved reference URIs back into fetchable locations.
 ///

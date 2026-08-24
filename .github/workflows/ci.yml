@@ -21,6 +21,18 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # `rust-version` in Cargo.toml is a claim, not a test: every other job runs
+  # `stable`, so nothing here would notice if the real floor rose above it and
+  # the first contributor on the declared version found out instead.
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets
+
   clippy:
     name: Clippy
     runs-on: ubuntu-latest

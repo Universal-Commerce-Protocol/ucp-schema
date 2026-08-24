@@ -853,9 +853,17 @@ fn run_lint(path: &Path, format: &str, strict: bool, quiet: bool) -> Result<(), 
 
         println!();
         if result.is_ok() && (!strict || result.warnings == 0) {
+            // Warnings do not fail a non-strict run, but omitting them from
+            // the summary lets a log tail read "all passed" while warnings
+            // scroll past above it.
+            let warnings = match result.warnings {
+                0 => String::new(),
+                1 => " (1 warning)".to_string(),
+                n => format!(" ({n} warnings)"),
+            };
             println!(
-                "\x1b[32m✓ {} files checked, all passed\x1b[0m",
-                result.files_checked
+                "\x1b[32m✓ {} files checked, all passed{}\x1b[0m",
+                result.files_checked, warnings
             );
         } else {
             println!(
