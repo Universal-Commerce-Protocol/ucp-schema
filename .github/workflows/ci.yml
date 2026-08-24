@@ -6,6 +6,12 @@ on:
   pull_request:
     branches: [main, master]
 
+# Every job here only reads the repository. Declaring this once at the workflow
+# level covers all of them, because a job without its own block inherits the
+# workflow's rather than falling back to the default token.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
