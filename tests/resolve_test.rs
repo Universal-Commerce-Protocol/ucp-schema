@@ -314,6 +314,33 @@ mod transformation {
     }
 
     #[test]
+    fn instance_data_preserves_annotation_like_field_names() {
+        let schema = json!({
+            "type": "object",
+            "ucp_request": "required",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "required" }
+            },
+            "default": { "ucp_request": "business-value" },
+            "const": { "ucp_response": "business-value" },
+            "examples": [{ "ucp_request": "business-value" }],
+            "enum": [{ "ucp_response": "business-value" }]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert!(result.get("ucp_request").is_none());
+        assert!(result["properties"]["id"].get("ucp_request").is_none());
+        assert_eq!(result["default"]["ucp_request"], json!("business-value"));
+        assert_eq!(result["const"]["ucp_response"], json!("business-value"));
+        assert_eq!(
+            result["examples"][0]["ucp_request"],
+            json!("business-value")
+        );
+        assert_eq!(result["enum"][0]["ucp_response"], json!("business-value"));
+    }
+
+    #[test]
     fn annotations_stripped_from_output() {
         let schema = json!({
             "type": "object",
