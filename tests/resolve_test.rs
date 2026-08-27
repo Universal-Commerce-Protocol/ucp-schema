@@ -1602,6 +1602,59 @@ mod strict_mode {
     }
 
     #[test]
+    fn applies_to_other_child_instance_applicators() {
+        let child = json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            }
+        });
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "registry": {
+                    "type": "object",
+                    "patternProperties": {
+                        "^item:": child.clone()
+                    }
+                },
+                "tuple": {
+                    "type": "array",
+                    "prefixItems": [child.clone()]
+                },
+                "set": {
+                    "type": "array",
+                    "contains": child.clone()
+                },
+                "tail": {
+                    "type": "array",
+                    "prefixItems": [{ "type": "string" }],
+                    "unevaluatedItems": child
+                }
+            }
+        });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(
+            result["properties"]["registry"]["patternProperties"]["^item:"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            result["properties"]["tuple"]["prefixItems"][0]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            result["properties"]["set"]["contains"]["additionalProperties"],
+            json!(false)
+        );
+        assert_eq!(
+            result["properties"]["tail"]["unevaluatedItems"]["additionalProperties"],
+            json!(false)
+        );
+    }
+
+    #[test]
     fn applies_to_defs() {
         // Definitions should also be closed in strict mode
         let schema = json!({
