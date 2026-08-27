@@ -509,3 +509,117 @@ fn explicit_def_validates_fragment_end_to_end() {
         ResolveOptions::new(Direction::Request, "create").def_name(Some("checkout".to_string()));
     assert!(validate(&schema, &payload, &def_opts).is_ok());
 }
+
+/// Issue #45, library level (PR #47's territory): selecting a `$defs` entry
+/// whose subtree carries `$ref: "#"` must keep `#` meaning the SOURCE
+/// document's root. The wrapper built here replaces that root, so without
+/// anchoring, `#` resolved to the wrapper — historically a stack overflow,
+/// on jsonschema 0.49 a silent under-constraint (the source root's
+/// `required` never applied). Library callers hand select/validate an
+/// unbundled document and hit the wrapper directly; the CLI path is
+/// shielded by bundling.
+#[test]
+fn select_def_with_self_root_ref_validates_against_source_root() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.test/instrument.json",
+        "type": "object",
+        "required": ["id"],
+        "properties": { "id": { "type": "string" } },
+        "$defs": {
+            "selected": {
+                "allOf": [
+                    { "$ref": "#" },
+                    { "type": "object", "properties": { "selected": { "type": "boolean" } } }
+                ]
+            }
+        }
+    });
+    let opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("selected".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+    assert!(validator.is_valid(&json!({ "id": "i1", "selected": true })));
+    assert!(
+        !validator.is_valid(&json!({ "selected": true })),
+        "the source root's required[id] must reach the selected def"
+    );
+}
+
+/// Same anchoring, without `$id`: the wrapper synthesizes a URN so the
+/// embedded source stays addressable.
+#[test]
+fn select_def_self_root_ref_without_id_synthesizes_identity() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "required": ["kind"],
+        "properties": { "kind": { "type": "string" } },
+        "$defs": {
+            "variant": { "allOf": [ { "$ref": "#" } ] }
+        }
+    });
+    let opts =
+        ResolveOptions::new(Direction::Request, "create").def_name(Some("variant".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+    assert!(validator.is_valid(&json!({ "kind": "a" })));
+    assert!(!validator.is_valid(&json!({})));
+}
+
+/// Anchoring discriminates ref classes: in one selected def, a bare `#`
+/// (source root) is anchored while `#/$defs/other` keeps resolving against
+/// the carried defs. Both constraints must bite.
+#[test]
+fn select_def_mixed_root_and_defs_refs_both_apply() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.test/mixed.json",
+        "type": "object",
+        "required": ["kind"],
+        "properties": { "kind": { "type": "string" } },
+        "$defs": {
+            "other": {
+                "type": "object",
+                "properties": { "n": { "type": "integer", "maximum": 5 } },
+                "additionalProperties": false
+            },
+            "sel": {
+                "allOf": [
+                    { "$ref": "#" },
+                    { "type": "object", "properties": { "extra": { "$ref": "#/$defs/other" } } }
+                ]
+            }
+        }
+    });
+    let opts = ResolveOptions::new(Direction::Request, "create").def_name(Some("sel".to_string()));
+    let selected = select_operation_schema(&schema, &opts).unwrap();
+    let validator = jsonschema::validator_for(&selected).expect("selection compiles");
+
+    assert!(validator.is_valid(&json!({ "kind": "a", "extra": { "n": 3 } })));
+    assert!(
+        !validator.is_valid(&json!({ "extra": { "n": 3 } })),
+        "root required[kind] via bare #"
+    );
+    assert!(
+        !validator.is_valid(&json!({ "kind": "a", "extra": { "n": 9 } })),
+        "defs-relative maximum via #/$defs/other"
+    );
+}
+
+/// The reserved embedding key is rejected loudly, never silently shadowed.
+#[test]
+fn select_def_reserved_source_key_errors() {
+    let schema = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "$defs": {
+            "__ucp_selected_source": { "type": "object" },
+            "sel": { "allOf": [ { "$ref": "#" } ] }
+        }
+    });
+    let opts = ResolveOptions::new(Direction::Request, "create").def_name(Some("sel".to_string()));
+    let err = select_operation_schema(&schema, &opts).unwrap_err();
+    assert!(err.to_string().contains("reserved"), "got: {err}");
+}

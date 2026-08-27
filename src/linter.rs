@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::loader::{load_schema, navigate_fragment};
+use crate::loader::{load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
 use crate::types::{
     is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
     UCP_ANNOTATIONS, VALID_OPERATIONS,
@@ -196,27 +196,47 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
 /// This turns `examples` into an executable, drift-free conformance battery that
 /// lives next to the grammar it documents.
 ///
-/// Best-effort: a sub-schema whose validator cannot be compiled in isolation
-/// (e.g., unresolved external `$ref`s) is skipped here — broken refs are already
-/// reported by the `$ref` checks.
+/// A sub-schema is compiled on its own, which strips the context its `$ref`s
+/// were written in: no base URI to resolve `types/amount.json` against, and
+/// `#/$defs/x` denoting the sub-schema rather than the document. Both fail to
+/// compile, so their examples cannot be checked here. That is reported as
+/// W006 rather than passed over: the `$ref` checks confirm a reference
+/// *resolves*, which is a different question from whether the example was
+/// ever validated, and a schema whose refs are all healthy can still have
+/// every example silently unchecked.
 fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     match value {
         Value::Object(map) => {
             if let Some(Value::Array(examples)) = map.get("examples") {
-                if let Ok(validator) = jsonschema::validator_for(value) {
-                    for (i, example) in examples.iter().enumerate() {
-                        if !validator.is_valid(example) {
-                            diagnostics.push(Diagnostic {
-                                severity: Severity::Error,
-                                code: "E008".to_string(),
-                                file: file.to_path_buf(),
-                                path: format!("{}/examples/{}", path, i),
-                                message: format!(
-                                    "example does not validate against its schema: {}",
-                                    example
-                                ),
-                            });
+                match jsonschema::validator_for(value) {
+                    Ok(validator) => {
+                        for (i, example) in examples.iter().enumerate() {
+                            if !validator.is_valid(example) {
+                                diagnostics.push(Diagnostic {
+                                    severity: Severity::Error,
+                                    code: "E008".to_string(),
+                                    file: file.to_path_buf(),
+                                    path: format!("{}/examples/{}", path, i),
+                                    message: format!(
+                                        "example does not validate against its schema: {}",
+                                        example
+                                    ),
+                                });
+                            }
                         }
+                    }
+                    Err(e) => {
+                        diagnostics.push(Diagnostic {
+                            severity: Severity::Warning,
+                            code: "W006".to_string(),
+                            file: file.to_path_buf(),
+                            path: format!("{}/examples", path),
+                            message: format!(
+                                "{} example(s) not validated: schema could not be compiled on its own ({})",
+                                examples.len(),
+                                e
+                            ),
+                        });
                     }
                 }
             }
@@ -345,8 +365,35 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
             }
         }
 
-        // Recurse
+        // The `ucp_` prefix is reserved for UCP annotations in every key
+        // position, so membership of that small set is the whole rule — no
+        // need to work out whether this object is a schema, a definition map
+        // or an extension carrier. An unrecognized `ucp_` key is inert, and
+        // inert is indistinguishable from working by inspection, whether it
+        // is a misspelled annotation or a definition squatting the prefix.
+        for key in map.keys() {
+            if key.starts_with("ucp_") && !UCP_ANNOTATIONS.contains(&key.as_str()) {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    code: "W007".to_string(),
+                    file: file.to_path_buf(),
+                    path: format!("{}/{}", path, key),
+                    message: format!(
+                        "{} is not a UCP annotation and has no effect; the ucp_ prefix is reserved (known: {})",
+                        key,
+                        UCP_ANNOTATIONS.join(", ")
+                    ),
+                });
+            }
+        }
+
+        // Recurse, but never into instance data: a `ucp_*` key inside a
+        // `const`/`enum`/`default`/`examples` value is payload the schema
+        // matches against, not an annotation to validate.
         for (key, val) in map {
+            if INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                continue;
+            }
             let child_path = format!("{}/{}", path, key);
             check_annotations(val, file, &child_path, diagnostics);
         }
@@ -790,6 +837,184 @@ mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::{tempdir, NamedTempFile};
+
+    // A sub-schema is compiled on its own, so a `$ref` to a sibling file or a
+    // document-level `#/$defs/...` cannot resolve and its examples go
+    // unchecked. Silence there reports a clean file while validating nothing,
+    // so the gap is surfaced as W006. The nested cases are the ones that bite:
+    // examples at the document root compile fine and are genuinely checked.
+    // `ucp_` is the spec's prefix, not an extension point, so an
+    // unrecognized one is inert — and inert reads exactly like working.
+    // Position matters: a definition or property may legitimately be named
+    // `ucp_agent`, and a `ucp_*` key inside instance data is payload.
+    #[test]
+    fn unrecognized_ucp_annotations_are_reported() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/unknown.json",
+                "ucp_shared_request": true,
+                "properties": {{ "a": {{ "type": "string" }} }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let hit = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "W007")
+            .unwrap_or_else(|| panic!("expected W007, got {:?}", result.diagnostics));
+        assert_eq!(hit.severity, Severity::Warning);
+        assert!(hit.message.contains("ucp_shared_request"));
+    }
+
+    // The prefix is reserved in every key position, so a definition or
+    // property squatting it is reported too \u2014 `$defs/ucp_agent` exists in the
+    // transports schema today. Deciding that from position instead would mean
+    // enumerating name-keyed carriers, and those are open-ended
+    // (`capabilities`, `methods`, `services`, `payment_handlers`, ...).
+    #[test]
+    fn the_ucp_prefix_is_reserved_in_every_key_position() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/reserved.json",
+                "type": "object",
+                "$defs": {{ "ucp_agent": {{ "type": "object" }} }},
+                "methods": {{ "ucp_custom": {{ "title": "a method" }} }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let hits: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W007")
+            .collect();
+        assert_eq!(hits.len(), 2, "expected both, got {:?}", result.diagnostics);
+        assert!(hits.iter().all(|d| d.severity == Severity::Warning));
+    }
+
+    // Instance data is the exception, and not because of where it sits: a
+    // `ucp_*` key inside `const`/`enum`/`default`/`examples` is a value the
+    // schema matches against, not a key in the schema at all. Reported as
+    // E005 before this traversal skipped it.
+    #[test]
+    fn ucp_keys_inside_instance_data_are_payload() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/payload.json",
+                "type": "object",
+                "properties": {{
+                    "template": {{ "const": {{ "ucp_request": 12345 }} }},
+                    "choice": {{ "enum": [{{ "ucp_whatever": true }}] }}
+                }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(
+            result.diagnostics.is_empty(),
+            "instance data is not schema keys: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn examples_behind_an_external_ref_are_reported_not_skipped() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("amount.json"),
+            r#"{"$id": "https://example.test/amount.json", "type": "integer"}"#,
+        )
+        .unwrap();
+        let main = dir.path().join("main.json");
+        std::fs::write(
+            &main,
+            r#"{
+                "$id": "https://example.test/main.json",
+                "properties": {
+                    "price": {
+                        "allOf": [{ "$ref": "amount.json" }],
+                        "examples": ["not-an-integer"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = lint_file(&main, dir.path());
+        assert_eq!(
+            result.status,
+            FileStatus::Warning,
+            "unvalidated examples must not report a clean file: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "W006"),
+            "expected W006, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn examples_behind_a_nested_internal_ref_are_reported_not_skipped() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r##"{{
+                "$id": "https://example.test/internal.json",
+                "$defs": {{ "code": {{ "type": "string", "pattern": "^[A-Z]+$" }} }},
+                "properties": {{
+                    "kind": {{
+                        "allOf": [{{ "$ref": "#/$defs/code" }}],
+                        "examples": ["lowercase"]
+                    }}
+                }}
+            }}"##
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "W006"),
+            "expected W006, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    // Self-contained sub-schemas still compile, so their examples are checked
+    // as errors rather than excused as warnings.
+    #[test]
+    fn self_contained_examples_are_still_validated() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/plain.json",
+                "properties": {{
+                    "amount": {{ "type": "integer", "examples": ["not-an-integer"] }}
+                }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E008"));
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "W006"),
+            "a compilable schema must not warn: {:?}",
+            result.diagnostics
+        );
+    }
 
     #[test]
     fn lint_valid_schema() {

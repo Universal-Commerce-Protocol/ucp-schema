@@ -6,7 +6,7 @@ license = "Apache-2.0"
 description = "Runtime resolution of UCP schema annotations"
 keywords = ["ucp", "json-schema", "validation"]
 categories = ["development-tools", "web-programming"]
-rust-version = "1.70"
+rust-version = "1.85"
 readme = "README.md"
 repository = "https://github.com/Universal-Commerce-Protocol/ucp-schema"
 
@@ -22,7 +22,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive"] }
-jsonschema = "0.26"
+jsonschema = "0.49"
 url = "2"
 
 [dependencies.reqwest]

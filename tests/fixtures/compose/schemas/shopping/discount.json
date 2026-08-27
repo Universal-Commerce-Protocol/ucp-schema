@@ -4,7 +4,7 @@
   "name": "dev.ucp.shopping.discount",
   "version": "2026-01-11",
   "title": "Discount Extension",
-  "description": "Extends Checkout with discount code support.",
+  "description": "Extends Cart and Checkout with discount code support.",
   "$defs": {
     "dev.ucp.shopping.checkout": {
       "title": "Checkout with Discount",
@@ -43,6 +43,18 @@
             "update": "optional"
           }
         }
+      }
+    },
+    "dev.ucp.shopping.cart": {
+      "title": "Cart with Discount",
+      "description": "Cart extended with discount capability.",
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "id": { "type": "string" },
+        "items": { "type": "array" },
+        "ucp": { "type": "object", "additionalProperties": true },
+        "discounts": { "type": "object" }
       }
     }
   }

@@ -755,6 +755,43 @@ mod bundle {
             .stdout(predicate::str::contains(r#""$ref":"types/buyer.json""#).not());
     }
 
+    // The base URI is built with `Url::from_directory_path`, which percent-
+    // encodes. Decoding it by stripping the `file://` prefix as text inverts
+    // neither the encoding nor Windows' `file:///C:/x` drive-letter form, so
+    // external refs failed to load from any path needing either. A space is
+    // the portable stand-in: it reproduces on every platform, where the
+    // drive-letter half only reproduces on Windows.
+    #[test]
+    fn bundle_resolves_external_ref_from_a_percent_encoded_path() {
+        let dir = TempDir::new().unwrap();
+        let spaced = dir.path().join("schema dir");
+        fs::create_dir_all(spaced.join("types")).unwrap();
+        fs::write(
+            spaced.join("types/buyer.json"),
+            r#"{"type":"object","properties":{"email":{"type":"string"}}}"#,
+        )
+        .unwrap();
+        let schema = spaced.join("schema.json");
+        fs::write(
+            &schema,
+            r#"{"type":"object","properties":{"buyer":{"$ref":"types/buyer.json"}}}"#,
+        )
+        .unwrap();
+
+        cmd()
+            .args([
+                "resolve",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+                "--bundle",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(r#""email""#));
+    }
+
     #[test]
     fn bundle_resolves_fragment_ref() {
         let dir = TempDir::new().unwrap();
@@ -942,36 +979,35 @@ mod bundle {
         let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
         let bundled: serde_json::Value = serde_json::from_str(&stdout).unwrap();
 
-        // The internal #/$defs/ ref should be inlined
-        let all_of = &bundled["properties"]["search_filters"]["allOf"];
-        let first_entry = &all_of[0];
-
-        // $ref should be removed (inlined)
+        // The internal #/$defs/ ref is inlined and the single-branch allOf
+        // wrapper is collapsed (a one-branch allOf is the same conjunction).
+        let filters = &bundled["properties"]["search_filters"];
         assert!(
-            first_entry.get("$ref").is_none(),
-            "Internal #/$defs/ ref should be inlined, but $ref still present: {first_entry}"
+            filters.get("$ref").is_none() && filters.get("allOf").is_none(),
+            "Internal #/$defs/ ref should be inlined flat, got: {filters}"
         );
-        // The inlined content should have the 'available' property
         assert!(
-            first_entry["properties"]["available"]["type"].as_str() == Some("boolean"),
-            "Inlined def should contain 'available: boolean', got: {first_entry}"
+            filters["properties"]["available"]["type"].as_str() == Some("boolean"),
+            "Inlined def should contain 'available: boolean', got: {filters}"
         );
     }
 
     #[test]
-    fn bundle_detects_circular_refs() {
+    fn bundle_retains_cross_file_recursion_as_refs() {
         let dir = TempDir::new().unwrap();
 
-        // Create circular reference: a.json -> b.json -> a.json
+        // Mutual recursion across files: legal JSON Schema (e.g. trees, graphs).
+        // The bundler must retain the cycle as a `$ref` with resource identity
+        // intact instead of erroring, and the result must validate correctly.
         fs::create_dir_all(dir.path().join("types")).unwrap();
         fs::write(
             dir.path().join("types/a.json"),
-            r#"{"type":"object","properties":{"b":{"$ref":"b.json"}}}"#,
+            r#"{"$id":"https://example.test/types/a.json","type":"object","properties":{"b":{"$ref":"b.json"}},"additionalProperties":false}"#,
         )
         .unwrap();
         fs::write(
             dir.path().join("types/b.json"),
-            r#"{"type":"object","properties":{"a":{"$ref":"a.json"}}}"#,
+            r#"{"$id":"https://example.test/types/b.json","type":"object","properties":{"a":{"$ref":"a.json"}},"additionalProperties":false}"#,
         )
         .unwrap();
 
@@ -981,12 +1017,12 @@ mod bundle {
             r#"{
                 "type": "object",
                 "properties": {
-                    "start": { "$ref": "types/a.json" }
+                    "root": { "$ref": "types/a.json" }
                 }
             }"#,
         );
 
-        cmd()
+        let output = cmd()
             .args([
                 "resolve",
                 schema.to_str().unwrap(),
@@ -996,8 +1032,18 @@ mod bundle {
                 "--bundle",
             ])
             .assert()
-            .failure()
-            .stderr(predicate::str::contains("circular"));
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let loaded: serde_json::Value = serde_json::from_slice(&output).unwrap();
+
+        // Bundled output must be self-contained and compilable...
+        let validator = jsonschema::validator_for(&loaded).unwrap();
+        // ...accept valid recursion...
+        assert!(validator.is_valid(&serde_json::json!({"root": {"b": {"a": {"b": {}}}}})));
+        // ...and reject a violation deep inside the cycle.
+        assert!(!validator.is_valid(&serde_json::json!({"root": {"b": {"a": {"unknown": 1}}}})));
     }
 
     #[test]
@@ -1355,9 +1401,9 @@ mod compose {
     }
 
     #[test]
-    fn unknown_parent_error() {
+    fn orphan_extension_error() {
         let dir = TempDir::new().unwrap();
-        // Extension references parent not in capabilities (but has a root)
+        // Extension has no active path to the declared root.
         let payload = write_temp_file(
             &dir,
             "payload.json",
@@ -1390,7 +1436,9 @@ mod compose {
             ])
             .assert()
             .code(2)
-            .stderr(predicate::str::contains("unknown parent"));
+            .stderr(predicate::str::contains(
+                "extension 'dev.ucp.shopping.discount' does not connect to root 'dev.ucp.shopping.checkout'",
+            ));
     }
 
     #[test]
@@ -1489,6 +1537,48 @@ mod compose_command {
             stdout.contains("ucp_response") || stdout.contains("ucp_request"),
             "compose should preserve UCP annotations"
         );
+    }
+
+    #[test]
+    fn compose_multi_parent_selects_checkout_def_with_absent_cart() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_discount_checkout_multi_parent.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let all_of = schema["allOf"].as_array().unwrap();
+
+        assert_eq!(all_of.len(), 1);
+        assert_eq!(all_of[0]["title"], "Checkout with Discount");
+        assert!(all_of[0]["properties"]["line_items"].is_object());
+    }
+
+    #[test]
+    fn compose_multi_parent_selects_cart_def_with_absent_checkout() {
+        let assert = cmd()
+            .args([
+                "compose",
+                "tests/fixtures/compose/response_discount_cart_multi_parent.json",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ])
+            .assert()
+            .success();
+
+        let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+        let schema: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+        let all_of = schema["allOf"].as_array().unwrap();
+
+        assert_eq!(all_of.len(), 1);
+        assert_eq!(all_of[0]["title"], "Cart with Discount");
+        assert!(all_of[0]["properties"]["items"].is_object());
     }
 
     #[test]

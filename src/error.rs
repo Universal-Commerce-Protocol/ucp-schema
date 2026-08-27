@@ -5,6 +5,7 @@ use thiserror::Error;
 
 /// Errors during schema composition from UCP capability metadata.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ComposeError {
     #[error("payload is not self-describing: missing ucp.capabilities (response) or meta.profile (request)")]
     NotSelfDescribing,
@@ -20,9 +21,6 @@ pub enum ComposeError {
 
     #[error("multiple root capabilities found: {}", names.join(", "))]
     MultipleRootCapabilities { names: Vec<String> },
-
-    #[error("extension '{extension}' references unknown parent '{parent}'")]
-    UnknownParent { extension: String, parent: String },
 
     #[error("extension '{extension}' does not connect to root '{root}'")]
     OrphanExtension { extension: String, root: String },
@@ -82,6 +80,7 @@ impl ComposeError {
 
 /// Errors during schema resolution.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ResolveError {
     // IO errors (exit code 3)
     #[error("file not found: {path}")]
@@ -169,6 +168,7 @@ pub enum ResolveError {
 
 /// Errors during validation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ValidateError {
     #[error(transparent)]
     Resolve(#[from] ResolveError),

@@ -114,7 +114,26 @@ fn select_def(schema: &Value, name: &str, mode: SelectMode) -> Result<Value, Res
     if let Some(defs) = schema.get("$defs") {
         wrapper.insert("$defs".to_string(), defs.clone());
     }
-    Ok(Value::Object(wrapper))
+    let mut selected = Value::Object(wrapper);
+
+    // The wrapper replaces the source document's root, so refs that denote
+    // that root — bare `#`, an `#anchor`, or a pointer into the root body
+    // like `#/properties/x` — would rebind to the wrapper (whose only
+    // content is the selecting `$ref`: a resolution cycle that silently
+    // drops the source root's constraints). Anchor them to an embedded copy
+    // of the source document. `#/$defs/...` pointers — including the
+    // wrapper's own selecting `$ref` — keep working against the carried
+    // defs and are NOT anchored, unlike composition extraction, which loses
+    // the source defs entirely.
+    crate::loader::anchor_to_source(
+        &mut selected,
+        schema,
+        &format!("urn:ucp-schema:selected:{name}"),
+        "__ucp_selected_source",
+        |r| r.starts_with('#') && !r.starts_with("#/$defs/"),
+    )
+    .map_err(|message| ResolveError::InvalidSchema { message })?;
+    Ok(selected)
 }
 
 /// Validate a payload against an already-resolved schema.
@@ -131,7 +150,7 @@ pub fn validate_against_schema(schema: &Value, payload: &Value) -> Result<(), Va
     let errors: Vec<SchemaError> = validator
         .iter_errors(payload)
         .map(|e| SchemaError {
-            path: e.instance_path.to_string(),
+            path: e.instance_path().to_string(),
             message: e.to_string(),
         })
         .collect();
