@@ -104,7 +104,7 @@ Options:
   --bundle                    Materialize external $refs into a self-contained schema (schema input only; payloads bundle automatically)
   --schema-local-base <dir>   Local directory for schema resolution
   --schema-remote-base <url>  URL prefix to strip when mapping to local
-  --strict                    Inject additionalProperties: false (see Concepts > Strict Mode)
+  --strict <true|false>       Inject additionalProperties: false (see Concepts > Strict Mode)
   --verbose, -v               Print pipeline stages to stderr
 ```
 
@@ -146,7 +146,7 @@ Options:
                                {op}_{direction} (see Concepts > Container Capabilities)
   --schema-local-base <dir>    Local directory to resolve schema URLs
   --schema-remote-base <url>   URL prefix to strip when mapping to local
-  --strict                     Reject unknown fields (see Concepts > Strict Mode)
+  --strict <true|false>        Reject unknown fields (see Concepts > Strict Mode)
   --json                       Machine-readable JSON output
   --verbose, -v                Print pipeline stages to stderr
 ```
@@ -598,8 +598,8 @@ multi-file original under any Draft 2020-12 validator.
 By default, validation allows unknown fields — payloads may contain fields from capabilities the validator hasn't seen, and forward compatibility requires tolerating them. For closed systems or catching typos, `--strict` injects `additionalProperties: false` into all object schemas:
 
 ```bash
-ucp-schema validate order.json --schema schema.json --request --op create --strict
-ucp-schema resolve schema.json --request --op create --strict --pretty
+ucp-schema validate order.json --schema schema.json --request --op create --strict true
+ucp-schema resolve schema.json --request --op create --strict true --pretty
 ```
 
 **Warning:** Strict mode conflicts with `allOf` composition. Each `allOf` branch validates independently and rejects properties from other branches. Use default (non-strict) mode for composed schemas.
