@@ -1,5 +1,17 @@
 # Changelog
 
+## [2.0.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.1...v2.0.0) (2026-08-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* ComposeError::UnknownParent is removed. Match arms naming it must be deleted; the equivalent condition now surfaces as ComposeError::OrphanExtension.
+
+### Bug Fixes
+
+* compose extensions when any parent is active ([#39](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/39)) ([613ee80](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/613ee804c4bad1efa0d98cd60b582a9c8a4599e6))
+* preserve schema resource identity in bundling, composition, and selection ([#66](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/66)) ([9f91c3d](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/9f91c3d497d8f9d7f4051fbfb49b2262536acfd7))
+
 ## [1.4.1](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.0...v1.4.1) (2026-07-24)
 
 
