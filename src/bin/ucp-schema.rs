@@ -8,10 +8,11 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
-    detect_direction, extract_capabilities, extract_capabilities_from_profile,
+    detect_direction, export_openapi, extract_capabilities, extract_capabilities_from_profile,
     extract_jsonrpc_payload, is_url, lint, load_schema, load_schema_auto, resolve,
-    select_operation_schema, validate, ComposeError, DetectedDirection, Direction, FileStatus,
-    ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
+    select_operation_schema, validate, ComposeError, DetectedDirection, Direction,
+    ExportOpenApiOptions, FileStatus, ResolveError, ResolveOptions, SchemaBaseConfig,
+    ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
@@ -237,6 +238,50 @@ enum Commands {
         #[arg(long, short)]
         quiet: bool,
     },
+
+    /// Export OpenAPI 3.1 specification from UCP schemas
+    #[command(alias = "generate-openapi")]
+    ExportOpenapi {
+        /// Directory containing UCP JSON schema files
+        #[arg(long, short = 's', default_value = "./schemas")]
+        schema_dir: PathBuf,
+
+        /// Output file path (emits JSON to stdout if omitted)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// API version string injected into info.version
+        #[arg(long, default_value = "2026-09-01")]
+        api_version: String,
+
+        /// API title injected into info.title
+        #[arg(long, default_value = "UCP API")]
+        title: String,
+
+        /// API description injected into info.description
+        #[arg(long)]
+        description: Option<String>,
+
+        /// Pretty-print JSON output (defaults to true; use --pretty=false for compact)
+        #[arg(long, default_value_t = true, num_args = 0..=1, default_missing_value = "true", action = clap::ArgAction::Set)]
+        pretty: bool,
+
+        /// CI check mode: exits with code 1 if generated output differs from target file
+        #[arg(long, requires = "output")]
+        check: bool,
+
+        /// Target domain profile (e.g. shopping)
+        #[arg(long, short = 'p')]
+        profile: Option<String>,
+
+        /// Strict mode: set additionalProperties=false
+        #[arg(long)]
+        strict: bool,
+
+        /// Print pipeline stages to stderr for debugging
+        #[arg(long, short)]
+        verbose: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -323,6 +368,30 @@ fn main() -> ExitCode {
             strict,
             quiet,
         } => run_lint(&path, &format, strict, quiet),
+
+        Commands::ExportOpenapi {
+            schema_dir,
+            output,
+            api_version,
+            title,
+            description,
+            pretty,
+            check,
+            profile,
+            strict,
+            verbose,
+        } => run_export_openapi(
+            schema_dir,
+            output,
+            api_version,
+            title,
+            description,
+            pretty,
+            check,
+            profile,
+            strict,
+            verbose,
+        ),
     };
 
     match result {
@@ -878,4 +947,107 @@ fn run_lint(path: &Path, format: &str, strict: bool, quiet: bool) -> Result<(), 
     } else {
         Err(1)
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_export_openapi(
+    schema_dir: PathBuf,
+    output: Option<PathBuf>,
+    api_version: String,
+    title: String,
+    description: Option<String>,
+    pretty: bool,
+    check: bool,
+    profile: Option<String>,
+    strict: bool,
+    verbose: bool,
+) -> Result<(), u8> {
+    if verbose {
+        eprintln!(
+            "[export-openapi] scanning schemas in {}",
+            schema_dir.display()
+        );
+    }
+
+    let options = ExportOpenApiOptions {
+        schema_dir,
+        title,
+        api_version,
+        description,
+        profile,
+        strict,
+    };
+
+    let doc = export_openapi(&options).map_err(|e| {
+        eprintln!("Error exporting OpenAPI specification: {}", e);
+        e.exit_code() as u8
+    })?;
+
+    let json = if pretty {
+        serde_json::to_string_pretty(&doc)
+    } else {
+        serde_json::to_string(&doc)
+    }
+    .map_err(|e| {
+        eprintln!("Error serializing OpenAPI document: {}", e);
+        2u8
+    })?;
+
+    if check {
+        let output_path = output.ok_or_else(|| {
+            eprintln!("Error: --check requires --output <path>");
+            2u8
+        })?;
+        if !output_path.exists() {
+            eprintln!(
+                "Check failed: target file {} does not exist",
+                output_path.display()
+            );
+            return Err(1);
+        }
+        let existing = std::fs::read_to_string(&output_path).map_err(|e| {
+            eprintln!("Error reading {}: {}", output_path.display(), e);
+            3u8
+        })?;
+        if existing.trim() != json.trim() {
+            eprintln!(
+                "Check failed: generated OpenAPI specification differs from {}",
+                output_path.display()
+            );
+            return Err(1);
+        }
+        if verbose {
+            eprintln!(
+                "[check] OpenAPI spec is up-to-date with {}",
+                output_path.display()
+            );
+        }
+        return Ok(());
+    }
+
+    match output {
+        Some(path) => {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).map_err(|e| {
+                    eprintln!("Error creating directory {}: {}", parent.display(), e);
+                    3u8
+                })?;
+            }
+            std::fs::write(&path, &json).map_err(|e| {
+                eprintln!("Error writing to {}: {}", path.display(), e);
+                3u8
+            })?;
+            if verbose {
+                eprintln!(
+                    "[export-openapi] exported specification to {}",
+                    path.display()
+                );
+            }
+        }
+        None => {
+            println!("{}", json);
+        }
+    }
+
+    Ok(())
 }
