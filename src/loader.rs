@@ -817,10 +817,20 @@ pub(crate) fn anchor_to_source(
         .unwrap_or(fallback_uri)
         .to_string();
 
+    let mut ref_error = None;
     for_each_schema_object_mut(subtree, &mut |obj| {
+        if ref_error.is_some() {
+            return;
+        }
         if let Some(Value::String(r)) = obj.get("$ref") {
             if qualifies(r) {
-                let fragment = r.strip_prefix('#').expect("qualifying refs are root-local");
+                let fragment = match r.strip_prefix('#') {
+                    Some(f) => f,
+                    None => {
+                        ref_error = Some(format!("qualifying ref does not start with '#': {r}"));
+                        return;
+                    }
+                };
                 let target = if fragment.is_empty() {
                     source_uri.clone()
                 } else {
@@ -830,6 +840,9 @@ pub(crate) fn anchor_to_source(
             }
         }
     });
+    if let Some(err) = ref_error {
+        return Err(err);
+    }
 
     let mut embedded = source_doc.clone();
     if let Value::Object(doc) = &mut embedded {
@@ -887,6 +900,44 @@ pub fn load_schema_auto(source: &str) -> Result<Value, ResolveError> {
         }
     } else {
         load_schema(Path::new(source))
+    }
+}
+
+/// Recursively collect all `.json` schema files under a path (file or directory).
+///
+/// If `path` is a file, returns it if it has a `.json` extension (excluding `.openapi.json`).
+/// If `path` is a directory, recursively finds all `.json` schema files (excluding `.openapi.json`).
+/// Results are sorted deterministically.
+pub fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name.ends_with(".json") && !name.ends_with(".openapi.json") {
+            return vec![path.to_path_buf()];
+        }
+        return vec![];
+    }
+
+    let mut files = Vec::new();
+    collect_files_recursive(path, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, files);
+        } else {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if name.ends_with(".json") && !name.ends_with(".openapi.json") {
+                files.push(path);
+            }
+        }
     }
 }
 
@@ -1078,6 +1129,24 @@ mod tests {
             let result = load_schema_auto(&format!("{}/schema.json", server.url()));
             assert_eq!(result.unwrap()["type"], "string");
             mock.assert();
+        }
+
+        #[test]
+        fn test_collect_schema_files() {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let sub = temp_dir.path().join("sub");
+            std::fs::create_dir_all(&sub).unwrap();
+
+            std::fs::write(temp_dir.path().join("a.json"), "{}").unwrap();
+            std::fs::write(temp_dir.path().join("ignore.txt"), "text").unwrap();
+            std::fs::write(temp_dir.path().join("test.openapi.json"), "{}").unwrap();
+            std::fs::write(sub.join("b.json"), "{}").unwrap();
+
+            let collected = collect_schema_files(temp_dir.path());
+            assert_eq!(collected.len(), 2);
+            assert!(collected.iter().any(|p| p.ends_with("a.json")));
+            assert!(collected.iter().any(|p| p.ends_with("b.json")));
+            assert!(!collected.iter().any(|p| p.ends_with("test.openapi.json")));
         }
     }
 }

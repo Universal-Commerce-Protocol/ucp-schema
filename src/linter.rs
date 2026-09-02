@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::loader::{load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
+use crate::loader::{collect_schema_files, load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
 use crate::types::{
     is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
     UCP_ANNOTATIONS, VALID_OPERATIONS,
@@ -798,36 +798,6 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
                     ),
                 });
             }
-        }
-    }
-}
-
-/// Collect all .json files in a path (file or directory).
-fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            return vec![path.to_path_buf()];
-        }
-        return vec![];
-    }
-
-    let mut files = Vec::new();
-    collect_files_recursive(path, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, files);
-        } else if path.extension().map(|e| e == "json").unwrap_or(false) {
-            files.push(path);
         }
     }
 }
