@@ -429,7 +429,9 @@ pub fn hoist_inline_conditional_variants(schemas: &mut BTreeMap<String, Value>) 
 
         let parent_props = parent_obj.get("properties").and_then(|p| p.as_object());
         let parent_is_abstract = match parent_props {
-            Some(pp) => pp.keys().all(|k| k == "type" || k == "kty" || k == "kind" || k == "id"),
+            Some(pp) => pp
+                .keys()
+                .all(|k| k == "type" || k == "kty" || k == "kind" || k == "id"),
             None => true,
         };
 
