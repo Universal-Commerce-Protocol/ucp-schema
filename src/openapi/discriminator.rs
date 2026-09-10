@@ -189,6 +189,8 @@ pub fn transform_object_conditionals(schema_obj: &mut Map<String, Value>) -> boo
     // Update allOf: keep remaining or remove if empty
     if remaining_all_of.is_empty() {
         schema_obj.remove("allOf");
+        schema_obj.remove("properties");
+        schema_obj.remove("required");
     } else {
         schema_obj.insert("allOf".to_string(), Value::Array(remaining_all_of));
     }
@@ -425,6 +427,39 @@ pub fn hoist_inline_conditional_variants(schemas: &mut BTreeMap<String, Value>) 
             None => continue,
         };
 
+        let parent_props = parent_obj.get("properties").and_then(|p| p.as_object());
+        let parent_is_abstract = match parent_props {
+            Some(pp) => pp.keys().all(|k| k == "type" || k == "kty" || k == "kind" || k == "id"),
+            None => true,
+        };
+
+        // Count how many branches introduce new specialized properties
+        let variant_branches_count = all_of_arr
+            .iter()
+            .filter(|b| {
+                if let Some(b_obj) = b.as_object() {
+                    if let Some(then_obj) = b_obj.get("then").and_then(|v| v.as_object()) {
+                        if then_obj.contains_key("$ref") {
+                            return true;
+                        }
+                        if let Some(then_props) =
+                            then_obj.get("properties").and_then(|p| p.as_object())
+                        {
+                            return match parent_props {
+                                Some(pp) => then_props.keys().any(|k| !pp.contains_key(k)),
+                                None => !then_props.is_empty(),
+                            };
+                        }
+                    }
+                }
+                false
+            })
+            .count();
+
+        if !parent_is_abstract && variant_branches_count < 2 {
+            continue;
+        }
+
         let mut modified = false;
 
         for branch in all_of_arr.iter_mut() {
@@ -527,6 +562,17 @@ pub fn hoist_inline_conditional_variants(schemas: &mut BTreeMap<String, Value>) 
                                             "default": const_val
                                         });
                                         props_entry.insert(prop_name.clone(), fixed_disc);
+                                    }
+
+                                    // Ensure discriminator property is marked required in the variant
+                                    let req_entry = variant_obj
+                                        .entry("required".to_string())
+                                        .or_insert_with(|| Value::Array(Vec::new()))
+                                        .as_array_mut()
+                                        .unwrap();
+                                    let prop_val_json = Value::String(prop_name.clone());
+                                    if !req_entry.contains(&prop_val_json) {
+                                        req_entry.push(prop_val_json);
                                     }
                                 }
 
