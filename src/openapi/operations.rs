@@ -314,6 +314,13 @@ pub fn project_resource_operations(
             "/.well-known/ucp".to_string(),
             "/.well-known/ucp".to_string(),
         )
+    } else if resource_name == "Checkout" {
+        // TODO: Temporary fallback for un-annotated schemas. Remove once Universal-Commerce-Protocol/ucp
+        // declares x-ucp-path: /checkout-sessions on checkout.json. See ucp#817.
+        (
+            "/checkout-sessions".to_string(),
+            "/checkout-sessions/{id}".to_string(),
+        )
     } else {
         let plural = pluralize_path_segment(resource_name);
         (format!("/{}", plural), format!("/{}/{{id}}", plural))
@@ -495,6 +502,10 @@ fn project_lifecycle_actions(
 
     let has_cancel = if let Some(actions) = explicit_lifecycle {
         actions.iter().any(|a| a.as_str() == Some("cancel"))
+    } else if resource_name == "Checkout" || resource_name == "Cart" {
+        // TODO: Temporary fallback for un-annotated schemas. Remove once Universal-Commerce-Protocol/ucp
+        // declares x-ucp-lifecycle: ["cancel"] on cart.json and checkout.json. See ucp#817.
+        true
     } else {
         available_schemas.contains_key(&cancel_schema_name)
     };
