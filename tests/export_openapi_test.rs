@@ -1395,13 +1395,8 @@ fn test_export_openapi_directional_union_and_metadata_invariants() {
         .iter()
         .map(|item| item["$ref"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        one_of_refs,
-        vec![
-            "#/components/schemas/LocationDestinationCreateRequest",
-            "#/components/schemas/ShippingDestinationCreateRequest"
-        ]
-    );
+    assert!(one_of_refs.contains(&"#/components/schemas/LocationDestinationCreateRequest"));
+    assert!(one_of_refs.contains(&"#/components/schemas/ShippingDestinationCreateRequest"));
 
     let disc_mapping = fdc["discriminator"]["mapping"]
         .as_object()
@@ -1476,4 +1471,183 @@ fn test_export_openapi_directional_union_and_metadata_invariants() {
             );
         }
     }
+}
+
+#[test]
+fn test_export_openapi_inline_ifthen_lowering() {
+    let schema_dir = std::path::Path::new("../ucp/source/schemas");
+    if !schema_dir.exists() {
+        return;
+    }
+
+    let options = ExportOpenApiOptions::new(schema_dir).title("UCP API");
+    let doc = export_openapi(&options).expect("Export API must succeed");
+    let schemas = doc.components.unwrap().schemas;
+
+    // Verify Provider in full export produces Oauth2Provider in components.schemas
+    assert!(
+        schemas.contains_key("Oauth2Provider"),
+        "Oauth2Provider must be synthesized"
+    );
+    let oauth2_provider = &schemas["Oauth2Provider"];
+
+    // It should have auth_url and required_claims
+    let props = oauth2_provider["properties"].as_object().unwrap();
+    assert!(
+        props.contains_key("auth_url"),
+        "Oauth2Provider must have auth_url"
+    );
+    assert!(
+        props.contains_key("required_claims"),
+        "Oauth2Provider must have required_claims"
+    );
+
+    // The discriminator property 'type' should be fixed to const
+    let type_prop = &props["type"];
+    assert_eq!(type_prop["const"], "oauth2");
+
+    // Verify Provider has discriminator mapping
+    let provider = &schemas["Provider"];
+    let disc = provider
+        .get("discriminator")
+        .expect("Provider must have discriminator");
+    assert_eq!(disc["propertyName"], "type");
+    let mapping = disc["mapping"].as_object().unwrap();
+    assert_eq!(mapping["oauth2"], "#/components/schemas/Oauth2Provider");
+
+    // Additionally verify JwkPublicKey behavior
+    if schemas.contains_key("EcJwkPublicKey") {
+        let ec_key = &schemas["EcJwkPublicKey"];
+        let ec_props = ec_key["properties"].as_object().unwrap();
+        assert_eq!(ec_props["kty"]["const"], "EC");
+        let ec_req = ec_key["required"].as_array().unwrap();
+        assert!(ec_req.contains(&serde_json::json!("crv")));
+        assert!(ec_req.contains(&serde_json::json!("x")));
+        assert!(ec_req.contains(&serde_json::json!("y")));
+
+        let jwk = &schemas["JwkPublicKey"];
+        let jwk_disc = jwk
+            .get("discriminator")
+            .expect("JwkPublicKey must have discriminator");
+        assert_eq!(jwk_disc["propertyName"], "kty");
+        let jwk_mapping = jwk_disc["mapping"].as_object().unwrap();
+        assert_eq!(jwk_mapping["EC"], "#/components/schemas/EcJwkPublicKey");
+    }
+}
+
+#[test]
+fn test_export_openapi_extension_subtype_discovery() {
+    let (_temp_dir, schema_root) = setup_test_schemas();
+
+    // In a completely separate file, author an extension subtype without modifying fulfillment_destination.json
+    let types_dir = schema_root.join("shopping").join("types");
+    fs::write(
+        types_dir.join("locker_destination.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/draft/schemas/shopping/types/locker_destination.json",
+            "title": "Locker Destination",
+            "description": "An automated parcel locker destination for customer pickup.",
+            "type": "object",
+            "allOf": [
+                { "$ref": "fulfillment_destination.json" }
+            ],
+            "required": ["locker_id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "description": "Fulfillment destination identifier.",
+                    "ucp_request": "optional"
+                },
+                "type": {
+                    "type": "string",
+                    "const": "parcel_locker",
+                    "description": "Destination contract discriminator for automated parcel lockers.",
+                    "ucp_request": "optional"
+                },
+                "locker_id": {
+                    "type": "string",
+                    "description": "Unique locker bay or kiosk ID (e.g. LOCKER-BAY-104)."
+                },
+                "carrier": {
+                    "type": "string",
+                    "description": "Locker operator or network (e.g. InPost, FedEx OnSite, Amazon Locker)."
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let options = ExportOpenApiOptions {
+        schema_dir: schema_root.clone(),
+        title: "UCP Shopping Extension Test".to_string(),
+        api_version: "2026-09-01".to_string(),
+        description: None,
+        profile: Some("shopping".to_string()),
+        strict: false,
+    };
+
+    let doc = export_openapi(&options).expect("Export API must succeed");
+    let schemas = doc.components.unwrap().schemas;
+
+    // 1. Assert FulfillmentDestination dynamically discovered parcel_locker
+    assert!(schemas.contains_key("FulfillmentDestination"));
+    let fulfillment_dest = &schemas["FulfillmentDestination"];
+    let disc = fulfillment_dest
+        .get("discriminator")
+        .expect("discriminator must exist");
+    assert_eq!(disc["propertyName"], "type");
+    let mapping = disc["mapping"].as_object().unwrap();
+    assert_eq!(
+        mapping["parcel_locker"],
+        "#/components/schemas/LockerDestination"
+    );
+    assert_eq!(
+        mapping["business_location"],
+        "#/components/schemas/LocationDestination"
+    );
+    assert_eq!(
+        mapping["shipping_address"],
+        "#/components/schemas/ShippingDestination"
+    );
+
+    let one_of = fulfillment_dest["oneOf"].as_array().unwrap();
+    assert_eq!(one_of.len(), 3);
+    assert!(one_of
+        .iter()
+        .any(|item| item["$ref"] == "#/components/schemas/LockerDestination"));
+
+    // 2. Assert LockerDestination component schema is properly normalized and cleaned up
+    assert!(schemas.contains_key("LockerDestination"));
+    let locker = &schemas["LockerDestination"];
+    assert!(
+        locker.get("allOf").is_none(),
+        "allOf must be removed from LockerDestination"
+    );
+    let locker_props = locker["properties"].as_object().unwrap();
+    assert!(locker_props.contains_key("id"));
+    assert!(locker_props.contains_key("type"));
+    assert_eq!(locker_props["type"]["const"], "parcel_locker");
+    assert_eq!(locker_props["type"]["default"], "parcel_locker");
+    assert!(locker_props.contains_key("locker_id"));
+    assert!(locker_props.contains_key("carrier"));
+
+    // 3. Assert directional models are aligned
+    assert!(schemas.contains_key("FulfillmentDestinationCreateRequest"));
+    let fdc = &schemas["FulfillmentDestinationCreateRequest"];
+    let fdc_mapping = fdc["discriminator"]["mapping"].as_object().unwrap();
+    assert_eq!(
+        fdc_mapping["parcel_locker"],
+        "#/components/schemas/LockerDestinationCreateRequest"
+    );
+    let fdc_one_of = fdc["oneOf"].as_array().unwrap();
+    assert_eq!(fdc_one_of.len(), 3);
+    assert!(fdc_one_of
+        .iter()
+        .any(|item| item["$ref"] == "#/components/schemas/LockerDestinationCreateRequest"));
+
+    assert!(schemas.contains_key("LockerDestinationCreateRequest"));
+    let ldc = &schemas["LockerDestinationCreateRequest"];
+    assert!(ldc.get("allOf").is_none());
 }

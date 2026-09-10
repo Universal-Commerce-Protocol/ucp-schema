@@ -20,7 +20,10 @@ use crate::compose::{capability_short_name, is_container_schema};
 use crate::error::ResolveError;
 use crate::loader::collect_schema_files;
 use crate::namespace::is_reverse_domain_name;
-use discriminator::{synthesize_oneof_discriminators, to_pascal_case};
+use discriminator::{
+    hoist_inline_conditional_variants, register_extended_subtypes, synthesize_oneof_discriminators,
+    to_pascal_case,
+};
 use normalizer::{
     is_generic_def_name, normalize_component_schema, rewrite_defs_refs_to_components,
     rewrite_self_refs_to_parent, slice_directional_schemas,
@@ -281,14 +284,9 @@ fn merge_extension_object(root: &mut serde_json::Value, ext_obj: &serde_json::Va
 /// A resource is a root capability if it declares a capability package name (or explicit route path)
 /// and defines an entity with id or directional annotations, and is NOT a container schema
 /// and NOT an extension schema.
-fn is_root_capability_resource(_file_path: &Path, stem: &str, schema: &serde_json::Value) -> bool {
+fn is_root_capability_resource(schema: &serde_json::Value) -> bool {
     // Container schemas and extension schemas are classified separately
     if is_container_schema(schema) || is_extension_schema(schema) {
-        return false;
-    }
-
-    // Never classify protocol-level meta schemas as domain capability resources
-    if matches!(stem, "profile" | "capability" | "service") {
         return false;
     }
 
@@ -307,11 +305,10 @@ fn is_root_capability_resource(_file_path: &Path, stem: &str, schema: &serde_jso
 
     // Must define an entity object with properties (or id / directional annotations / explicit lifecycle)
     if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-        props.contains_key("id")
+        !props.is_empty()
             || has_directional_annotations(schema)
             || schema.get("x-ucp-lifecycle").is_some()
             || has_explicit_path
-            || !props.is_empty()
     } else {
         false
     }
@@ -484,10 +481,82 @@ fn extract_ref_targets(
     }
 }
 
-/// Compute the transitive closure of reachable schema files for a profile.
+/// Check if a schema AST or file path matches a target profile.
+fn schema_matches_profile(
+    schema: &serde_json::Value,
+    file_path: &Path,
+    profile_lower: &str,
+) -> bool {
+    // 1. Root profile discovery document is always an entrypoint for any profile
+    let stem = file_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    if stem == "profile" || file_path.ends_with("profile.json") {
+        return true;
+    }
+
+    // 2. Explicit x-ucp-profile(s) annotation
+    if let Some(p) = schema.get("x-ucp-profile").and_then(|v| v.as_str()) {
+        if p.eq_ignore_ascii_case(profile_lower) {
+            return true;
+        }
+    }
+    if let Some(arr) = schema.get("x-ucp-profiles").and_then(|v| v.as_array()) {
+        if arr.iter().any(|v| {
+            v.as_str()
+                .map(|s| s.eq_ignore_ascii_case(profile_lower))
+                .unwrap_or(false)
+        }) {
+            return true;
+        }
+    }
+
+    // 3. Schema reverse-domain package name segment matches profile (e.g. dev.ucp.shopping.checkout -> shopping)
+    if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
+        if name
+            .split('.')
+            .any(|seg| seg.eq_ignore_ascii_case(profile_lower))
+        {
+            return true;
+        }
+    }
+
+    // 4. Schema $id URI path segments match profile (e.g. https://ucp.dev/schemas/shopping/checkout.json)
+    if let Some(id_str) = schema.get("$id").and_then(|v| v.as_str()) {
+        if let Ok(parsed_url) = url::Url::parse(id_str) {
+            if parsed_url
+                .path_segments()
+                .map(|mut segs| segs.any(|s| s.eq_ignore_ascii_case(profile_lower)))
+                .unwrap_or(false)
+            {
+                return true;
+            }
+        } else if id_str
+            .split('/')
+            .any(|s| s.eq_ignore_ascii_case(profile_lower))
+        {
+            return true;
+        }
+    }
+
+    // 5. Container discovery operations match discovery profile
+    if profile_lower == "discovery"
+        && is_container_schema(schema)
+        && has_container_operations(schema)
+    {
+        return true;
+    }
+
+    // 6. Stem exact or prefix match (e.g. shopping.json, discovery.json)
+    if stem.to_lowercase() == profile_lower || stem.to_lowercase().starts_with(profile_lower) {
+        return true;
+    }
+
+    false
+}
+
+/// Compute the transitive closure of reachable schema files for a profile using in-memory ASTs.
 fn compute_profile_reachable_files(
     schema_dir: &Path,
-    json_files: &[PathBuf],
+    loaded_files: &BTreeMap<PathBuf, (PathBuf, serde_json::Value)>,
     profile: &str,
 ) -> HashSet<PathBuf> {
     let mut visited = HashSet::new();
@@ -495,50 +564,33 @@ fn compute_profile_reachable_files(
 
     let profile_lower = profile.to_lowercase();
 
-    // Identify entrypoint files for the profile
-    for file in json_files {
-        let path_str = file.to_string_lossy().to_lowercase();
-        let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-
-        let is_entrypoint = if profile_lower == "discovery" {
-            stem == "profile"
-                || stem.starts_with("catalog_")
-                || stem.ends_with("_search")
-                || stem.ends_with("_lookup")
-                || path_str.ends_with("profile.json")
-        } else {
-            path_str.contains(&format!("/{}", profile_lower))
-                || path_str.contains(&format!("\\{}", profile_lower))
-                || stem.starts_with(&profile_lower)
-        };
-
-        if is_entrypoint {
-            let canon = file.canonicalize().unwrap_or_else(|_| file.clone());
-            if visited.insert(canon.clone()) {
-                queue.push(file.clone());
-            }
+    // Identify entrypoint files for the profile by AST inspection
+    for (canon, (orig_path, schema_val)) in loaded_files {
+        if schema_matches_profile(schema_val, orig_path, &profile_lower)
+            && visited.insert(canon.clone())
+        {
+            queue.push((canon.clone(), orig_path.clone()));
         }
     }
 
-    // Transitive closure through $refs
-    while let Some(current_file) = queue.pop() {
+    // Transitive closure through $refs purely in memory
+    while let Some((_current_canon, current_file)) = queue.pop() {
         let parent_dir = current_file.parent().unwrap_or(schema_dir);
-        let content = match std::fs::read_to_string(&current_file) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let schema_val: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let canon_key = current_file
+            .canonicalize()
+            .unwrap_or_else(|_| current_file.clone());
+        let schema_val = match loaded_files.get(&canon_key) {
+            Some((_, v)) => v,
+            None => continue,
         };
 
         let mut targets = HashSet::new();
-        extract_ref_targets(&schema_val, parent_dir, schema_dir, &mut targets);
+        extract_ref_targets(schema_val, parent_dir, schema_dir, &mut targets);
 
         for target in targets {
             let canon = target.canonicalize().unwrap_or_else(|_| target.clone());
-            if visited.insert(canon) && target.exists() {
-                queue.push(target);
+            if visited.insert(canon.clone()) && loaded_files.contains_key(&canon) {
+                queue.push((canon, target));
             }
         }
     }
@@ -556,24 +608,9 @@ pub fn export_openapi(options: &ExportOpenApiOptions) -> Result<OpenApiDoc, Open
 
     let json_files = collect_schema_files(&options.schema_dir);
 
-    let reachable_filter: Option<HashSet<PathBuf>> = match options.profile.as_deref() {
-        Some(p) if !p.is_empty() && !p.eq_ignore_ascii_case("all") => Some(
-            compute_profile_reachable_files(&options.schema_dir, &json_files, p),
-        ),
-        _ => None,
-    };
-
-    let mut raw_schemas = Vec::new();
+    // Read and parse all JSON files once into a memory map: canonical_path -> (original_path, parsed_value)
+    let mut loaded_files = BTreeMap::new();
     for file_path in &json_files {
-        if let Some(ref reachable) = reachable_filter {
-            let canon = file_path
-                .canonicalize()
-                .unwrap_or_else(|_| file_path.clone());
-            if !reachable.contains(&canon) {
-                continue;
-            }
-        }
-
         let content =
             std::fs::read_to_string(file_path).map_err(|e| OpenApiExportError::IoError {
                 path: file_path.clone(),
@@ -584,7 +621,27 @@ pub fn export_openapi(options: &ExportOpenApiOptions) -> Result<OpenApiDoc, Open
                 path: file_path.clone(),
                 source: e,
             })?;
-        raw_schemas.push((file_path.clone(), value));
+        let canon = file_path
+            .canonicalize()
+            .unwrap_or_else(|_| file_path.clone());
+        loaded_files.insert(canon, (file_path.clone(), value));
+    }
+
+    let reachable_filter: Option<HashSet<PathBuf>> = match options.profile.as_deref() {
+        Some(p) if !p.is_empty() && !p.eq_ignore_ascii_case("all") => Some(
+            compute_profile_reachable_files(&options.schema_dir, &loaded_files, p),
+        ),
+        _ => None,
+    };
+
+    let mut raw_schemas = Vec::new();
+    for (canon, (orig_path, value)) in loaded_files {
+        if let Some(ref reachable) = reachable_filter {
+            if !reachable.contains(&canon) {
+                continue;
+            }
+        }
+        raw_schemas.push((orig_path, value));
     }
 
     let mut schemas = BTreeMap::new();
@@ -635,7 +692,7 @@ pub fn export_openapi(options: &ExportOpenApiOptions) -> Result<OpenApiDoc, Open
             && !is_extension_schema(raw_schema)
             && has_container_operations(raw_schema);
 
-        if is_container && !is_root_capability_resource(file_path, stem, raw_schema) {
+        if is_container && !is_root_capability_resource(raw_schema) {
             let mut container_clone = raw_schema.clone();
             // Compose any extension operation shapes into container
             let container_name = raw_schema.get("name").and_then(|v| v.as_str());
@@ -666,7 +723,7 @@ pub fn export_openapi(options: &ExportOpenApiOptions) -> Result<OpenApiDoc, Open
             container_schemas.push((file_path.clone(), container_clone));
         }
 
-        let is_root = is_root_capability_resource(file_path, stem, raw_schema);
+        let is_root = is_root_capability_resource(raw_schema);
         let mut parent_schema = raw_schema.clone();
 
         // If parent schema is a container schema (only holds $defs without direct type/properties/allOf),
@@ -753,8 +810,17 @@ pub fn export_openapi(options: &ExportOpenApiOptions) -> Result<OpenApiDoc, Open
         }
     }
 
+    // 1b. Hoist inline conditionals out of schemas into separate components
+    hoist_inline_conditional_variants(&mut schemas);
+    for schema_val in schemas.values_mut() {
+        discriminator::transform_schema_conditionals(schema_val);
+    }
+
     // 2. Synthesize explicit discriminators on oneOf unions before aligning directional models
     synthesize_oneof_discriminators(&mut schemas);
+
+    // 2b. Discover and register extended subtypes (decentralized polymorphism via allOf)
+    register_extended_subtypes(&mut schemas);
 
     // 1c. Align directional references in request schemas (e.g. LineItem -> LineItemCreateRequest inside CartCreateRequest)
     let schema_keys: Vec<String> = schemas.keys().cloned().collect();

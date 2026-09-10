@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::compose::capability_short_name;
+use crate::openapi::normalizer::attach_const_defaults;
 
 /// Convert an identifier string (snake_case, kebab-case, space-separated, or dot-separated)
 /// into PascalCase.
@@ -151,7 +152,7 @@ pub fn transform_object_conditionals(schema_obj: &mut Map<String, Value>) -> boo
 
     for item in all_of {
         if let Some(cond) = parse_conditional_branch(item) {
-            conditional_branches.push(cond);
+            conditional_branches.push((cond, item.clone()));
         } else {
             remaining_all_of.push(item.clone());
         }
@@ -161,12 +162,15 @@ pub fn transform_object_conditionals(schema_obj: &mut Map<String, Value>) -> boo
         return false;
     }
 
-    // Verify all conditional branches use the same discriminator property name
-    let prop_name = conditional_branches[0].property_name.clone();
-    for branch in &conditional_branches {
-        if branch.property_name != prop_name {
-            // Inconsistent discriminator properties, skip transformation
-            return false;
+    // Isolate branches using the primary discriminator property
+    let prop_name = conditional_branches[0].0.property_name.clone();
+    let mut matching_branches = Vec::new();
+
+    for (branch, original_item) in conditional_branches {
+        if branch.property_name == prop_name {
+            matching_branches.push(branch);
+        } else {
+            remaining_all_of.push(original_item);
         }
     }
 
@@ -174,7 +178,7 @@ pub fn transform_object_conditionals(schema_obj: &mut Map<String, Value>) -> boo
     let mut mapping = BTreeMap::new();
     let mut one_of_refs = BTreeSet::new();
 
-    for branch in conditional_branches {
+    for branch in matching_branches {
         mapping.insert(
             branch.discriminator_value,
             branch.target_component_ref.clone(),
@@ -400,6 +404,380 @@ pub fn synthesize_oneof_discriminators(schemas: &mut BTreeMap<String, Value>) {
     }
 }
 
+/// Hoists inline conditional `if`/`then` branches out of parent schemas and synthesizes
+/// first-class component variant schemas for them, rewriting the original branches to `$ref`.
+pub fn hoist_inline_conditional_variants(schemas: &mut BTreeMap<String, Value>) {
+    let schema_names: Vec<String> = schemas.keys().cloned().collect();
+
+    for parent_name in schema_names {
+        let parent_schema_val = match schemas.get(&parent_name) {
+            Some(s) => s.clone(),
+            None => continue,
+        };
+
+        let mut parent_obj = match parent_schema_val.as_object() {
+            Some(obj) => obj.clone(),
+            None => continue,
+        };
+
+        let mut all_of_arr = match parent_obj.get("allOf").and_then(|v| v.as_array()) {
+            Some(arr) => arr.clone(),
+            None => continue,
+        };
+
+        let mut modified = false;
+
+        for branch in all_of_arr.iter_mut() {
+            if let Some(branch_obj) = branch.as_object_mut() {
+                if let Some(if_obj) = branch_obj.get("if").and_then(|v| v.as_object()) {
+                    if let Some(then_obj) = branch_obj.get("then").and_then(|v| v.as_object()) {
+                        // Skip if it is already a $ref
+                        if then_obj.contains_key("$ref") {
+                            continue;
+                        }
+
+                        // Only hoist if the conditional branch defines a specialized variant introducing
+                        // new properties beyond the parent base schema (polymorphism), rather than merely
+                        // applying a validation constraint to an existing property.
+                        let parent_props = parent_obj.get("properties").and_then(|p| p.as_object());
+                        let introduces_new_props = if let Some(then_props) =
+                            then_obj.get("properties").and_then(|p| p.as_object())
+                        {
+                            match parent_props {
+                                Some(pp) => then_props.keys().any(|k| !pp.contains_key(k)),
+                                None => !then_props.is_empty(),
+                            }
+                        } else {
+                            false
+                        };
+
+                        if !introduces_new_props {
+                            continue;
+                        }
+
+                        if let Some(props) = if_obj.get("properties").and_then(|p| p.as_object()) {
+                            let mut prop_name_match = None;
+                            let mut const_val_match = None;
+
+                            for (k, v) in props {
+                                if let Some(val) = extract_const_or_single_enum(v) {
+                                    prop_name_match = Some(k.clone());
+                                    const_val_match = Some(val);
+                                    break;
+                                }
+                            }
+
+                            if let (Some(prop_name), Some(const_val)) =
+                                (prop_name_match, const_val_match)
+                            {
+                                let const_pascal = to_pascal_case(&const_val);
+                                let variant_name = if const_pascal
+                                    .to_lowercase()
+                                    .ends_with(&parent_name.to_lowercase())
+                                {
+                                    const_pascal
+                                } else {
+                                    format!("{}{}", const_pascal, parent_name)
+                                };
+
+                                let mut variant_schema = parent_schema_val.clone();
+                                if let Some(variant_obj) = variant_schema.as_object_mut() {
+                                    variant_obj.remove("allOf");
+
+                                    // Merge `then.properties` into properties.
+                                    if let Some(then_props) =
+                                        then_obj.get("properties").and_then(|p| p.as_object())
+                                    {
+                                        let props_entry = variant_obj
+                                            .entry("properties".to_string())
+                                            .or_insert_with(
+                                                || Value::Object(serde_json::Map::new()),
+                                            )
+                                            .as_object_mut()
+                                            .unwrap();
+                                        for (k, v) in then_props {
+                                            props_entry.insert(k.clone(), v.clone());
+                                        }
+                                    }
+
+                                    // Merge `then.required` into required (avoid duplicates).
+                                    if let Some(then_req) =
+                                        then_obj.get("required").and_then(|r| r.as_array())
+                                    {
+                                        let req_entry = variant_obj
+                                            .entry("required".to_string())
+                                            .or_insert_with(|| Value::Array(Vec::new()))
+                                            .as_array_mut()
+                                            .unwrap();
+                                        for r in then_req {
+                                            if !req_entry.contains(r) {
+                                                req_entry.push(r.clone());
+                                            }
+                                        }
+                                    }
+
+                                    // Fix discriminator property in variant.
+                                    if let Some(props_entry) = variant_obj
+                                        .get_mut("properties")
+                                        .and_then(|p| p.as_object_mut())
+                                    {
+                                        let fixed_disc = serde_json::json!({
+                                            "type": "string",
+                                            "const": const_val,
+                                            "default": const_val
+                                        });
+                                        props_entry.insert(prop_name.clone(), fixed_disc);
+                                    }
+                                }
+
+                                schemas.insert(variant_name.clone(), variant_schema);
+
+                                branch_obj.insert(
+                                    "then".to_string(),
+                                    serde_json::json!({
+                                        "$ref": format!("#/components/schemas/{}", variant_name)
+                                    }),
+                                );
+
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if modified {
+            parent_obj.insert("allOf".to_string(), Value::Array(all_of_arr));
+            schemas.insert(parent_name, Value::Object(parent_obj));
+        }
+    }
+}
+
+/// Discovers and registers extended subtypes into base polymorphic schemas.
+///
+/// In UCP, extensions introduce new polymorphic variants in standalone files without
+/// modifying upstream schemas (e.g. `locker_destination.json` extending `fulfillment_destination.json`).
+///
+/// A schema `Derived` is recognized as an extended subtype of `Base` if:
+/// 1. `Base` is a polymorphic schema (has `discriminator` with `propertyName` and `mapping`, or `oneOf`).
+/// 2. `Derived` extends `Base` via an `allOf` entry referencing `Base`.
+/// 3. `Derived` defines a constant/single-enum value for `Base`'s discriminator property.
+pub fn register_extended_subtypes(schemas: &mut BTreeMap<String, Value>) {
+    let schema_names: Vec<String> = schemas.keys().cloned().collect();
+
+    // Step 1: Identify all base schemas that define a discriminator
+    let mut base_schemas = Vec::new();
+    for name in &schema_names {
+        if let Some(schema_val) = schemas.get(name) {
+            if let Some(prop_name) = schema_val
+                .get("discriminator")
+                .and_then(|d| d.get("propertyName"))
+                .and_then(|p| p.as_str())
+            {
+                base_schemas.push((name.clone(), prop_name.to_string()));
+            }
+        }
+    }
+
+    if base_schemas.is_empty() {
+        return;
+    }
+
+    // Step 2: For each base schema, find all derived schemas extending it via allOf
+    // Store: (base_name, derived_name, const_val, base_root_name)
+    let mut registrations = Vec::new();
+
+    for (base_name, prop_name) in &base_schemas {
+        let base_root = base_name
+            .strip_suffix("CreateRequest")
+            .or_else(|| base_name.strip_suffix("UpdateRequest"))
+            .or_else(|| base_name.strip_suffix("CompleteRequest"))
+            .unwrap_or(base_name.as_str());
+        let base_suffix = base_name.strip_prefix(base_root).unwrap_or("");
+
+        for derived_name in &schema_names {
+            if derived_name == base_name || derived_name == base_root {
+                continue;
+            }
+
+            let derived_val = match schemas.get(derived_name) {
+                Some(v) => v,
+                None => continue,
+            };
+
+            // Check if derived extends base_root (or base_name)
+            let extends_base =
+                if let Some(all_of) = derived_val.get("allOf").and_then(|a| a.as_array()) {
+                    all_of.iter().any(|item| {
+                        if let Some(ref_str) = item.get("$ref").and_then(|r| r.as_str()) {
+                            if ref_str == format!("#/components/schemas/{}", base_name)
+                                || ref_str == format!("#/components/schemas/{}", base_root)
+                            {
+                                return true;
+                            }
+                            let comp = ref_to_component_name(ref_str);
+                            comp == *base_name || comp == base_root
+                        } else {
+                            false
+                        }
+                    })
+                } else {
+                    false
+                };
+
+            if !extends_base {
+                continue;
+            }
+
+            // If base has a directional suffix, only match derived that has the same suffix
+            // (or unsuffixed derived if no suffixed derived exists)
+            let derived_root = derived_name
+                .strip_suffix("CreateRequest")
+                .or_else(|| derived_name.strip_suffix("UpdateRequest"))
+                .or_else(|| derived_name.strip_suffix("CompleteRequest"))
+                .unwrap_or(derived_name.as_str());
+            let derived_suffix = derived_name.strip_prefix(derived_root).unwrap_or("");
+
+            if !base_suffix.is_empty() {
+                let suffixed_derived = format!("{}{}", derived_root, base_suffix);
+                if schemas.contains_key(&suffixed_derived) {
+                    if derived_suffix != base_suffix {
+                        continue;
+                    }
+                } else if !derived_suffix.is_empty() {
+                    continue;
+                }
+            } else if !derived_suffix.is_empty() {
+                continue;
+            }
+
+            // Check if derived defines the discriminator property as const/enum
+            if let Some(const_val) = get_const_property_value(derived_val, prop_name) {
+                registrations.push((
+                    base_name.clone(),
+                    derived_name.clone(),
+                    const_val,
+                    base_root.to_string(),
+                    prop_name.clone(),
+                ));
+            }
+        }
+    }
+
+    // Step 3: Apply registrations
+    for (base_name, derived_name, const_val, base_root, prop_name) in registrations {
+        let derived_ref = format!("#/components/schemas/{}", derived_name);
+
+        // 3a. Update Base: add to discriminator.mapping and oneOf
+        if let Some(base_val) = schemas.get_mut(&base_name) {
+            if let Some(base_obj) = base_val.as_object_mut() {
+                // Update mapping
+                let disc_entry = base_obj
+                    .entry("discriminator".to_string())
+                    .or_insert_with(|| {
+                        serde_json::json!({
+                            "propertyName": prop_name,
+                            "mapping": {}
+                        })
+                    });
+                if let Some(mapping) = disc_entry
+                    .get_mut("mapping")
+                    .and_then(|m| m.as_object_mut())
+                {
+                    mapping.insert(const_val.clone(), Value::String(derived_ref.clone()));
+                }
+
+                // Update oneOf
+                let one_of_entry = base_obj
+                    .entry("oneOf".to_string())
+                    .or_insert_with(|| Value::Array(Vec::new()));
+                if let Some(one_of_arr) = one_of_entry.as_array_mut() {
+                    let already_present = one_of_arr.iter().any(|item| {
+                        item.get("$ref").and_then(|r| r.as_str()) == Some(&derived_ref)
+                    });
+                    if !already_present {
+                        one_of_arr.push(serde_json::json!({ "$ref": derived_ref }));
+                        // Sort oneOf for determinism
+                        one_of_arr.sort_by(|a, b| {
+                            let ref_a = a.get("$ref").and_then(|r| r.as_str()).unwrap_or("");
+                            let ref_b = b.get("$ref").and_then(|r| r.as_str()).unwrap_or("");
+                            ref_a.cmp(ref_b)
+                        });
+                    }
+                }
+            }
+        }
+
+        // 3b. Update Derived: inherit base properties & required, clean up allOf
+        let (inherited_props, inherited_req) = {
+            let base_lookup = schemas
+                .get(&base_name)
+                .filter(|b| b.get("properties").is_some())
+                .or_else(|| schemas.get(&base_root));
+            if let Some(b) = base_lookup {
+                let props = b.get("properties").and_then(|p| p.as_object()).cloned();
+                let req = b.get("required").and_then(|r| r.as_array()).cloned();
+                (props, req)
+            } else {
+                (None, None)
+            }
+        };
+
+        if let Some(derived_val) = schemas.get_mut(&derived_name) {
+            if let Some(derived_obj) = derived_val.as_object_mut() {
+                // Inherit missing properties from Base
+                if let Some(props_map) = inherited_props {
+                    let derived_props = derived_obj
+                        .entry("properties".to_string())
+                        .or_insert_with(|| Value::Object(serde_json::Map::new()))
+                        .as_object_mut();
+                    if let Some(dp) = derived_props {
+                        for (k, v) in props_map {
+                            if !dp.contains_key(&k) {
+                                dp.insert(k, v);
+                            }
+                        }
+                    }
+                }
+
+                // Inherit required fields from Base
+                if let Some(req_arr) = inherited_req {
+                    let derived_req = derived_obj
+                        .entry("required".to_string())
+                        .or_insert_with(|| Value::Array(Vec::new()))
+                        .as_array_mut();
+                    if let Some(dr) = derived_req {
+                        for r in req_arr {
+                            if !dr.contains(&r) {
+                                dr.push(r);
+                            }
+                        }
+                    }
+                }
+
+                // Remove base ref from allOf
+                if let Some(all_of) = derived_obj.get_mut("allOf").and_then(|a| a.as_array_mut()) {
+                    all_of.retain(|item| {
+                        if let Some(ref_str) = item.get("$ref").and_then(|r| r.as_str()) {
+                            let comp = ref_to_component_name(ref_str);
+                            comp != base_name && comp != base_root
+                        } else {
+                            true
+                        }
+                    });
+                    if all_of.is_empty() {
+                        derived_obj.remove("allOf");
+                    }
+                }
+
+                // Ensure discriminator property in derived has default
+                attach_const_defaults(derived_val);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -595,5 +973,74 @@ mod tests {
             "#/components/schemas/MessageWarning"
         );
         assert_eq!(disc["mapping"]["info"], "#/components/schemas/MessageInfo");
+    }
+
+    #[test]
+    fn test_register_extended_subtypes() {
+        let mut schemas = BTreeMap::new();
+
+        schemas.insert(
+            "FulfillmentDestination".to_string(),
+            json!({
+                "title": "Fulfillment Destination",
+                "type": "object",
+                "required": ["type", "id"],
+                "properties": {
+                    "id": { "type": "string", "description": "Destination ID" },
+                    "type": { "type": "string", "description": "Discriminator" }
+                },
+                "oneOf": [
+                    { "$ref": "#/components/schemas/LocationDestination" },
+                    { "$ref": "#/components/schemas/ShippingDestination" }
+                ],
+                "discriminator": {
+                    "propertyName": "type",
+                    "mapping": {
+                        "business_location": "#/components/schemas/LocationDestination",
+                        "shipping_address": "#/components/schemas/ShippingDestination"
+                    }
+                }
+            }),
+        );
+
+        schemas.insert(
+            "LockerDestination".to_string(),
+            json!({
+                "title": "Locker Destination",
+                "type": "object",
+                "allOf": [
+                    { "$ref": "#/components/schemas/FulfillmentDestination" }
+                ],
+                "required": ["locker_id"],
+                "properties": {
+                    "type": { "type": "string", "const": "parcel_locker" },
+                    "locker_id": { "type": "string" },
+                    "carrier": { "type": "string" }
+                }
+            }),
+        );
+
+        register_extended_subtypes(&mut schemas);
+
+        let base = &schemas["FulfillmentDestination"];
+        let disc = &base["discriminator"];
+        assert_eq!(
+            disc["mapping"]["parcel_locker"],
+            "#/components/schemas/LockerDestination"
+        );
+        let one_of = base["oneOf"].as_array().unwrap();
+        assert_eq!(one_of.len(), 3);
+        assert!(one_of
+            .iter()
+            .any(|item| item["$ref"] == "#/components/schemas/LockerDestination"));
+
+        let derived = &schemas["LockerDestination"];
+        assert!(derived.get("allOf").is_none());
+        assert!(derived["properties"].get("id").is_some());
+        assert_eq!(derived["properties"]["type"]["default"], "parcel_locker");
+        let req = derived["required"].as_array().unwrap();
+        assert!(req.iter().any(|r| r == "locker_id"));
+        assert!(req.iter().any(|r| r == "id"));
+        assert!(req.iter().any(|r| r == "type"));
     }
 }

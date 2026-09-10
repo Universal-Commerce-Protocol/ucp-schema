@@ -584,26 +584,70 @@ fn project_lifecycle_actions(
     }
 }
 
-/// Extract capability group stem/namespace from schema name or file path.
+/// Extract capability group stem/namespace from schema annotations, name, or file path.
 pub fn extract_capability_group(file_path: &std::path::Path, schema: &Value) -> String {
-    if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
-        let parts: Vec<&str> = name.split('.').collect();
-        if parts.len() >= 4 {
-            return parts[3].to_string();
-        } else if parts.len() == 3 {
-            return parts[2].to_string();
+    // 1. Explicit x-ucp-group annotation
+    if let Some(group) = schema.get("x-ucp-group").and_then(|v| v.as_str()) {
+        return group.to_string();
+    }
+
+    // 2. Explicit x-ucp-path annotation (e.g. "/catalog" -> "catalog")
+    if let Some(path) = schema.get("x-ucp-path").and_then(|v| v.as_str()) {
+        let clean = path.trim_matches('/');
+        if let Some(first_seg) = clean.split('/').next() {
+            if !first_seg.is_empty() {
+                return first_seg.to_string();
+            }
         }
     }
 
+    // 3. Inspect $defs to find unique operation names in this container
+    let def_ops: std::collections::BTreeSet<String> = schema
+        .get("$defs")
+        .and_then(|d| d.as_object())
+        .map(|defs| {
+            defs.keys()
+                .filter_map(|k| {
+                    k.strip_suffix("_request")
+                        .or_else(|| k.strip_suffix("_response"))
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    // 4. Derive from reverse-domain package name
+    if let Some(name) = schema.get("name").and_then(|v| v.as_str()) {
+        let parts: Vec<&str> = name.split('.').collect();
+        if parts.len() >= 2 {
+            let last = *parts.last().unwrap();
+            // If last segment matches a container operation, group is the preceding segment
+            if def_ops
+                .iter()
+                .any(|op| op == last || last.ends_with(op) || last.starts_with(op))
+            {
+                return parts[parts.len() - 2].to_string();
+            }
+            // Otherwise, last segment is the capability group
+            return last.to_string();
+        }
+    }
+
+    // 5. Derive from file stem, stripping matched operation suffix if present
     let stem = file_path
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("capability");
-    if let Some(pos) = stem.find('_') {
-        stem[..pos].to_string()
-    } else {
-        stem.to_string()
+
+    for op in &def_ops {
+        let op_suffix = format!("_{}", op);
+        if let Some(prefix) = stem.strip_suffix(&op_suffix) {
+            return prefix.to_string();
+        }
     }
+
+    // Default to the full file stem (no blind slicing on underscores)
+    stem.to_string()
 }
 
 /// Project container capability operations dynamically from `$defs` request/response pairs.
@@ -661,11 +705,19 @@ pub fn project_container_operations(
         if let Some(entity) = op.strip_prefix("get_") {
             // Single-entity retrieval: GET /{group}/{plural_entity}/{id}
             let entity_title = to_pascal_case(entity);
-            let item_path = format!(
-                "{}/{}/{{id}}",
-                base_path,
-                pluralize_path_segment(&entity_title)
-            );
+            let item_path = if let Some(p) = req_def.get("x-ucp-path").and_then(|v| v.as_str()) {
+                if p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    format!("/{}", p)
+                }
+            } else {
+                format!(
+                    "{}/{}/{{id}}",
+                    base_path,
+                    pluralize_path_segment(&entity_title)
+                )
+            };
 
             let param_desc = format!("{} ID to lookup.", entity_title);
             let mut params = vec![ParameterOrRef::Item(Parameter {
@@ -705,7 +757,15 @@ pub fn project_container_operations(
             projected_tags.push(tag.clone());
         } else {
             // Action or search query: POST /{group}/{op}
-            let action_path = format!("{}/{}", base_path, op);
+            let action_path = if let Some(p) = req_def.get("x-ucp-path").and_then(|v| v.as_str()) {
+                if p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    format!("/{}", p)
+                }
+            } else {
+                format!("{}/{}", base_path, op)
+            };
 
             let req_required = req_def
                 .get("required")
@@ -1046,5 +1106,23 @@ mod tests {
         assert!(loc_paths.contains_key("/location/search"));
         let loc_op = loc_paths["/location/search"].post.as_ref().unwrap();
         assert_eq!(loc_op.operation_id.as_deref(), Some("searchLocation"));
+
+        // Test deep enterprise namespace: com.example.enterprise.commerce.catalog.search
+        let enterprise_schema = json!({
+            "name": "com.example.enterprise.commerce.catalog.search",
+            "$defs": {
+                "search_request": {
+                    "type": "object",
+                    "x-ucp-path": "/enterprise-catalog/custom-search"
+                },
+                "search_response": { "type": "object" }
+            }
+        });
+        let mut ent_paths = BTreeMap::new();
+        let ent_path = std::path::Path::new("schemas/enterprise/catalog_search.json");
+        let ent_tags =
+            project_container_operations(ent_path, &enterprise_schema, &available, &mut ent_paths);
+        assert!(ent_tags.contains(&"Catalog".to_string()));
+        assert!(ent_paths.contains_key("/enterprise-catalog/custom-search"));
     }
 }
