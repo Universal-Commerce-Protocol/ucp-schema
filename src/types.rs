@@ -15,8 +15,19 @@ pub struct SchemaTransitionInfo {
 /// Valid UCP operations for annotation object form.
 pub const VALID_OPERATIONS: &[&str] = &["create", "update", "complete", "read"];
 
-/// UCP annotation keys.
+/// UCP annotation keys for field visibility.
 pub const UCP_ANNOTATIONS: &[&str] = &["ucp_request", "ucp_response"];
+
+/// UCP authoring and metadata keywords reserved by the specification.
+pub const UCP_RESERVED_KEYWORDS: &[&str] = &[
+    "ucp_request",
+    "ucp_response",
+    "ucp_metadata",
+    "ucp_direction",
+    "ucp_shared_request",
+    "ucp_capability",
+    "ucp_version",
+];
 
 /// Returns the JSON type name for error messages.
 pub fn json_type_name(value: &Value) -> &'static str {

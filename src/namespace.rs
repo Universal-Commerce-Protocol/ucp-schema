@@ -124,6 +124,25 @@ pub fn reverse_labels(host: &str) -> String {
         .join(".")
 }
 
+/// Check if a string is a valid reverse-domain capability identifier (e.g. `dev.ucp.shopping.checkout`).
+///
+/// A reverse-domain name has at least two dot-separated labels, and each label
+/// is a non-empty alphanumeric/hyphen/underscore identifier.
+pub fn is_reverse_domain_name(s: &str) -> bool {
+    if s.ends_with(".json") {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.len() < 2 {
+        return false;
+    }
+    parts.iter().all(|p| {
+        !p.is_empty()
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
 /// Validate that `name`'s namespace authority matches the origin of its `schema`
 /// `url`.
 ///
