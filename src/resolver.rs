@@ -259,7 +259,20 @@ fn resolve_object(
 ) -> Result<Value, ResolveError> {
     let mut result = Map::new();
 
-    // Track required array modifications
+    // Track required array modifications.
+    //
+    // `required` is only rewritten when it is well formed, that is an array of
+    // strings. A `required` that is any other shape is not a JSON Schema
+    // keyword we can reason about, so it is passed through untouched below
+    // rather than being replaced with an empty array. Replacing it silently
+    // discarded the constraint and left a schema that a validator would have
+    // rejected looking valid, and it also rewrote the unrelated boolean
+    // `required` that OpenAPI and OpenRPC service definitions carry.
+    let well_formed_required = map.get("required").is_none_or(|v| {
+        v.as_array()
+            .is_some_and(|arr| arr.iter().all(|e| e.is_string()))
+    });
+
     let original_required: Vec<String> = map
         .get("required")
         .and_then(|v| v.as_array())
@@ -330,7 +343,11 @@ fn resolve_object(
     }
 
     // Add updated required array if non-empty or if original existed
-    if !new_required.is_empty() || map.contains_key("required") {
+    if !well_formed_required {
+        if let Some(value) = map.get("required") {
+            result.insert("required".to_string(), value.clone());
+        }
+    } else if !new_required.is_empty() || map.contains_key("required") {
         result.insert(
             "required".to_string(),
             Value::Array(new_required.into_iter().map(Value::String).collect()),
@@ -870,6 +887,53 @@ mod tests {
         let required = result["required"].as_array().unwrap();
         assert!(!required.contains(&json!("id")));
         assert!(required.contains(&json!("name")));
+    }
+
+    #[test]
+    fn resolve_preserves_a_non_array_required() {
+        // A `required` that is not an array of strings is not a JSON Schema
+        // keyword this resolver can rewrite. It must survive untouched so the
+        // validator sees the authored value and rejects the schema, rather
+        // than being replaced with an empty array that silently drops the
+        // constraint and reports the schema as usable.
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": "name"
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!("name"));
+    }
+
+    #[test]
+    fn resolve_preserves_a_boolean_required() {
+        // OpenAPI and OpenRPC parameter objects carry a boolean `required`.
+        // Those documents are resolved too, and the flag must not be rewritten
+        // into an empty array.
+        let schema = json!({
+            "name": "checkout",
+            "required": true,
+            "schema": { "type": "object" }
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!(true));
+    }
+
+    #[test]
+    fn resolve_preserves_required_with_a_non_string_element() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name", 1]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!(["name", 1]));
     }
 
     #[test]

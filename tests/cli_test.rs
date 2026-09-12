@@ -281,6 +281,39 @@ mod validate_command {
     }
 
     #[test]
+    fn validate_rejects_a_schema_whose_required_is_not_an_array() {
+        // A malformed `required` used to be rewritten to an empty array during
+        // resolution, so the constraint vanished and an instance missing the
+        // field validated cleanly. The authored value now survives, the
+        // validator refuses the schema, and the run exits 2 rather than 0.
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": "name"
+            }"#,
+        );
+        let payload = write_temp_file(&dir, "payload.json", r#"{}"#);
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("invalid schema"));
+    }
+
+    #[test]
     fn validate_wrong_type() {
         let dir = TempDir::new().unwrap();
         let schema = write_temp_file(
