@@ -59,6 +59,7 @@ mod error;
 mod linter;
 mod loader;
 mod namespace;
+pub mod openapi;
 mod resolver;
 mod types;
 mod validator;
@@ -72,12 +73,18 @@ pub use compose::{
 pub use error::{ComposeError, ResolveError, SchemaError, ValidateError};
 pub use linter::{lint, lint_file, Diagnostic, FileResult, FileStatus, LintResult, Severity};
 pub use loader::{
-    bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema, load_schema_auto,
-    load_schema_str, navigate_fragment,
+    bundle_refs, bundle_refs_with_url_mapping, collect_schema_files, is_url, load_schema,
+    load_schema_auto, load_schema_str, navigate_fragment,
 };
 pub use namespace::{reverse_labels, validate_binding, BindingError};
+pub use openapi::{
+    export_openapi, ExportOpenApiOptions, OpenApiDoc, OpenApiExportError, OpenApiExportOptions,
+};
 pub use resolver::{resolve, strip_annotations};
-pub use types::{Direction, Requires, ResolveOptions, VersionConstraint, Visibility};
+pub use types::{
+    Direction, Requires, ResolveOptions, VersionConstraint, Visibility, UCP_ANNOTATIONS,
+    UCP_RESERVED_KEYWORDS,
+};
 pub use validator::{select_operation_schema, validate, validate_against_schema};
 
 #[cfg(feature = "remote")]
