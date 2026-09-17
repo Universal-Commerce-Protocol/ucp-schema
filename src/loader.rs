@@ -196,11 +196,20 @@ impl jsonschema::Retrieve for UcpRetriever {
         uri: &jsonschema::Uri<String>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let uri = uri.as_str();
-        // 1. Explicit URL mapping wins.
+        // 1. Explicit URL mapping wins, when it resolves to a file that
+        //    actually exists. A `$ref` resolved (via URL join) against a
+        //    document whose declared `$id` sits one level deeper, in `$id`
+        //    terms, than its referrer's disk location doubles a path
+        //    segment here exactly as it can in step 3 below; falling
+        //    through instead of erroring lets the learned-anchor relocation
+        //    in step 3 recover the real file the same way it already does
+        //    for references with no explicit mapping configured.
         if let Some((local, remote)) = &self.mapping {
             if let Some(rest) = uri.strip_prefix(remote.trim_end_matches('/')) {
                 let path = local.join(rest.trim_start_matches('/'));
-                return Ok(self.load_and_learn(&path)?);
+                if path.exists() {
+                    return Ok(self.load_and_learn(&path)?);
+                }
             }
         }
         // 2. file:// URIs load directly. Parse rather than strip the scheme:
@@ -357,7 +366,7 @@ fn crawl_external_refs(
                     None => {
                         claimed.insert(fetched_base.clone(), uri.clone());
                         seen.insert(fetched_base.clone());
-                        resources.push((fetched_base, fetched));
+                        resources.push((fetched_base, fetched.clone()));
                     }
                     Some(first) if *first != uri => {
                         return Err(ResolveError::BundleError {
@@ -368,6 +377,22 @@ fn crawl_external_refs(
                     }
                     Some(_) => {}
                 }
+                // `uri` is a retrieval URI that does not match this
+                // document's own `$id` — it was only reachable because a
+                // relative `$ref` in the *referrer* was written against a
+                // directory layout that does not match the referrer's
+                // declared `$id` (e.g. a sibling-on-disk directory nested
+                // one level deeper in the `$id` namespace). Upstream
+                // dereference resolves this document's *own* relative
+                // `$ref`s against the URI it retrieved the document under,
+                // not against the document's declared `$id`, so every
+                // resource this document points to must also be reachable
+                // (and registered) relative to `uri`, or upstream dereference
+                // fails with "not present in a registry" the moment it
+                // re-derives the same join independently. Crawl this
+                // document's own refs a second time under `uri` so both
+                // bases are covered.
+                queue.push((fetched, uri));
             }
         }
     }
