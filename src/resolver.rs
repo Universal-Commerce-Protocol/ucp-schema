@@ -98,12 +98,16 @@ fn close_additional_properties_inner(value: &mut Value, in_composition_branch: b
                         }
                     }
                 }
-                "items" | "additionalProperties" | "unevaluatedProperties" => {
+                "items"
+                | "additionalProperties"
+                | "unevaluatedProperties"
+                | "contains"
+                | "unevaluatedItems" => {
                     // Schema values - recurse
                     close_additional_properties_inner(child, false);
                 }
-                "$defs" | "definitions" => {
-                    // Definitions - recurse into each
+                "$defs" | "definitions" | "patternProperties" => {
+                    // Schema maps - recurse into each value schema
                     if let Value::Object(defs) = child {
                         for def_value in defs.values_mut() {
                             close_additional_properties_inner(def_value, false);
@@ -116,6 +120,15 @@ fn close_additional_properties_inner(value: &mut Value, in_composition_branch: b
                     if let Value::Array(arr) = child {
                         for item in arr {
                             close_additional_properties_inner(item, true);
+                        }
+                    }
+                }
+                "prefixItems" => {
+                    // Tuple item schemas are child-instance schemas, not
+                    // same-instance composition branches.
+                    if let Value::Array(arr) = child {
+                        for item in arr {
+                            close_additional_properties_inner(item, false);
                         }
                     }
                 }
