@@ -185,7 +185,7 @@ ucp-schema lint <path> [options]
 Options:
   --format <text|json>  Output format (default: text)
   --strict              Treat warnings as errors
-  --quiet, -q           Only show errors, suppress progress
+  --quiet, -q           Suppress per-file progress; keep the final summary
 ```
 
 | Code | Category    | Issue                                                          | Severity |
@@ -213,7 +213,7 @@ ucp-schema lint schemas/
 ucp-schema lint schemas/ --strict --format json
 ```
 
-Exit codes: `0` passed, `1` errors found, `2` path not found.
+Exit codes: `0` passed, `1` errors found (or warnings with `--strict`), `2` path not found.
 
 <details>
 <summary>JSON output format</summary>
