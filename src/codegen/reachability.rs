@@ -77,6 +77,8 @@ pub(super) fn select_active_schemas(
     cap_queries: Option<&[String]>,
     ext_queries: Option<&[String]>,
 ) -> Result<(BTreeSet<usize>, BTreeSet<usize>, BTreeSet<String>), CodegenError> {
+    let cap_queries = cap_queries.filter(|q| !q.is_empty());
+    let ext_queries = ext_queries.filter(|q| !q.is_empty());
     let mut active_caps = BTreeSet::new();
     let mut active_exts = BTreeSet::new();
 
@@ -519,6 +521,12 @@ mod tests {
             select_active_schemas(&loaded, None, Some(&exts)).unwrap();
         assert_eq!(all_caps, BTreeSet::from([0]));
         assert_eq!(selected_exts, BTreeSet::from([1]));
+
+        // 3. Empty slices `Some(&[])` normalize to `None` (selecting all capabilities and extensions)
+        let (all_caps_empty, all_exts_empty, _) =
+            select_active_schemas(&loaded, Some(&[]), Some(&[])).unwrap();
+        assert_eq!(all_caps_empty, BTreeSet::from([0]));
+        assert_eq!(all_exts_empty, BTreeSet::from([1]));
     }
 
     #[test]

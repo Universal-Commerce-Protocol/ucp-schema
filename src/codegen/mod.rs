@@ -61,6 +61,12 @@ impl GenerateTypesOptions {
         self
     }
 
+    /// Set the remote schema URL prefix for URL-to-local mapping.
+    pub fn schema_remote_base(mut self, base: impl Into<String>) -> Self {
+        self.schema_remote_base = Some(base.into());
+        self
+    }
+
     /// Set the profile path or URL.
     pub fn profile(mut self, profile: impl Into<String>) -> Self {
         self.profile = Some(profile.into());
@@ -69,13 +75,15 @@ impl GenerateTypesOptions {
 
     /// Set active capability filters (accepts string literals without `.to_string()`).
     pub fn capabilities(mut self, caps: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.capabilities = Some(caps.into_iter().map(Into::into).collect());
+        let collected: Vec<String> = caps.into_iter().map(Into::into).collect();
+        self.capabilities = (!collected.is_empty()).then_some(collected);
         self
     }
 
     /// Set active extension filters (accepts string literals without `.to_string()`).
     pub fn extensions(mut self, exts: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.extensions = Some(exts.into_iter().map(Into::into).collect());
+        let collected: Vec<String> = exts.into_iter().map(Into::into).collect();
+        self.extensions = (!collected.is_empty()).then_some(collected);
         self
     }
 
@@ -144,6 +152,11 @@ impl CodegenError {
 
 /// Compile UCP schemas into a self-contained `$defs` type table and intermediate metadata.
 pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, CodegenError> {
+    if options.profile.is_some() {
+        return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+            message: "--profile mode is not yet implemented (deferred to Task 5)".to_string(),
+        }));
+    }
     let Some(schema_dir) = options.schema_dir.as_deref() else {
         return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
             message: "--schema-dir is required when --profile is not provided".to_string(),
@@ -157,12 +170,11 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
 
     // Stage 1: Entrypoint & Transitive $ref Reachability Crawl
     let loaded = load_all_schemas(schema_dir)?;
-    let (active_cap_indices, active_ext_indices, active_capabilities) = select_active_schemas(
-        &loaded,
-        options.capabilities.as_deref(),
-        options.extensions.as_deref(),
-    )?;
-    let include_all = options.capabilities.is_none() && options.extensions.is_none();
+    let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
+    let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
+    let (active_cap_indices, active_ext_indices, active_capabilities) =
+        select_active_schemas(&loaded, cap_queries, ext_queries)?;
+    let include_all = cap_queries.is_none() && ext_queries.is_none();
     let reachable_indices = compute_reachable_closure(
         &loaded,
         &active_cap_indices,
@@ -388,12 +400,24 @@ mod tests {
     fn options_builders_and_error_exit_codes_behave_as_expected() {
         let opts = GenerateTypesOptions::new()
             .profile("https://example.com/profile.json")
+            .schema_remote_base("https://ucp.dev/draft")
+            .capabilities(Vec::<&str>::new())
+            .extensions(Vec::<&str>::new())
             .title("");
         assert_eq!(
             opts.profile.as_deref(),
             Some("https://example.com/profile.json")
         );
+        assert_eq!(
+            opts.schema_remote_base.as_deref(),
+            Some("https://ucp.dev/draft")
+        );
+        assert!(opts.capabilities.is_none());
+        assert!(opts.extensions.is_none());
         assert_eq!(opts.title, "");
+
+        let profile_err = compile_types(&opts).expect_err("profile guard must error before Task 5");
+        assert_eq!(profile_err.exit_code(), 2);
 
         let no_rest = CodegenError::NoRestServiceBinding {
             profile: "p".to_string(),
