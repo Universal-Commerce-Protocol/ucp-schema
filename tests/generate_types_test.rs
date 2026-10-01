@@ -19,11 +19,19 @@ fn collect_schema_refs_and_annotations(
     val: &Value,
     refs: &mut Vec<String>,
     annotations: &mut Vec<String>,
+    hybrid_ref_props: &mut usize,
+    allof_branch_titles: &mut Vec<String>,
 ) {
     let Some(obj) = val.as_object() else {
         if let Some(arr) = val.as_array() {
             for item in arr {
-                collect_schema_refs_and_annotations(item, refs, annotations);
+                collect_schema_refs_and_annotations(
+                    item,
+                    refs,
+                    annotations,
+                    hybrid_ref_props,
+                    allof_branch_titles,
+                );
             }
         }
         return;
@@ -31,6 +39,16 @@ fn collect_schema_refs_and_annotations(
 
     if let Some(Value::String(r)) = obj.get("$ref") {
         refs.push(r.clone());
+        if obj.contains_key("properties") {
+            *hybrid_ref_props += 1;
+        }
+    }
+    if let Some(Value::Array(all_of)) = obj.get("allOf") {
+        for branch in all_of.iter().filter_map(Value::as_object) {
+            if let Some(Value::String(t)) = branch.get("title") {
+                allof_branch_titles.push(t.clone());
+            }
+        }
     }
     for key in obj.keys() {
         if key == "ucp_request"
@@ -49,25 +67,59 @@ fn collect_schema_refs_and_annotations(
         if k == "properties" || k == "$defs" || k == "definitions" || k == "patternProperties" {
             if let Some(map) = v.as_object() {
                 for child in map.values() {
-                    collect_schema_refs_and_annotations(child, refs, annotations);
+                    collect_schema_refs_and_annotations(
+                        child,
+                        refs,
+                        annotations,
+                        hybrid_ref_props,
+                        allof_branch_titles,
+                    );
                 }
             }
             continue;
         }
-        collect_schema_refs_and_annotations(v, refs, annotations);
+        collect_schema_refs_and_annotations(
+            v,
+            refs,
+            annotations,
+            hybrid_ref_props,
+            allof_branch_titles,
+        );
     }
 }
 
 fn assert_bundle_invariants(defs: &std::collections::BTreeMap<String, Value>) {
     let known: BTreeSet<&str> = defs.keys().map(String::as_str).collect();
     for (def_name, schema_val) in defs {
+        assert_eq!(
+            schema_val.get("title").and_then(Value::as_str),
+            Some(def_name.as_str()),
+            "def '{def_name}' must have canonical title equal to its $defs key"
+        );
+
         let mut refs = Vec::new();
         let mut annotations = Vec::new();
-        collect_schema_refs_and_annotations(schema_val, &mut refs, &mut annotations);
+        let mut hybrid_ref_props = 0;
+        let mut allof_branch_titles = Vec::new();
+        collect_schema_refs_and_annotations(
+            schema_val,
+            &mut refs,
+            &mut annotations,
+            &mut hybrid_ref_props,
+            &mut allof_branch_titles,
+        );
 
         assert!(
             annotations.is_empty(),
             "def '{def_name}' still contains UCP annotations: {annotations:?}"
+        );
+        assert_eq!(
+            hybrid_ref_props, 0,
+            "def '{def_name}' contains hybrid $ref + inline properties node(s)"
+        );
+        assert!(
+            allof_branch_titles.is_empty(),
+            "def '{def_name}' contains inline allOf branch title(s): {allof_branch_titles:?}"
         );
 
         for r in refs {
@@ -260,16 +312,31 @@ fn ucp_corpus_multi_extension_and_container_composition() {
     let bundle = generate_types(&opts).unwrap();
     assert_bundle_invariants(&bundle.defs);
 
-    // 1. BuyerConsent composed in-place into Buyer and overrides CheckoutCompleteRequest.buyer
+    // 1. BuyerConsent composed in-place into Buyer and overrides CheckoutCompleteRequest.buyer;
+    // unreachable ConsentPurpose*Request slices and inlined Fulfillment*Request/Response mixins are pruned
     assert_eq!(
         bundle.defs["Buyer"]["properties"]["consent"]["$ref"],
         "#/$defs/Consent"
     );
     assert!(bundle.defs.contains_key("ConsentPurpose"));
-    assert!(bundle.defs.contains_key("ConsentPurposeCreateRequest"));
-    assert!(bundle.defs["ConsentPurposeCreateRequest"]["properties"]
-        .get("description")
-        .is_none());
+    assert!(bundle.defs.contains_key("ConsentSegment"));
+    for pruned in [
+        "ConsentPurposeCreateRequest",
+        "ConsentPurposeUpdateRequest",
+        "ConsentSegmentCreateRequest",
+        "ConsentSegmentUpdateRequest",
+        "FulfillmentSearchRequest",
+        "FulfillmentSearchResponse",
+        "FulfillmentLookupRequest",
+        "FulfillmentLookupResponse",
+        "FulfillmentGetProductRequest",
+        "FulfillmentGetProductResponse",
+    ] {
+        assert!(
+            !bundle.defs.contains_key(pruned),
+            "expected dead/unreferenced def '{pruned}' to be pruned"
+        );
+    }
     assert!(
         bundle.defs["CheckoutCompleteRequest"]["properties"]
             .get("buyer")
@@ -277,10 +344,17 @@ fn ucp_corpus_multi_extension_and_container_composition() {
         "buyer_consent sets buyer.ucp_request.complete = optional"
     );
 
-    // 2. PaymentTerms composed in-place into Payment and sliced directionally
+    // 2. PaymentTerms and PaymentSplitPayments composed in-place into Payment (without hybrid $ref + properties on Checkout.properties.payment)
+    assert!(bundle.defs["Checkout"]["properties"]["payment"]
+        .get("properties")
+        .is_none());
     assert!(bundle.defs["Payment"]["properties"]
         .get("instruments")
         .is_some());
+    assert_eq!(
+        bundle.defs["Payment"]["properties"]["instruments"]["items"]["$ref"],
+        "#/$defs/SelectedPaymentInstrument"
+    );
     assert!(bundle.defs["Payment"]["properties"].get("terms").is_some());
     assert!(bundle.defs["Payment"]["properties"]
         .get("selected_term_id")
@@ -294,6 +368,10 @@ fn ucp_corpus_multi_extension_and_container_composition() {
     assert!(bundle.defs["PaymentUpdateRequest"]["properties"]
         .get("selected_term_id")
         .is_some());
+    assert_eq!(
+        bundle.defs["PaymentCompleteRequest"]["required"],
+        serde_json::json!(["instruments"])
+    );
 
     // 3. PaymentSplitPayments composed in-place into PaymentInstrument and role schema hoisted
     assert_eq!(
@@ -371,6 +449,9 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         // Standalone map-valued schema with $defs
         "Actions",
         "Instance",
+        // Lodging cancellation policy item wired into Policy.allOf
+        "Policy",
+        "CancellationItem",
         // Container capabilities
         "CatalogSearchRequest",
         "CatalogSearchResponse",
@@ -389,16 +470,55 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         );
     }
 
-    // Verify payment_authentication.json merges inline properties onto Checkout.properties.actions
-    assert!(
-        bundle.defs["Checkout"]["properties"]["actions"]["properties"]
-            .get("dev.ucp.common.payment.device_data_collection")
-            .is_some()
+    // Verify inlined mixin defs and unreachable non-capability request slices are pruned
+    for pruned in [
+        "PaymentActions",
+        "FulfillmentSearchRequest",
+        "FulfillmentSearchResponse",
+        "FulfillmentLookupRequest",
+        "FulfillmentLookupResponse",
+        "FulfillmentGetProductRequest",
+        "FulfillmentGetProductResponse",
+        "LocationCreateRequest",
+        "LocationUpdateRequest",
+        "DailyHourCreateRequest",
+        "DailyHourUpdateRequest",
+        "ExceptionHourCreateRequest",
+        "ExceptionHourUpdateRequest",
+        "StayCompleteRequest",
+        "TokenCredentialCreateRequest",
+        "TokenCredentialUpdateRequest",
+        "TokenCredentialCompleteRequest",
+    ] {
+        assert!(
+            !bundle.defs.contains_key(pruned),
+            "expected unreferenced def '{pruned}' to be pruned from full corpus bundle"
+        );
+    }
+
+    // Verify payment_authentication.json merges action properties into Actions (leaving Checkout.properties.actions as a pure $ref)
+    assert!(bundle.defs["Checkout"]["properties"]["actions"]
+        .get("properties")
+        .is_none());
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["actions"]["$ref"],
+        "#/$defs/Actions"
     );
-    assert!(
-        bundle.defs["Checkout"]["properties"]["actions"]["properties"]
-            .get("dev.ucp.common.payment.three_ds_challenge")
-            .is_some()
+    assert!(bundle.defs["Actions"]["properties"]
+        .get("dev.ucp.common.payment.device_data_collection")
+        .is_some());
+    assert!(bundle.defs["Actions"]["properties"]
+        .get("dev.ucp.common.payment.three_ds_challenge")
+        .is_some());
+
+    // Verify lodging/policy_cancellation.json attaches its conditional if/then branch to Policy.allOf
+    assert_eq!(
+        bundle.defs["Booking"]["properties"]["policies"]["items"],
+        serde_json::json!({ "$ref": "#/$defs/Policy" })
+    );
+    assert_eq!(
+        bundle.defs["Policy"]["allOf"][0]["then"]["$ref"],
+        "#/$defs/CancellationItem"
     );
 
     // Verify payment_ap2_mandate.json response-only Ap2WithMerchantAuthorization is omitted from CheckoutCompleteRequest.properties.ap2.allOf

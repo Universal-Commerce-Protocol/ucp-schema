@@ -197,6 +197,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     )?;
 
     // Stage 3: Capability & Sub-Type Extension Composition
+    let mut inlined_mixin_defs = BTreeSet::new();
     let (capability_resources, container_schemas) = compose_active_extensions(
         &loaded,
         &working_schemas,
@@ -205,6 +206,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         pending_overlays,
         &mut root_raw_schemas,
         &mut defs,
+        &mut inlined_mixin_defs,
     )?;
 
     // Stage 4: Inline Conditional Variant Hoisting (added in Phase 3 / Task 6)
@@ -223,8 +225,19 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
 
-    // Stage 8: Empty-Object Pruning (retaining ErrorResponse)
-    prune_empty_object_defs(&mut defs);
+    // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning
+    let active_cap_root_requests: BTreeSet<String> = active_cap_indices
+        .iter()
+        .flat_map(|&idx| {
+            let stem = &loaded[idx].stem_pascal;
+            [
+                format!("{stem}CreateRequest"),
+                format!("{stem}UpdateRequest"),
+                format!("{stem}CompleteRequest"),
+            ]
+        })
+        .collect();
+    prune_empty_object_defs(&mut defs, &inlined_mixin_defs, &active_cap_root_requests);
 
     Ok(CompiledTypes {
         defs,
@@ -305,22 +318,41 @@ fn align_all_directional_refs(
     }
 }
 
-fn prune_empty_object_defs(defs: &mut BTreeMap<String, Value>) {
-    let mut referenced = BTreeSet::new();
-    for val in defs.values() {
-        for_each_schema_object(val, &mut |obj| {
-            if let Some(target) = obj
-                .get("$ref")
-                .and_then(Value::as_str)
-                .and_then(|r| r.strip_prefix("#/$defs/"))
-            {
-                referenced.insert(target.to_string());
+fn prune_empty_object_defs(
+    defs: &mut BTreeMap<String, Value>,
+    inlined_mixin_defs: &BTreeSet<String>,
+    active_cap_root_requests: &BTreeSet<String>,
+) {
+    loop {
+        let mut referenced = BTreeSet::new();
+        for val in defs.values() {
+            for_each_schema_object(val, &mut |obj| {
+                if let Some(target) = obj
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|r| r.strip_prefix("#/$defs/"))
+                {
+                    referenced.insert(target.to_string());
+                }
+            });
+        }
+        let before = defs.len();
+        defs.retain(|name, val| {
+            if name == "ErrorResponse" || referenced.contains(name) {
+                return true;
             }
+            if is_empty_object_schema(val) || inlined_mixin_defs.contains(name) {
+                return false;
+            }
+            let is_request_slice = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
+                .iter()
+                .any(|s| name.ends_with(s));
+            !(is_request_slice && !active_cap_root_requests.contains(name))
         });
+        if defs.len() == before {
+            break;
+        }
     }
-    defs.retain(|name, val| {
-        name == "ErrorResponse" || referenced.contains(name) || !is_empty_object_schema(val)
-    });
 }
 
 fn is_empty_object_schema(val: &Value) -> bool {
@@ -363,6 +395,25 @@ mod tests {
                 json!({ "type": "object", "properties": {}, "additionalProperties": true }),
             ),
             (
+                "InlinedMixin".to_string(),
+                json!({ "type": "object", "properties": { "x": { "type": "string" } } }),
+            ),
+            (
+                "DeadChildCreateRequest".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "leaf": { "$ref": "#/$defs/DeadLeafCreateRequest" } }
+                }),
+            ),
+            (
+                "DeadLeafCreateRequest".to_string(),
+                json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+            ),
+            (
+                "CheckoutCreateRequest".to_string(),
+                json!({ "type": "object", "properties": { "id": { "type": "string" } } }),
+            ),
+            (
                 "ReferencedEmpty".to_string(),
                 json!({ "type": "object", "additionalProperties": true }),
             ),
@@ -387,9 +438,17 @@ mod tests {
             ),
         ]);
 
-        prune_empty_object_defs(&mut defs);
+        prune_empty_object_defs(
+            &mut defs,
+            &BTreeSet::from(["InlinedMixin".to_string()]),
+            &BTreeSet::from(["CheckoutCreateRequest".to_string()]),
+        );
 
         assert!(!defs.contains_key("UnreferencedEmpty"));
+        assert!(!defs.contains_key("InlinedMixin"));
+        assert!(!defs.contains_key("DeadChildCreateRequest"));
+        assert!(!defs.contains_key("DeadLeafCreateRequest"));
+        assert!(defs.contains_key("CheckoutCreateRequest"));
         assert!(defs.contains_key("ReferencedEmpty"));
         assert!(defs.contains_key("ErrorResponse"));
         assert!(defs.contains_key("ActionsMap"));
