@@ -410,16 +410,16 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
 }
 
 #[test]
-fn ucp_corpus_short_names_reclassification_and_cart_checkout_overlay() {
+fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
     let Some(schema_dir) = ucp_schemas_dir() else {
         return;
     };
 
-    // 1. Passing --capability checkout with extensions: None excludes unrequested extensions
+    // 1. Passing --capability dev.ucp.shopping.checkout with extensions: None excludes unrequested extensions
     let checkout_only = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
-            .capabilities(["checkout"]),
+            .capabilities(["dev.ucp.shopping.checkout"]),
     )
     .unwrap();
     assert_bundle_invariants(&checkout_only.defs);
@@ -430,11 +430,11 @@ fn ucp_corpus_short_names_reclassification_and_cart_checkout_overlay() {
         .get("fulfillment")
         .is_none());
 
-    // 2. Passing an extension ("fulfillment") via capabilities reclassifies it into active extensions
+    // 2. Passing an extension ("dev.ucp.shopping.fulfillment") via capabilities reclassifies it into active extensions
     let reclassified = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
-            .capabilities(["checkout", "fulfillment"]),
+            .capabilities(["dev.ucp.shopping.checkout", "dev.ucp.shopping.fulfillment"]),
     )
     .unwrap();
     assert_bundle_invariants(&reclassified.defs);
@@ -446,12 +446,12 @@ fn ucp_corpus_short_names_reclassification_and_cart_checkout_overlay() {
         .get("discounts")
         .is_none());
 
-    // 3. Passing --capability cart alone does not pull in Checkout; passing both cart and checkout
+    // 3. Passing --capability dev.ucp.shopping.cart alone does not pull in Checkout; passing both cart and checkout
     // composes cart.json#/$defs/checkout (adding cart_id) into Checkout.
     let cart_only = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
-            .capabilities(["cart"]),
+            .capabilities(["dev.ucp.shopping.cart"]),
     )
     .unwrap();
     assert_bundle_invariants(&cart_only.defs);
@@ -461,7 +461,7 @@ fn ucp_corpus_short_names_reclassification_and_cart_checkout_overlay() {
     let cart_and_checkout = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
-            .capabilities(["cart", "checkout"]),
+            .capabilities(["dev.ucp.shopping.cart", "dev.ucp.shopping.checkout"]),
     )
     .unwrap();
     assert_bundle_invariants(&cart_and_checkout.defs);
@@ -471,4 +471,13 @@ fn ucp_corpus_short_names_reclassification_and_cart_checkout_overlay() {
             .is_some(),
         "expected cart.json#/$defs/checkout overlay to add cart_id to CheckoutCreateRequest"
     );
+
+    // 4. Short names ("checkout") are rejected with InvalidCapability
+    let err = generate_types(
+        &GenerateTypesOptions::new()
+            .schema_dir(&schema_dir)
+            .capabilities(["checkout"]),
+    )
+    .expect_err("short capability names must be rejected");
+    assert_eq!(err.exit_code(), 2);
 }

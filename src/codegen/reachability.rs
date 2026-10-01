@@ -7,7 +7,7 @@ use serde_json::{Map, Value};
 
 use crate::codegen::normalizer::{is_reverse_domain_name, to_pascal_case};
 use crate::codegen::CodegenError;
-use crate::compose::{capability_short_name, is_container_schema};
+use crate::compose::is_container_schema;
 use crate::error::ComposeError;
 use crate::loader::{collect_schema_files, for_each_schema_object, load_schema};
 
@@ -85,7 +85,7 @@ pub(super) fn select_active_schemas(
     match cap_queries {
         Some(queries) => {
             for query in queries {
-                let idx = find_matching_schema(loaded, query, false).ok_or_else(|| {
+                let idx = find_matching_schema(loaded, query).ok_or_else(|| {
                     CodegenError::ComposeError(ComposeError::InvalidCapability {
                         name: query.clone(),
                         message: "capability schema not found in schema_dir".to_string(),
@@ -111,7 +111,7 @@ pub(super) fn select_active_schemas(
     match ext_queries {
         Some(queries) => {
             for query in queries {
-                let idx = find_matching_schema(loaded, query, true).ok_or_else(|| {
+                let idx = find_matching_schema(loaded, query).ok_or_else(|| {
                     CodegenError::ComposeError(ComposeError::InvalidCapability {
                         name: query.clone(),
                         message: "extension schema not found in schema_dir".to_string(),
@@ -137,7 +137,6 @@ pub(super) fn select_active_schemas(
         active_capabilities.insert(item.stem.clone());
         if let Some(name) = &item.name {
             active_capabilities.insert(name.clone());
-            active_capabilities.insert(capability_short_name(name));
         }
     }
 
@@ -221,9 +220,7 @@ pub(super) fn compute_inactive_local_defs(
         if !is_reverse_domain_name(k) {
             continue;
         }
-        let is_active = item.name.as_deref() == Some(k.as_str())
-            || active_capabilities.contains(k)
-            || active_capabilities.contains(&capability_short_name(k));
+        let is_active = item.name.as_deref() == Some(k.as_str()) || active_capabilities.contains(k);
         if is_active {
             active_seeds.push(v);
         } else {
@@ -322,47 +319,11 @@ fn is_container_capability(schema: &Value, is_extension: bool, in_types_dir: boo
         .is_some_and(|defs| defs.keys().any(|k| is_container_op_key(k)))
 }
 
-fn find_matching_schema(
-    loaded: &[LoadedSchema],
-    query: &str,
-    prefer_extension: bool,
-) -> Option<usize> {
-    let trimmed = query.trim().trim_end_matches(".json");
-    if let Some((idx, _)) = loaded
+fn find_matching_schema(loaded: &[LoadedSchema], query: &str) -> Option<usize> {
+    let trimmed = query.trim();
+    loaded
         .iter()
-        .enumerate()
-        .find(|(_, item)| item.name.as_deref() == Some(trimmed))
-    {
-        return Some(idx);
-    }
-
-    let short = capability_short_name(trimmed);
-    let candidates: Vec<usize> = loaded
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| {
-            item.stem == trimmed
-                || item.stem == short
-                || item
-                    .name
-                    .as_deref()
-                    .is_some_and(|n| capability_short_name(n) == short)
-        })
-        .map(|(idx, _)| idx)
-        .collect();
-
-    if let Some(&idx) = candidates
-        .iter()
-        .find(|&&i| prefer_extension && loaded[i].is_extension)
-    {
-        return Some(idx);
-    }
-    candidates
-        .iter()
-        .find(|&&i| loaded[i].name.is_some())
-        .or_else(|| candidates.iter().find(|&&i| !loaded[i].in_types_dir))
-        .or_else(|| candidates.first())
-        .copied()
+        .position(|item| item.name.as_deref() == Some(trimmed))
 }
 
 fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) -> BTreeSet<String> {
@@ -430,8 +391,7 @@ fn collect_active_external_refs(
             }
             if is_reverse_domain_name(def_k) {
                 let is_active = item.name.as_deref() == Some(def_k.as_str())
-                    || active_capabilities.contains(def_k)
-                    || active_capabilities.contains(&capability_short_name(def_k));
+                    || active_capabilities.contains(def_k);
                 if !is_active {
                     continue;
                 }
@@ -507,7 +467,10 @@ mod tests {
         ];
 
         // 1. Passing an extension in `cap_queries` reclassifies it into `active_exts`
-        let caps = vec!["checkout.json".to_string(), "discount".to_string()];
+        let caps = vec![
+            "dev.ucp.shopping.checkout".to_string(),
+            "dev.ucp.shopping.discount".to_string(),
+        ];
         let (active_caps, active_exts, active_names) =
             select_active_schemas(&loaded, Some(&caps), None).unwrap();
         assert_eq!(active_caps, BTreeSet::from([0]));
@@ -515,8 +478,8 @@ mod tests {
         assert!(active_names.contains("checkout"));
         assert!(active_names.contains("dev.ucp.shopping.checkout"));
 
-        // 2. `cap_queries: None` with explicit `ext_queries` activates all capabilities and prefers extension over types/
-        let exts = vec!["discount".to_string()];
+        // 2. `cap_queries: None` with explicit `ext_queries` activates all capabilities and selects requested extensions
+        let exts = vec!["dev.ucp.shopping.discount".to_string()];
         let (all_caps, selected_exts, _) =
             select_active_schemas(&loaded, None, Some(&exts)).unwrap();
         assert_eq!(all_caps, BTreeSet::from([0]));
@@ -527,6 +490,14 @@ mod tests {
             select_active_schemas(&loaded, Some(&[]), Some(&[])).unwrap();
         assert_eq!(all_caps_empty, BTreeSet::from([0]));
         assert_eq!(all_exts_empty, BTreeSet::from([1]));
+
+        // 4. Short names ("checkout") are rejected with InvalidCapability
+        let err = select_active_schemas(&loaded, Some(&["checkout".to_string()]), None)
+            .expect_err("short capability names must be rejected");
+        assert!(matches!(
+            err,
+            CodegenError::ComposeError(ComposeError::InvalidCapability { .. })
+        ));
     }
 
     #[test]
@@ -655,7 +626,10 @@ mod tests {
             &loaded,
             &BTreeSet::from([2]),
             &BTreeSet::from([5]),
-            &BTreeSet::from(["checkout".to_string()]),
+            &BTreeSet::from([
+                "checkout".to_string(),
+                "dev.ucp.shopping.checkout".to_string(),
+            ]),
             false,
         );
         // Ambient root ucp.json (0), checkout.json (2), buyer.json (3), ext.json (5) are reachable;
