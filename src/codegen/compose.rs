@@ -204,6 +204,23 @@ fn merge_extension_property(base_prop: &mut Value, ext_prop: &Value) {
     if let Some(ext_items) = ext_obj.get("items").filter(|i| i.get("$ref").is_some()) {
         base_obj.insert("items".to_string(), ext_items.clone());
     }
+    let Some(Value::Object(ext_sub)) = ext_obj.get("properties") else {
+        return;
+    };
+    let Some(base_sub) = base_obj
+        .entry("properties".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+    else {
+        return;
+    };
+    for (k, v) in ext_sub {
+        if let Some(existing) = base_sub.get_mut(k) {
+            merge_extension_property(existing, v);
+        } else {
+            base_sub.insert(k.clone(), v.clone());
+        }
+    }
 }
 
 fn compose_container_capability(
