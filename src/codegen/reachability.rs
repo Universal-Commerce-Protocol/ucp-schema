@@ -231,11 +231,16 @@ pub(super) fn compute_inactive_local_defs(
     let used_by_active = transitive_local_def_refs(&active_seeds, defs_obj);
     let used_by_inactive = transitive_local_def_refs(&inactive_seeds, defs_obj);
 
-    for def_key in defs_obj.keys() {
-        if !is_reverse_domain_name(def_key)
-            && used_by_inactive.contains(def_key)
-            && !used_by_active.contains(def_key)
-        {
+    for (def_key, def_val) in defs_obj {
+        if is_reverse_domain_name(def_key) || used_by_active.contains(def_key) {
+            continue;
+        }
+        let is_external_ref_alias = def_val
+            .as_object()
+            .and_then(|o| o.get("$ref"))
+            .and_then(Value::as_str)
+            .is_some_and(|r| !r.starts_with('#'));
+        if used_by_inactive.contains(def_key) || is_external_ref_alias {
             inactive.insert(def_key.clone());
         }
     }
