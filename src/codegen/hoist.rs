@@ -32,6 +32,7 @@ pub(super) fn hoist_defs(
     active_ext_indices: &BTreeSet<usize>,
     active_capabilities: &BTreeSet<String>,
     defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<
     (
         BTreeMap<usize, Value>,
@@ -96,7 +97,12 @@ pub(super) fn hoist_defs(
             ) {
                 LocalDefAction::Skip => continue,
                 LocalDefAction::RoleContainer => {
-                    hoist_self_named_role_schemas(&item.stem_pascal, def_val, defs)?;
+                    hoist_self_named_role_schemas(
+                        &item.stem_pascal,
+                        def_val,
+                        defs,
+                        sliced_base_names,
+                    )?;
                 }
                 LocalDefAction::Overlay(target_pascal) => {
                     let mut overlay = def_val.clone();
@@ -113,6 +119,7 @@ pub(super) fn hoist_defs(
                         &hoisted_name,
                         &item.stem_pascal,
                         defs,
+                        sliced_base_names,
                     )?;
                 }
             }
@@ -163,7 +170,14 @@ fn classify_local_def(
         return LocalDefAction::Skip;
     }
     let target_pascal = to_pascal_case(def_key);
-    if is_active_source && is_inplace_overlay(item, &target_pascal, def_val, standalone_type_names)
+    if is_active_source
+        && is_inplace_overlay(
+            item,
+            def_key,
+            &target_pascal,
+            def_val,
+            standalone_type_names,
+        )
     {
         return LocalDefAction::Overlay(target_pascal);
     }
@@ -186,6 +200,7 @@ fn is_pure_reexport_def(parent_pascal: &str, def_key: &str, def_val: &Value) -> 
 
 fn is_inplace_overlay(
     item: &LoadedSchema,
+    def_key: &str,
     target_pascal: &str,
     def_val: &Value,
     standalone_type_names: &BTreeSet<String>,
@@ -206,10 +221,32 @@ fn is_inplace_overlay(
                     })
                 })
             });
-    has_allof_ref_to_target
-        || (item.is_extension
-            && (obj.get("type").and_then(Value::as_str) == Some("object")
-                || obj.contains_key("properties")))
+    if has_allof_ref_to_target {
+        return true;
+    }
+    if !item.is_extension
+        || !(obj.get("type").and_then(Value::as_str) == Some("object")
+            || obj.contains_key("properties"))
+    {
+        return false;
+    }
+    let expected_ref = format!("#/$defs/{def_key}");
+    item.schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .is_some_and(|defs| {
+            defs.iter()
+                .filter(|(k, _)| is_reverse_domain_name(k))
+                .any(|(_, v)| {
+                    let mut found = false;
+                    crate::loader::for_each_schema_object(v, &mut |sub| {
+                        if sub.get("$ref").and_then(Value::as_str) == Some(&expected_ref) {
+                            found = true;
+                        }
+                    });
+                    found
+                })
+        })
 }
 
 fn compute_collision_renames(
@@ -251,10 +288,13 @@ fn compute_collision_renames(
             continue;
         }
         let parent_pascal = &loaded[idx].stem_pascal;
-        renames.insert(
-            (idx, def_key.clone()),
-            format!("{parent_pascal}{}", to_pascal_case(&def_key)),
-        );
+        let def_pascal = to_pascal_case(&def_key);
+        let qualified = if def_pascal.starts_with(parent_pascal) {
+            def_pascal
+        } else {
+            format!("{parent_pascal}{def_pascal}")
+        };
+        renames.insert((idx, def_key), qualified);
     }
     renames
 }
@@ -308,6 +348,7 @@ fn hoist_self_named_role_schemas(
     stem_pascal: &str,
     role_container: &Value,
     defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
     let Some(obj) = role_container.as_object() else {
         return Ok(());
@@ -317,7 +358,13 @@ fn hoist_self_named_role_schemas(
             continue;
         };
         let hoisted_name = qualify_def_name(stem_pascal, role_key);
-        insert_sliced_or_normalized_def(role_val, &hoisted_name, stem_pascal, defs)?;
+        insert_sliced_or_normalized_def(
+            role_val,
+            &hoisted_name,
+            stem_pascal,
+            defs,
+            sliced_base_names,
+        )?;
     }
     Ok(())
 }
@@ -327,8 +374,10 @@ fn insert_sliced_or_normalized_def(
     hoisted_name: &str,
     parent_pascal: &str,
     defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
     if has_directional_annotations(raw_val) {
+        sliced_base_names.insert(hoisted_name.to_string());
         let mut prepared = raw_val.clone();
         rewrite_refs_to_defs(&mut prepared, hoisted_name, Some(parent_pascal));
         for (slice_name, slice_val) in slice_directional_schemas(&prepared, hoisted_name)? {
@@ -428,6 +477,7 @@ mod tests {
         let active_exts = BTreeSet::new();
         let active_names = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
         let mut defs = BTreeMap::new();
+        let mut sliced_base_names = BTreeSet::new();
 
         let (_, root_raw, overlays) = hoist_defs(
             &loaded,
@@ -436,6 +486,7 @@ mod tests {
             &active_exts,
             &active_names,
             &mut defs,
+            &mut sliced_base_names,
         )
         .unwrap();
 

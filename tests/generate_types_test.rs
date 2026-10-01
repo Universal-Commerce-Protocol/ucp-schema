@@ -385,6 +385,28 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
             "expected '{expected}' in full corpus bundle.defs"
         );
     }
+
+    // Verify payment_authentication.json merges inline properties onto Checkout.properties.actions
+    assert!(
+        bundle.defs["Checkout"]["properties"]["actions"]["properties"]
+            .get("dev.ucp.common.payment.device_data_collection")
+            .is_some()
+    );
+    assert!(
+        bundle.defs["Checkout"]["properties"]["actions"]["properties"]
+            .get("dev.ucp.common.payment.three_ds_challenge")
+            .is_some()
+    );
+
+    // Verify payment_ap2_mandate.json response-only Ap2WithMerchantAuthorization is omitted from CheckoutCompleteRequest.properties.ap2.allOf
+    let complete_ap2_allof = bundle.defs["CheckoutCompleteRequest"]["properties"]["ap2"]["allOf"]
+        .as_array()
+        .expect("CheckoutCompleteRequest.properties.ap2.allOf must be an array");
+    assert_eq!(complete_ap2_allof.len(), 1);
+    assert_eq!(
+        complete_ap2_allof[0]["$ref"],
+        "#/$defs/Ap2WithCheckoutMandateCompleteRequest"
+    );
 }
 
 #[test]
