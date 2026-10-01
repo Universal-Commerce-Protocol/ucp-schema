@@ -14,6 +14,8 @@ use crate::codegen::reachability::{
 };
 use crate::codegen::CodegenError;
 use crate::loader::for_each_schema_object_mut;
+use crate::resolver::resolve;
+use crate::types::{Direction, ResolveOptions};
 
 const ROLE_SCHEMA_KEYS: &[&str] = &["platform_schema", "business_schema", "response_schema"];
 
@@ -114,13 +116,23 @@ pub(super) fn hoist_defs(
                         .get(&(idx, def_key.clone()))
                         .cloned()
                         .unwrap_or(default_name);
-                    insert_sliced_or_normalized_def(
-                        def_val,
-                        &hoisted_name,
-                        &item.stem_pascal,
-                        defs,
-                        sliced_base_names,
-                    )?;
+                    if item.stem == "ucp" {
+                        insert_ucp_def(
+                            def_key,
+                            def_val,
+                            defs_obj.get("base"),
+                            &hoisted_name,
+                            defs,
+                        )?;
+                    } else {
+                        insert_sliced_or_normalized_def(
+                            def_val,
+                            &hoisted_name,
+                            &item.stem_pascal,
+                            defs,
+                            sliced_base_names,
+                        )?;
+                    }
                 }
             }
         }
@@ -392,6 +404,51 @@ fn insert_sliced_or_normalized_def(
     Ok(())
 }
 
+fn insert_ucp_def(
+    def_key: &str,
+    raw_val: &Value,
+    raw_ucp_base: Option<&Value>,
+    hoisted_name: &str,
+    defs: &mut BTreeMap<String, Value>,
+) -> Result<(), CodegenError> {
+    let mut prepared = raw_val.clone();
+    let is_request_envelope = def_key.starts_with("request_");
+    let is_response_envelope = def_key.starts_with("response_");
+
+    if (is_request_envelope || is_response_envelope) && def_key != "base" {
+        if let Some(base_val) = raw_ucp_base.and_then(Value::as_object) {
+            for_each_schema_object_mut(&mut prepared, &mut |obj| {
+                let is_base_ref = obj
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r == "#/$defs/base" || r == "#/$defs/UcpBase");
+                if !is_base_ref {
+                    return;
+                }
+                obj.remove("$ref");
+                for (k, v) in base_val {
+                    obj.entry(k.clone()).or_insert_with(|| v.clone());
+                }
+            });
+        }
+    }
+
+    if is_request_envelope || is_response_envelope || has_directional_annotations(&prepared) {
+        let opts = if is_request_envelope {
+            ResolveOptions::new(Direction::Request, "create")
+        } else {
+            ResolveOptions::new(Direction::Response, "read")
+        };
+        prepared = resolve(&prepared, &opts)?;
+    }
+
+    defs.insert(
+        hoisted_name.to_string(),
+        normalize_def_schema(&prepared, hoisted_name, Some("Ucp")),
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -512,5 +569,83 @@ mod tests {
             root_raw["Beta"].1["properties"]["alpha_detail"]["$ref"],
             "#/$defs/AlphaSharedDetail"
         );
+    }
+
+    #[test]
+    fn hoist_defs_resolves_ucp_envelopes_without_create_or_update_suffixes() {
+        let loaded = vec![make_loaded(
+            "/schemas/ucp.json",
+            "ucp",
+            None,
+            false,
+            json!({
+                "$defs": {
+                    "base": {
+                        "type": "object",
+                        "required": ["version"],
+                        "properties": {
+                            "version": { "type": "string" },
+                            "map_order": {
+                                "type": "object",
+                                "ucp_request": "omit"
+                            }
+                        }
+                    },
+                    "request_checkout_schema": {
+                        "allOf": [
+                            { "$ref": "#/$defs/base" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "capabilities": { "type": "object" }
+                                }
+                            }
+                        ]
+                    },
+                    "response_checkout_schema": {
+                        "allOf": [
+                            { "$ref": "#/$defs/base" },
+                            {
+                                "type": "object",
+                                "required": ["payment_handlers"],
+                                "properties": {
+                                    "payment_handlers": { "type": "object" }
+                                }
+                            }
+                        ]
+                    }
+                }
+            }),
+        )];
+
+        let reachable = BTreeSet::from([0]);
+        let mut defs = BTreeMap::new();
+        let mut sliced_base_names = BTreeSet::new();
+
+        hoist_defs(
+            &loaded,
+            &reachable,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            &mut defs,
+            &mut sliced_base_names,
+        )
+        .unwrap();
+
+        assert!(defs.contains_key("UcpBase"));
+        assert!(!defs.contains_key("UcpBaseCreateRequest"));
+        assert!(!defs.contains_key("UcpBaseUpdateRequest"));
+        assert!(!sliced_base_names.contains("UcpBase"));
+
+        // RequestCheckoutSchema resolves inherited base with request visibility (omits map_order)
+        let req_base = &defs["RequestCheckoutSchema"]["allOf"][0];
+        assert!(req_base["properties"].get("version").is_some());
+        assert!(req_base["properties"].get("map_order").is_none());
+
+        // ResponseCheckoutSchema resolves inherited base with response visibility (retains map_order)
+        let resp_base = &defs["ResponseCheckoutSchema"]["allOf"][0];
+        assert!(resp_base["properties"].get("version").is_some());
+        assert!(resp_base["properties"].get("map_order").is_some());
     }
 }
