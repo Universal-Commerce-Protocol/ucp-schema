@@ -150,6 +150,11 @@ pub fn strip_ucp_keywords(value: &mut Value) {
             }
         }
         obj.retain(|k, _| !k.starts_with("x-ucp-"));
+        if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
+            for branch in all_of.iter_mut().filter_map(Value::as_object_mut) {
+                branch.remove("title");
+            }
+        }
         prune_dangling_required(obj);
     });
 }
@@ -158,13 +163,14 @@ pub fn strip_ucp_keywords(value: &mut Value) {
 pub fn rewrite_refs_to_defs(value: &mut Value, current_def: &str, parent_name: Option<&str>) {
     let effective_parent = parent_name.unwrap_or(current_def);
     for_each_schema_object_mut(value, &mut |obj| {
-        if let Some(Value::String(ref_str)) = obj.get("$ref") {
-            let target = ref_to_def_name(ref_str, Some(effective_parent));
-            obj.insert(
-                "$ref".to_string(),
-                Value::String(format!("#/$defs/{target}")),
-            );
-        }
+        let Some(Value::String(ref_str)) = obj.get("$ref") else {
+            return;
+        };
+        let target = ref_to_def_name(ref_str, Some(effective_parent));
+        obj.insert(
+            "$ref".to_string(),
+            Value::String(format!("#/$defs/{target}")),
+        );
     });
 }
 
@@ -409,8 +415,18 @@ mod tests {
                 },
                 "name": {
                     "type": "string"
+                },
+                "title": {
+                    "type": "string"
                 }
-            }
+            },
+            "allOf": [
+                {
+                    "title": "EC keys carry crv, x, y",
+                    "if": { "properties": { "name": { "const": "EC" } } },
+                    "then": { "required": ["id"] }
+                }
+            ]
         });
 
         strip_ucp_keywords(&mut schema);
@@ -431,6 +447,8 @@ mod tests {
             "keep_inside_default"
         );
         assert!(schema["properties"].get("name").is_some());
+        assert!(schema["properties"].get("title").is_some());
+        assert!(schema["allOf"][0].get("title").is_none());
     }
 
     #[test]
