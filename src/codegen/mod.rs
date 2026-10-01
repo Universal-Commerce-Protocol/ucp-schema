@@ -173,6 +173,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
 
     // Stage 2: Upfront $defs Hoisting & Collision Qualification
     let mut defs = BTreeMap::new();
+    let mut sliced_base_names = BTreeSet::new();
     let (working_schemas, mut root_raw_schemas, pending_overlays) = hoist_defs(
         &loaded,
         &reachable_indices,
@@ -180,6 +181,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         &active_ext_indices,
         &active_capabilities,
         &mut defs,
+        &mut sliced_base_names,
     )?;
 
     // Stage 3: Capability & Sub-Type Extension Composition
@@ -196,10 +198,16 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     // Stage 4: Inline Conditional Variant Hoisting (added in Phase 3 / Task 6)
 
     // Stage 5: Directional Slicing & Base Normalization
-    slice_and_normalize_defs(&loaded, &active_cap_indices, &root_raw_schemas, &mut defs)?;
+    slice_and_normalize_defs(
+        &loaded,
+        &active_cap_indices,
+        &root_raw_schemas,
+        &mut defs,
+        &mut sliced_base_names,
+    )?;
 
     // Stage 6: Directional $ref Alignment
-    align_all_directional_refs(&mut defs);
+    align_all_directional_refs(&mut defs, &sliced_base_names);
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
 
@@ -235,10 +243,12 @@ fn slice_and_normalize_defs(
     active_cap_indices: &BTreeSet<usize>,
     root_raw_schemas: &BTreeMap<String, (usize, Value)>,
     defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
     for (base_name, (idx, raw_schema)) in root_raw_schemas {
         let is_active_root_cap = active_cap_indices.contains(idx) && !loaded[*idx].is_container;
         if is_active_root_cap || has_directional_annotations(raw_schema) {
+            sliced_base_names.insert(base_name.clone());
             for (slice_name, slice_val) in slice_directional_schemas(raw_schema, base_name)? {
                 defs.insert(slice_name, slice_val);
             }
@@ -252,7 +262,10 @@ fn slice_and_normalize_defs(
     Ok(())
 }
 
-fn align_all_directional_refs(defs: &mut BTreeMap<String, Value>) {
+fn align_all_directional_refs(
+    defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &BTreeSet<String>,
+) {
     let known_defs: BTreeSet<String> = defs.keys().cloned().collect();
     for (def_name, schema_val) in defs.iter_mut() {
         let Some(suffix) = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
@@ -262,6 +275,21 @@ fn align_all_directional_refs(defs: &mut BTreeMap<String, Value>) {
             continue;
         };
         align_directional_refs(schema_val, suffix, &known_defs);
+        crate::loader::for_each_schema_object_mut(schema_val, &mut |obj| {
+            let Some(Value::Array(all_of)) = obj.get_mut("allOf") else {
+                return;
+            };
+            all_of.retain(|branch| {
+                let Some(target) = branch
+                    .get("$ref")
+                    .and_then(Value::as_str)
+                    .and_then(|r| r.strip_prefix("#/$defs/"))
+                else {
+                    return true;
+                };
+                !sliced_base_names.contains(target)
+            });
+        });
     }
 }
 
