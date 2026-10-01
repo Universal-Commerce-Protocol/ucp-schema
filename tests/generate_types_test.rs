@@ -186,6 +186,7 @@ fn ucp_corpus_checkout_with_discount_scoping_and_slicing() {
         "Buyer",
         "Total",
         "ErrorResponse",
+        "UcpBase",
     ] {
         assert!(
             bundle.defs.contains_key(expected),
@@ -200,6 +201,8 @@ fn ucp_corpus_checkout_with_discount_scoping_and_slicing() {
         "Booking",
         "CatalogSearchRequest",
         "CatalogLookupRequest",
+        "UcpBaseCreateRequest",
+        "UcpBaseUpdateRequest",
     ] {
         assert!(
             !bundle.defs.contains_key(excluded),
