@@ -9,9 +9,10 @@ use clap::{Parser, Subcommand};
 use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, is_url, lint, load_schema, load_schema_auto, resolve,
-    select_operation_schema, validate, ComposeError, DetectedDirection, Direction, FileStatus,
-    ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
+    extract_jsonrpc_payload, generate_types, is_url, lint, load_schema, load_schema_auto, resolve,
+    select_operation_schema, validate, CodegenError, ComposeError, DetectedDirection, Direction,
+    FileStatus, GenerateTypesOptions, ResolveError, ResolveOptions, SchemaBaseConfig,
+    ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
@@ -28,6 +29,12 @@ impl CliExitCode for ResolveError {
 impl CliExitCode for ComposeError {
     fn exit_code(&self) -> u8 {
         ComposeError::exit_code(self) as u8
+    }
+}
+
+impl CliExitCode for CodegenError {
+    fn exit_code(&self) -> u8 {
+        CodegenError::exit_code(self) as u8
     }
 }
 
@@ -237,6 +244,54 @@ enum Commands {
         #[arg(long, short)]
         quiet: bool,
     },
+
+    /// Generate a self-contained JSON Schema 2020-12 type bundle ($defs) from a UCP profile or capability set
+    #[command(name = "generate-types")]
+    GenerateTypes {
+        /// Path or URL to a UCP discovery profile (e.g. profile.json or https://allbirds.com/.well-known/ucp)
+        #[arg(long, short = 'p')]
+        profile: Option<String>,
+
+        /// Explicit capability FQDN to include in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
+        #[arg(
+            long = "capability",
+            alias = "capabilities",
+            value_delimiter = ',',
+            conflicts_with = "profile"
+        )]
+        capabilities: Vec<String>,
+
+        /// Explicit capability extension FQDN to include and compose in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
+        #[arg(
+            long = "extension",
+            alias = "extensions",
+            value_delimiter = ',',
+            conflicts_with = "profile"
+        )]
+        extensions: Vec<String>,
+
+        /// Local directory containing UCP JSON schema files (required in flag mode without --profile; optional local URL-mapping override when --profile is provided)
+        #[arg(long, short = 's', alias = "schema-local-base")]
+        schema_dir: Option<PathBuf>,
+
+        /// URL prefix to strip when mapping profile schema URLs to --schema-dir (e.g., https://ucp.dev/draft or https://ucp.dev/2026-08-25)
+        #[arg(long, requires = "schema_dir")]
+        schema_remote_base: Option<String>,
+
+        /// Output file path (emits JSON to stdout if omitted)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Pretty-print JSON output (defaults to true; use --pretty=false for compact)
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        pretty: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -323,6 +378,24 @@ fn main() -> ExitCode {
             strict,
             quiet,
         } => run_lint(&path, &format, strict, quiet),
+
+        Commands::GenerateTypes {
+            profile,
+            capabilities,
+            extensions,
+            schema_dir,
+            schema_remote_base,
+            output,
+            pretty,
+        } => run_generate_types(
+            profile,
+            capabilities,
+            extensions,
+            schema_dir,
+            schema_remote_base,
+            output,
+            pretty,
+        ),
     };
 
     match result {
@@ -715,9 +788,30 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
     }
 }
 
+fn run_generate_types(
+    profile: Option<String>,
+    capabilities: Vec<String>,
+    extensions: Vec<String>,
+    schema_dir: Option<PathBuf>,
+    schema_remote_base: Option<String>,
+    output: Option<PathBuf>,
+    pretty: bool,
+) -> Result<(), u8> {
+    let options = GenerateTypesOptions {
+        profile,
+        capabilities: (!capabilities.is_empty()).then_some(capabilities),
+        extensions: (!extensions.is_empty()).then_some(extensions),
+        schema_dir,
+        schema_remote_base,
+        ..GenerateTypesOptions::default()
+    };
+    let bundle = generate_types(&options).map_err(cli_err(false))?;
+    write_json_output(&bundle, output, pretty)
+}
+
 /// Shared helper: serialize JSON and write to output or stdout.
-fn write_json_output(
-    value: &serde_json::Value,
+fn write_json_output<T: serde::Serialize + ?Sized>(
+    value: &T,
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
