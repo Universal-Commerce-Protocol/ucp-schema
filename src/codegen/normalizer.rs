@@ -192,8 +192,9 @@ pub fn rewrite_refs_to_defs(value: &mut Value, current_def: &str, parent_name: O
 }
 
 /// Normalize a single `$defs` entry by stripping UCP authoring keywords, rewriting `$ref`
-/// pointers to `#/$defs/<PascalName>`, and setting `"additionalProperties": true` on object
-/// schemas that omit `"additionalProperties"` to preserve UCP's open-world property semantics.
+/// pointers to `#/$defs/<PascalName>`, synchronizing `"title"` to `current_def`, and setting
+/// `"additionalProperties": true` on object schemas that omit `"additionalProperties"` to
+/// preserve UCP's open-world property semantics.
 pub fn normalize_def_schema(schema: &Value, current_def: &str, parent_name: Option<&str>) -> Value {
     let mut val = schema.clone();
     strip_ucp_keywords(&mut val);
@@ -201,6 +202,7 @@ pub fn normalize_def_schema(schema: &Value, current_def: &str, parent_name: Opti
     let Some(obj) = val.as_object_mut() else {
         return val;
     };
+    obj.insert("title".to_string(), Value::String(current_def.to_string()));
     let is_object =
         obj.get("type").and_then(Value::as_str) == Some("object") || obj.contains_key("properties");
     if is_object && !obj.contains_key("additionalProperties") {
@@ -991,6 +993,7 @@ mod tests {
     fn normalize_def_schema_strips_rewrites_and_defaults_additional_properties() {
         let raw_obj = json!({
             "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Buyer Object",
             "name": "dev.ucp.shopping.buyer",
             "version": "2026-01-11",
             "type": "object",
@@ -1004,6 +1007,7 @@ mod tests {
         assert!(normalized.get("$schema").is_none());
         assert!(normalized.get("name").is_none());
         assert!(normalized.get("version").is_none());
+        assert_eq!(normalized["title"], "Buyer");
         assert!(normalized["properties"]["id"].get("ucp_request").is_none());
         assert_eq!(
             normalized["properties"]["address"]["$ref"],
@@ -1018,6 +1022,7 @@ mod tests {
             "properties": { "code": { "type": "string" } }
         });
         let normalized_closed = normalize_def_schema(&closed_obj, "Closed", None);
+        assert_eq!(normalized_closed["title"], "Closed");
         assert_eq!(
             normalized_closed["additionalProperties"],
             Value::Bool(false)
@@ -1028,17 +1033,19 @@ mod tests {
             "properties": { "name": { "type": "string" } }
         });
         let normalized_implicit = normalize_def_schema(&implicit_obj, "Implicit", None);
+        assert_eq!(normalized_implicit["title"], "Implicit");
         assert_eq!(
             normalized_implicit["additionalProperties"],
             Value::Bool(true)
         );
 
-        // Non-object schemas do not receive additionalProperties
+        // Non-object schemas do not receive additionalProperties, but still synchronize title
         let string_schema = json!({
             "type": "string",
             "enum": ["pending", "completed"]
         });
         let normalized_str = normalize_def_schema(&string_schema, "Status", None);
+        assert_eq!(normalized_str["title"], "Status");
         assert!(normalized_str.get("additionalProperties").is_none());
     }
 
