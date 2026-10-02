@@ -252,7 +252,7 @@ enum Commands {
         #[arg(long, short = 'p')]
         profile: Option<String>,
 
-        /// Explicit capability FQDN to include in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
+        /// Explicit capability FQDN to include in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
         #[arg(
             long = "capability",
             alias = "capabilities",
@@ -261,7 +261,7 @@ enum Commands {
         )]
         capabilities: Vec<String>,
 
-        /// Explicit capability extension FQDN to include and compose in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
+        /// Explicit capability extension FQDN to include and compose in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
         #[arg(
             long = "extension",
             alias = "extensions",
@@ -270,8 +270,13 @@ enum Commands {
         )]
         extensions: Vec<String>,
 
-        /// Local directory containing UCP JSON schema files (required in flag mode without --profile; optional local URL-mapping override when --profile is provided)
-        #[arg(long, short = 's', alias = "schema-local-base")]
+        /// Local directory containing UCP JSON schema files (mutually exclusive with --profile)
+        #[arg(
+            long,
+            short = 's',
+            conflicts_with = "profile",
+            required_unless_present = "profile"
+        )]
         schema_dir: Option<PathBuf>,
 
         /// Output file path (emits JSON to stdout if omitted)
@@ -790,6 +795,9 @@ fn run_generate_types(
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
+    if let (Some(dir), Some(out)) = (&schema_dir, &output) {
+        validate_output_outside_schema_dir_or_types_json(dir, out)?;
+    }
     let options = GenerateTypesOptions {
         profile,
         capabilities: (!capabilities.is_empty()).then_some(capabilities),
@@ -799,6 +807,55 @@ fn run_generate_types(
     };
     let bundle = generate_types(&options).map_err(cli_err(false))?;
     write_json_output(&bundle, output, pretty)
+}
+
+fn validate_output_outside_schema_dir_or_types_json(
+    schema_dir: &Path,
+    output: &Path,
+) -> Result<(), u8> {
+    let is_types_json = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".types.json"));
+    if is_types_json {
+        return Ok(());
+    }
+    let resolved_dir = resolve_path_for_prefix_check(schema_dir);
+    let resolved_out = resolve_path_for_prefix_check(output);
+    if resolved_out.starts_with(&resolved_dir) {
+        eprintln!(
+            "Error: output file inside --schema-dir must end with '.types.json' so subsequent directory scans ignore it: {}",
+            output.display()
+        );
+        return Err(2);
+    }
+    Ok(())
+}
+
+fn resolve_path_for_prefix_check(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
+    };
+    let mut normalized = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            c => normalized.push(c.as_os_str()),
+        }
+    }
+    normalized
+        .canonicalize()
+        .ok()
+        .or_else(|| {
+            let parent = normalized.parent()?.canonicalize().ok()?;
+            Some(parent.join(normalized.file_name()?))
+        })
+        .unwrap_or(normalized)
 }
 
 /// Shared helper: serialize JSON and write to output or stdout.
