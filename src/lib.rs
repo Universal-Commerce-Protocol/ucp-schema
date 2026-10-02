@@ -64,6 +64,10 @@ mod resolver;
 mod types;
 mod validator;
 
+pub use codegen::{
+    compile_types, generate_types, CodegenError, CompiledTypes, GenerateTypesOptions,
+    TypesBundleDoc,
+};
 pub use compose::{
     capability_short_name, check_version_constraints, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
