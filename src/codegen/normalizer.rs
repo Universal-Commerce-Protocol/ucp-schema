@@ -1,12 +1,15 @@
-//! Naming, UCP keyword stripping, and `#/$defs/` reference rewriting for code generation.
+//! Naming, UCP keyword stripping, `#/$defs/` reference rewriting, base normalization,
+//! directional slicing, and `$ref` alignment for code generation.
 
 use std::collections::BTreeSet;
 
 use serde_json::{Map, Value};
 
 use crate::compose::capability_short_name;
-use crate::loader::for_each_schema_object_mut;
-use crate::types::{is_valid_version, UCP_ANNOTATIONS};
+use crate::error::ResolveError;
+use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
+use crate::resolver::resolve;
+use crate::types::{is_valid_version, Direction, ResolveOptions, UCP_ANNOTATIONS};
 
 /// Convert a snake_case, kebab-case, or reverse-domain identifier into PascalCase.
 pub fn to_pascal_case(s: &str) -> String {
@@ -179,6 +182,190 @@ pub fn rewrite_refs_to_defs(value: &mut Value, current_def: &str, parent_name: O
             Value::String(format!("#/$defs/{target}")),
         );
     });
+}
+
+/// Normalize a single `$defs` entry by stripping UCP authoring keywords, rewriting `$ref`
+/// pointers to `#/$defs/<PascalName>`, synchronizing `"title"` to `current_def`, and setting
+/// `"additionalProperties": true` on object schemas that omit `"additionalProperties"` to
+/// preserve UCP's open-world property semantics.
+pub fn normalize_def_schema(schema: &Value, current_def: &str, parent_name: Option<&str>) -> Value {
+    let mut val = schema.clone();
+    strip_ucp_keywords(&mut val);
+    rewrite_refs_to_defs(&mut val, current_def, parent_name);
+    let Some(obj) = val.as_object_mut() else {
+        return val;
+    };
+    obj.insert("title".to_string(), Value::String(current_def.to_string()));
+    let is_object =
+        obj.get("type").and_then(Value::as_str) == Some("object") || obj.contains_key("properties");
+    if is_object && !obj.contains_key("additionalProperties") {
+        obj.insert("additionalProperties".to_string(), Value::Bool(true));
+    }
+    val
+}
+
+/// Returns `true` when `schema` contains any `ucp_request` or `ucp_response` annotation
+/// in schema position (ignoring instance data inside `const`, `enum`, `default`, `examples`).
+pub fn has_directional_annotations(schema: &Value) -> bool {
+    let mut found = false;
+    for_each_schema_object(schema, &mut |obj| {
+        if UCP_ANNOTATIONS.iter().any(|k| obj.contains_key(*k)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Returns `true` when `schema` supports the `"complete"` request operation via `ucp_request`
+/// annotations, `x-ucp-lifecycle`, or a `complete_request` entry in `$defs`.
+pub fn schema_supports_complete(schema: &Value) -> bool {
+    if schema
+        .get("$defs")
+        .and_then(Value::as_object)
+        .is_some_and(|defs| {
+            defs.keys().any(|k| {
+                k == "complete_request"
+                    || k == "CompleteRequest"
+                    || k.ends_with(".complete_request")
+                    || k.ends_with("_complete_request")
+            })
+        })
+    {
+        return true;
+    }
+
+    let mut found = false;
+    for_each_schema_object(schema, &mut |obj| {
+        if obj
+            .get("x-ucp-lifecycle")
+            .and_then(Value::as_array)
+            .is_some_and(|lc| lc.iter().any(|v| v.as_str() == Some("complete")))
+        {
+            found = true;
+        }
+        if obj
+            .get("ucp_request")
+            .and_then(Value::as_object)
+            .is_some_and(|req_map| req_map.contains_key("complete"))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Slice a UCP-annotated schema into directional request and response schemas:
+/// `<BaseName>CreateRequest`, `<BaseName>UpdateRequest`, optional `<BaseName>CompleteRequest`
+/// (when `schema_supports_complete(raw_schema)` is `true`), and `<BaseName>` (`Response, "read"`).
+///
+/// Note: Unlike container operation definitions (`$defs.<op>_request` / `$defs.<op>_response`),
+/// which represent explicit RPC messages and are always emitted even when parameterless,
+/// `slice_directional_schemas` also runs on nested sub-object value types (e.g.
+/// `FulfillmentAvailableMethod`, `TimeInterval`) that mark every field `"ucp_request": "omit"`
+/// because the sub-object is server-computed / response-only. Request slices where all fields
+/// were omitted are skipped so response-only sub-objects do not emit unreferenced `*Request` types.
+pub fn slice_directional_schemas(
+    raw_schema: &Value,
+    base_name: &str,
+) -> Result<Vec<(String, Value)>, ResolveError> {
+    let mut out = Vec::new();
+    let supports_complete = schema_supports_complete(raw_schema);
+
+    let mut req_ops = vec![("CreateRequest", "create"), ("UpdateRequest", "update")];
+    if supports_complete {
+        req_ops.push(("CompleteRequest", "complete"));
+    }
+
+    for (suffix, op) in req_ops {
+        let resolved = resolve(raw_schema, &ResolveOptions::new(Direction::Request, op))?;
+        let slice_name = format!("{base_name}{suffix}");
+        let mut normalized = normalize_def_schema(&resolved, &slice_name, Some(base_name));
+        if is_non_empty_request_slice(&normalized) {
+            update_request_slice_metadata(&mut normalized, &slice_name, base_name, op);
+            out.push((slice_name, normalized));
+        }
+    }
+
+    let resp_resolved = resolve(
+        raw_schema,
+        &ResolveOptions::new(Direction::Response, "read"),
+    )?;
+    let resp_normalized = normalize_def_schema(&resp_resolved, base_name, Some(base_name));
+    out.push((base_name.to_string(), resp_normalized));
+
+    Ok(out)
+}
+
+/// Rewrite `#/$defs/<Target>` references inside a directional request schema slice
+/// (`<Name>CreateRequest`, `<Name>UpdateRequest`, `<Name>CompleteRequest`) to point to
+/// `#/$defs/<Target><suffix>` when `<Target><suffix>` is in `known_defs` (or to
+/// `#/$defs/<Target>UpdateRequest` when `suffix == "CompleteRequest"` and
+/// `<Target>UpdateRequest` is in `known_defs`).
+pub fn align_directional_refs(schema_val: &mut Value, suffix: &str, known_defs: &BTreeSet<String>) {
+    for_each_schema_object_mut(schema_val, &mut |obj| {
+        let Some(Value::String(ref_str)) = obj.get("$ref") else {
+            return;
+        };
+        let Some(target) = ref_str.strip_prefix("#/$defs/") else {
+            return;
+        };
+
+        let candidate = format!("{target}{suffix}");
+        if known_defs.contains(&candidate) {
+            obj.insert(
+                "$ref".to_string(),
+                Value::String(format!("#/$defs/{candidate}")),
+            );
+        } else if suffix == "CompleteRequest" {
+            let fallback = format!("{target}UpdateRequest");
+            if known_defs.contains(&fallback) {
+                obj.insert(
+                    "$ref".to_string(),
+                    Value::String(format!("#/$defs/{fallback}")),
+                );
+            }
+        }
+    });
+}
+
+fn is_non_empty_request_slice(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    let has_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let has_composition = ["allOf", "oneOf", "anyOf"].iter().any(|k| {
+        obj.get(*k)
+            .and_then(Value::as_array)
+            .is_some_and(|a| !a.is_empty())
+    });
+    let has_ref = obj.get("$ref").is_some_and(Value::is_string);
+    has_props || has_composition || has_ref
+}
+
+fn update_request_slice_metadata(
+    slice_val: &mut Value,
+    slice_name: &str,
+    base_name: &str,
+    op: &str,
+) {
+    let Some(obj) = slice_val.as_object_mut() else {
+        return;
+    };
+    obj.insert("title".to_string(), Value::String(slice_name.to_string()));
+    let prefix = match op {
+        "create" => format!("Request payload to create a new {base_name}."),
+        "update" => format!("Request payload to update an existing {base_name}."),
+        "complete" => format!("Request payload to complete a {base_name}."),
+        _ => format!("Request payload for {base_name}."),
+    };
+    let new_desc = match obj.get("description").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{prefix} {existing}"),
+        _ => prefix,
+    };
+    obj.insert("description".to_string(), Value::String(new_desc));
 }
 
 fn file_stem_to_pascal(path_or_url: &str) -> String {
@@ -683,5 +870,312 @@ mod tests {
         let once = schema.clone();
         rewrite_refs_to_defs(&mut schema, "Profile", Some("Profile"));
         assert_eq!(schema, once);
+    }
+
+    #[test]
+    fn normalize_def_schema_strips_rewrites_and_defaults_additional_properties() {
+        let raw_obj = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Buyer Object",
+            "name": "dev.ucp.shopping.buyer",
+            "version": "2026-01-11",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "address": { "$ref": "types/postal_address.json" }
+            }
+        });
+
+        let normalized = normalize_def_schema(&raw_obj, "Buyer", Some("Buyer"));
+        assert!(normalized.get("$schema").is_none());
+        assert!(normalized.get("name").is_none());
+        assert!(normalized.get("version").is_none());
+        assert_eq!(normalized["title"], "Buyer");
+        assert!(normalized["properties"]["id"].get("ucp_request").is_none());
+        assert_eq!(
+            normalized["properties"]["address"]["$ref"],
+            "#/$defs/PostalAddress"
+        );
+        assert_eq!(normalized["additionalProperties"], Value::Bool(true));
+
+        // Explicit additionalProperties is preserved
+        let closed_obj = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "code": { "type": "string" } }
+        });
+        let normalized_closed = normalize_def_schema(&closed_obj, "Closed", None);
+        assert_eq!(normalized_closed["title"], "Closed");
+        assert_eq!(
+            normalized_closed["additionalProperties"],
+            Value::Bool(false)
+        );
+
+        // Schema with properties but no explicit "type": "object" receives additionalProperties: true
+        let implicit_obj = json!({
+            "properties": { "name": { "type": "string" } }
+        });
+        let normalized_implicit = normalize_def_schema(&implicit_obj, "Implicit", None);
+        assert_eq!(normalized_implicit["title"], "Implicit");
+        assert_eq!(
+            normalized_implicit["additionalProperties"],
+            Value::Bool(true)
+        );
+
+        // Non-object schemas do not receive additionalProperties, but still synchronize title
+        let string_schema = json!({
+            "type": "string",
+            "enum": ["pending", "completed"]
+        });
+        let normalized_str = normalize_def_schema(&string_schema, "Status", None);
+        assert_eq!(normalized_str["title"], "Status");
+        assert!(normalized_str.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn has_directional_annotations_and_schema_supports_complete_skip_instance_data() {
+        let plain = json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "default": {
+                        "ucp_request": { "complete": "required" },
+                        "x-ucp-lifecycle": ["complete"]
+                    }
+                }
+            }
+        });
+        assert!(!has_directional_annotations(&plain));
+        assert!(!schema_supports_complete(&plain));
+
+        let with_req = json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": { "create": "omit", "update": "required" }
+                }
+            }
+        });
+        assert!(has_directional_annotations(&with_req));
+        assert!(!schema_supports_complete(&with_req));
+
+        let with_complete_req = json!({
+            "type": "object",
+            "properties": {
+                "payment": {
+                    "type": "string",
+                    "ucp_request": { "complete": "required" }
+                }
+            }
+        });
+        assert!(has_directional_annotations(&with_complete_req));
+        assert!(schema_supports_complete(&with_complete_req));
+
+        let with_lifecycle = json!({
+            "type": "object",
+            "x-ucp-lifecycle": ["create", "update", "complete"],
+            "properties": {}
+        });
+        assert!(schema_supports_complete(&with_lifecycle));
+
+        let with_defs_complete = json!({
+            "type": "object",
+            "$defs": {
+                "checkout.complete_request": { "type": "object" }
+            }
+        });
+        assert!(schema_supports_complete(&with_defs_complete));
+    }
+
+    #[test]
+    fn slice_directional_schemas_emits_request_and_response_slices_and_omits_empty_requests() {
+        let checkout_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Checkout",
+            "description": "Checkout session.",
+            "type": "object",
+            "required": ["id", "line_items"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": {
+                        "create": "omit",
+                        "update": "required",
+                        "complete": "omit"
+                    }
+                },
+                "line_items": {
+                    "type": "array",
+                    "items": { "$ref": "types/line_item.json" },
+                    "ucp_request": {
+                        "create": "required",
+                        "update": "optional",
+                        "complete": "omit"
+                    }
+                },
+                "payment_token": {
+                    "type": "string",
+                    "ucp_request": {
+                        "create": "omit",
+                        "update": "omit",
+                        "complete": "required"
+                    },
+                    "ucp_response": "omit"
+                }
+            }
+        });
+
+        let slices = slice_directional_schemas(&checkout_schema, "Checkout").unwrap();
+        let names: Vec<&str> = slices.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "CheckoutCreateRequest",
+                "CheckoutUpdateRequest",
+                "CheckoutCompleteRequest",
+                "Checkout"
+            ]
+        );
+
+        let create_slice = &slices[0].1;
+        assert_eq!(create_slice["title"], "CheckoutCreateRequest");
+        assert_eq!(
+            create_slice["description"],
+            "Request payload to create a new Checkout. Checkout session."
+        );
+        assert!(create_slice["properties"].get("id").is_none());
+        assert_eq!(
+            create_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItem"
+        );
+        assert_eq!(create_slice["required"], json!(["line_items"]));
+        assert_eq!(create_slice["additionalProperties"], Value::Bool(true));
+
+        let update_slice = &slices[1].1;
+        assert_eq!(update_slice["title"], "CheckoutUpdateRequest");
+        assert_eq!(
+            update_slice["description"],
+            "Request payload to update an existing Checkout. Checkout session."
+        );
+        assert_eq!(update_slice["required"], json!(["id"]));
+
+        let complete_slice = &slices[2].1;
+        assert_eq!(complete_slice["title"], "CheckoutCompleteRequest");
+        assert_eq!(
+            complete_slice["description"],
+            "Request payload to complete a Checkout. Checkout session."
+        );
+        assert_eq!(complete_slice["required"], json!(["payment_token"]));
+
+        let resp_slice = &slices[3].1;
+        assert_eq!(resp_slice["title"], "Checkout");
+        assert_eq!(resp_slice["description"], "Checkout session.");
+        assert!(resp_slice["properties"].get("payment_token").is_none());
+        assert_eq!(resp_slice["required"], json!(["id", "line_items"]));
+
+        // Schema where all properties are omitted on requests omits request slices
+        let response_only = json!({
+            "title": "Adjustment",
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": "omit"
+                }
+            }
+        });
+        let ro_slices = slice_directional_schemas(&response_only, "Adjustment").unwrap();
+        assert_eq!(ro_slices.len(), 1);
+        assert_eq!(ro_slices[0].0, "Adjustment");
+
+        // Schema without description receives default request description without trailing space,
+        // and internal #/$defs/base is qualified with base_name ("ItemBase"), not slice_name
+        let no_desc = json!({
+            "type": "object",
+            "properties": {
+                "base_info": {
+                    "$ref": "#/$defs/base",
+                    "ucp_request": { "create": "required", "update": "omit" }
+                }
+            }
+        });
+        let nd_slices = slice_directional_schemas(&no_desc, "Item").unwrap();
+        assert_eq!(
+            nd_slices[0].1["description"],
+            "Request payload to create a new Item."
+        );
+        assert_eq!(
+            nd_slices[0].1["properties"]["base_info"]["$ref"],
+            "#/$defs/ItemBase"
+        );
+    }
+
+    #[test]
+    fn align_directional_refs_rewrites_known_targets_and_falls_back_for_complete_request() {
+        let known_defs: BTreeSet<String> = [
+            "LineItem",
+            "LineItemCreateRequest",
+            "LineItemUpdateRequest",
+            "Fulfillment",
+            "FulfillmentCreateRequest",
+            "FulfillmentUpdateRequest",
+            "FulfillmentCompleteRequest",
+            "Money",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let base_slice = json!({
+            "type": "object",
+            "properties": {
+                "line_items": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/LineItem" }
+                },
+                "fulfillment": { "$ref": "#/$defs/Fulfillment" },
+                "total": { "$ref": "#/$defs/Money" },
+                "example": {
+                    "type": "object",
+                    "default": { "$ref": "#/$defs/LineItem" }
+                }
+            }
+        });
+
+        let mut create_slice = base_slice.clone();
+        align_directional_refs(&mut create_slice, "CreateRequest", &known_defs);
+        assert_eq!(
+            create_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItemCreateRequest"
+        );
+        assert_eq!(
+            create_slice["properties"]["fulfillment"]["$ref"],
+            "#/$defs/FulfillmentCreateRequest"
+        );
+        assert_eq!(create_slice["properties"]["total"]["$ref"], "#/$defs/Money");
+        assert_eq!(
+            create_slice["properties"]["example"]["default"]["$ref"],
+            "#/$defs/LineItem"
+        );
+
+        let mut complete_slice = base_slice;
+        align_directional_refs(&mut complete_slice, "CompleteRequest", &known_defs);
+        // LineItem has no CompleteRequest, so it falls back to LineItemUpdateRequest
+        assert_eq!(
+            complete_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItemUpdateRequest"
+        );
+        // Fulfillment has FulfillmentCompleteRequest, so it uses the direct match
+        assert_eq!(
+            complete_slice["properties"]["fulfillment"]["$ref"],
+            "#/$defs/FulfillmentCompleteRequest"
+        );
+        assert_eq!(
+            complete_slice["properties"]["total"]["$ref"],
+            "#/$defs/Money"
+        );
     }
 }
