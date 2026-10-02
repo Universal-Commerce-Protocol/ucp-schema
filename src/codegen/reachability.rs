@@ -21,11 +21,12 @@ pub(super) const AMBIENT_ROOT_STEMS: &[&str] = &[
 ];
 
 #[derive(Debug, Clone)]
-pub(super) struct LoadedSchema {
+pub(crate) struct LoadedSchema {
     pub path: PathBuf,
     pub stem: String,
     pub stem_pascal: String,
     pub name: Option<String>,
+    pub declared_extends: Option<BTreeSet<String>>,
     pub is_extension: bool,
     pub is_container: bool,
     pub is_capability: bool,
@@ -62,12 +63,19 @@ impl LoadedSchema {
             stem,
             stem_pascal,
             name,
+            declared_extends: None,
             is_extension,
             is_container,
             is_capability,
             in_types_dir,
             schema,
         }
+    }
+
+    pub(super) fn extends_capability(&self, cap_name: &str) -> bool {
+        self.declared_extends
+            .as_ref()
+            .is_none_or(|ext| ext.contains(cap_name))
     }
 }
 
@@ -224,7 +232,9 @@ pub(super) fn compute_inactive_local_defs(
         if !is_reverse_domain_name(k) {
             continue;
         }
-        if item.name.as_deref() == Some(k.as_str()) || active_capabilities.contains(k) {
+        if item.name.as_deref() == Some(k.as_str())
+            || (active_capabilities.contains(k) && item.extends_capability(k))
+        {
             active_seeds.push(v);
         } else {
             inactive.insert(k.clone());
@@ -307,9 +317,15 @@ pub(super) fn normalize_lexical_path(path: &Path) -> PathBuf {
     for comp in path.components() {
         match comp {
             Component::CurDir => {}
-            Component::ParentDir => {
-                out.pop();
-            }
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::RootDir | Component::Prefix(_)) => {}
+                None | Some(Component::CurDir | Component::ParentDir) => {
+                    out.push(comp.as_os_str());
+                }
+            },
             other => out.push(other.as_os_str()),
         }
     }
@@ -376,7 +392,7 @@ fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) ->
     visited
 }
 
-fn collect_active_external_refs(
+pub(super) fn collect_active_external_refs(
     item: &LoadedSchema,
     inactive_locals: &BTreeSet<String>,
 ) -> Vec<String> {

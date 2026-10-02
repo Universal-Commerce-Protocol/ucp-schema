@@ -47,6 +47,9 @@ pub(super) fn compose_active_extensions(
 
         for &ext_idx in active_ext_indices {
             let ext_item = &loaded[ext_idx];
+            if !ext_item.extends_capability(cap_name) {
+                continue;
+            }
             let Some(ext_block) = ext_item
                 .schema
                 .get("$defs")
@@ -162,7 +165,7 @@ fn merge_extension_into_schema(
     if let Some(all_of) = ext_val.get("allOf").and_then(Value::as_array) {
         for branch in all_of {
             if local_def_ref(branch) != Some(target_name) {
-                merge_single_branch_into_target(target, branch, root_raw_schemas, defs);
+                merge_extension_into_schema(target, branch, target_name, root_raw_schemas, defs);
             }
         }
     }
@@ -363,6 +366,9 @@ fn compose_container_capability(
 
     for &ext_idx in active_ext_indices {
         let ext_item = &loaded[ext_idx];
+        if !ext_item.extends_capability(cap_name) {
+            continue;
+        }
         let Some(ext_cap_block) = ext_item
             .schema
             .get("$defs")
