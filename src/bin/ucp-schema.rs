@@ -252,7 +252,7 @@ enum Commands {
         #[arg(long, short = 'p')]
         profile: Option<String>,
 
-        /// Explicit capability FQDN to include in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
+        /// Explicit capability FQDN to include in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
         #[arg(
             long = "capability",
             alias = "capabilities",
@@ -261,7 +261,7 @@ enum Commands {
         )]
         capabilities: Vec<String>,
 
-        /// Explicit capability extension FQDN to include and compose in flag mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
+        /// Explicit capability extension FQDN to include and compose in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
         #[arg(
             long = "extension",
             alias = "extensions",
@@ -270,13 +270,14 @@ enum Commands {
         )]
         extensions: Vec<String>,
 
-        /// Local directory containing UCP JSON schema files (required in flag mode without --profile; optional local URL-mapping override when --profile is provided)
-        #[arg(long, short = 's', alias = "schema-local-base")]
+        /// Local directory containing UCP JSON schema files (mutually exclusive with --profile)
+        #[arg(
+            long,
+            short = 's',
+            conflicts_with = "profile",
+            required_unless_present = "profile"
+        )]
         schema_dir: Option<PathBuf>,
-
-        /// URL prefix to strip when mapping profile schema URLs to --schema-dir (e.g., https://ucp.dev/draft or https://ucp.dev/2026-08-25)
-        #[arg(long, requires = "schema_dir")]
-        schema_remote_base: Option<String>,
 
         /// Output file path (emits JSON to stdout if omitted)
         #[arg(long, short = 'o')]
@@ -384,7 +385,6 @@ fn main() -> ExitCode {
             capabilities,
             extensions,
             schema_dir,
-            schema_remote_base,
             output,
             pretty,
         } => run_generate_types(
@@ -392,7 +392,6 @@ fn main() -> ExitCode {
             capabilities,
             extensions,
             schema_dir,
-            schema_remote_base,
             output,
             pretty,
         ),
@@ -793,7 +792,6 @@ fn run_generate_types(
     capabilities: Vec<String>,
     extensions: Vec<String>,
     schema_dir: Option<PathBuf>,
-    schema_remote_base: Option<String>,
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
@@ -802,7 +800,6 @@ fn run_generate_types(
         capabilities: (!capabilities.is_empty()).then_some(capabilities),
         extensions: (!extensions.is_empty()).then_some(extensions),
         schema_dir,
-        schema_remote_base,
         ..GenerateTypesOptions::default()
     };
     let bundle = generate_types(&options).map_err(cli_err(false))?;

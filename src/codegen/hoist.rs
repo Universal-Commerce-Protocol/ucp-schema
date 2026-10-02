@@ -301,11 +301,13 @@ fn apply_collision_renames_to_schemas(
     if local_def_renames.is_empty() {
         return;
     }
-    let path_to_idx: BTreeMap<_, usize> = loaded
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (item.path.clone(), i))
-        .collect();
+    let mut path_to_idx: BTreeMap<_, usize> = BTreeMap::new();
+    for (i, item) in loaded.iter().enumerate() {
+        path_to_idx.insert(item.path.clone(), i);
+        if let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) {
+            path_to_idx.insert(normalize_lexical_path(std::path::Path::new(id_str)), i);
+        }
+    }
 
     for &idx in reachable_indices {
         let current_dir = loaded[idx].path.parent().map(std::path::Path::to_path_buf);
@@ -316,9 +318,15 @@ fn apply_collision_renames_to_schemas(
             let lookup_key = if let Some(local_key) = ref_str.strip_prefix("#/$defs/") {
                 Some((idx, local_key.to_string()))
             } else if let Some((file_part, def_key)) = ref_str.split_once("#/$defs/") {
-                current_dir
-                    .as_ref()
-                    .and_then(|dir| path_to_idx.get(&normalize_lexical_path(&dir.join(file_part))))
+                let target_path = if crate::loader::is_url(file_part) {
+                    Some(normalize_lexical_path(std::path::Path::new(file_part)))
+                } else {
+                    current_dir
+                        .as_ref()
+                        .map(|dir| normalize_lexical_path(&dir.join(file_part)))
+                };
+                target_path
+                    .and_then(|p| path_to_idx.get(&p))
                     .map(|&target_idx| (target_idx, def_key.to_string()))
             } else {
                 None
