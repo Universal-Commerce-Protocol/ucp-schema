@@ -150,13 +150,20 @@ pub fn strip_ucp_keywords(value: &mut Value) {
             }
         }
         obj.retain(|k, _| !k.starts_with("x-ucp-"));
+        if obj.contains_key("$ref") {
+            obj.remove("type");
+        }
         if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
             for branch in all_of.iter_mut().filter_map(Value::as_object_mut) {
                 branch.remove("title");
             }
         }
-        prune_dangling_required(obj);
     });
+
+    if let Some(root) = value.as_object_mut() {
+        clean_vacuous_anyof(root);
+        prune_dangling_required(root);
+    }
 }
 
 /// Rewrite all schema-position `$ref` pointers in `value` to `#/$defs/<PascalName>`.
@@ -214,6 +221,52 @@ fn prune_dangling_required(obj: &mut Map<String, Value>) {
     }
     if reqs.is_empty() {
         obj.remove("required");
+    }
+}
+
+fn prune_empty_prop_stubs(obj: &mut Map<String, Value>) {
+    let Some(Value::Object(props)) = obj.get_mut("properties") else {
+        return;
+    };
+    for prop_obj in props.values_mut().filter_map(Value::as_object_mut) {
+        prune_empty_prop_stubs(prop_obj);
+    }
+    props.retain(|_, v| v.as_object().is_none_or(|m| !m.is_empty()));
+    if props.is_empty() {
+        obj.remove("properties");
+    }
+}
+
+fn clean_vacuous_anyof(obj: &mut Map<String, Value>) {
+    if !obj.get("anyOf").is_some_and(Value::is_array) {
+        return;
+    }
+    let parent_req: BTreeSet<String> = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    let Some(Value::Array(any_of)) = obj.get_mut("anyOf") else {
+        return;
+    };
+    for branch in any_of.iter_mut().filter_map(Value::as_object_mut) {
+        prune_empty_prop_stubs(branch);
+    }
+    let is_tautological = any_of.iter().any(|b| {
+        b.as_object().is_some_and(|m| {
+            m.keys().all(|k| k == "required")
+                && m.get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .all(|r| r.as_str().is_some_and(|s| parent_req.contains(s)))
+        })
+    });
+    if is_tautological {
+        obj.remove("anyOf");
     }
 }
 
@@ -495,6 +548,94 @@ mod tests {
         });
         strip_ucp_keywords(&mut empty_req);
         assert!(empty_req.get("required").is_none());
+
+        // Nested anyOf inside allOf (ServicePlatformSchema pattern) preserves inherited required fields
+        let mut service_platform = json!({
+            "allOf": [
+                { "$ref": "#/$defs/ServiceBase" },
+                {
+                    "anyOf": [
+                        {
+                            "properties": { "transport": { "const": "rest" } },
+                            "required": ["schema"]
+                        }
+                    ]
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut service_platform);
+        assert_eq!(
+            service_platform["allOf"][1]["anyOf"][0]["required"],
+            json!(["schema"])
+        );
+
+        // Redundant "type" alongside "$ref" (MembershipReward pattern) is removed
+        let mut ref_with_type = json!({
+            "type": "object",
+            "properties": {
+                "currency": {
+                    "type": "object",
+                    "$ref": "#/$defs/RewardCurrency",
+                    "description": "Currency."
+                }
+            }
+        });
+        strip_ucp_keywords(&mut ref_with_type);
+        assert!(ref_with_type["properties"]["currency"]
+            .get("type")
+            .is_none());
+
+        // Vacuous {} property stubs in anyOf (Stay response & StayCreateRequest patterns) are pruned
+        let mut stay_resp = json!({
+            "type": "object",
+            "required": ["id", "accommodation_type", "rate_plan"],
+            "anyOf": [
+                { "properties": { "id": { "ucp_request": { "create": "required" } } } },
+                {
+                    "required": ["accommodation_type", "rate_plan"],
+                    "properties": {
+                        "accommodation_type": {
+                            "properties": { "id": { "ucp_request": { "create": "required" } } }
+                        }
+                    }
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut stay_resp);
+        assert!(stay_resp.get("anyOf").is_none());
+
+        let mut stay_req = json!({
+            "type": "object",
+            "required": ["stay_dates"],
+            "anyOf": [
+                {
+                    "properties": { "id": {} },
+                    "required": ["id"]
+                },
+                {
+                    "properties": {
+                        "accommodation_type": {
+                            "properties": { "id": {} },
+                            "required": ["id"]
+                        }
+                    },
+                    "required": ["accommodation_type"]
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut stay_req);
+        assert_eq!(
+            stay_req["anyOf"],
+            json!([
+                { "required": ["id"] },
+                {
+                    "properties": {
+                        "accommodation_type": { "required": ["id"] }
+                    },
+                    "required": ["accommodation_type"]
+                }
+            ])
+        );
     }
 
     #[test]
