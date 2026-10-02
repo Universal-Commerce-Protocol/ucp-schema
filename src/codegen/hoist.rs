@@ -9,11 +9,10 @@ use crate::codegen::normalizer::{
     ref_to_def_name, rewrite_refs_to_defs, slice_directional_schemas, to_pascal_case,
 };
 use crate::codegen::reachability::{
-    compute_inactive_local_defs, has_root_schema_body, is_container_op_key, normalize_lexical_path,
-    LoadedSchema,
+    compute_inactive_local_defs, is_container_op_key, normalize_lexical_path, LoadedSchema,
 };
-use crate::codegen::CodegenError;
-use crate::loader::for_each_schema_object_mut;
+use crate::codegen::{has_root_schema_body, CodegenError, SchemaMap};
+use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
 
@@ -26,23 +25,15 @@ enum LocalDefAction {
     Hoist(String),
 }
 
-#[allow(clippy::type_complexity)]
 pub(super) fn hoist_defs(
-    loaded: &[LoadedSchema],
+    loaded: &mut [LoadedSchema],
     reachable_indices: &BTreeSet<usize>,
     active_cap_indices: &BTreeSet<usize>,
     active_ext_indices: &BTreeSet<usize>,
     active_capabilities: &BTreeSet<String>,
-    defs: &mut BTreeMap<String, Value>,
+    defs: &mut SchemaMap,
     sliced_base_names: &mut BTreeSet<String>,
-) -> Result<
-    (
-        BTreeMap<usize, Value>,
-        BTreeMap<String, (usize, Value)>,
-        Vec<(String, Value)>,
-    ),
-    CodegenError,
-> {
+) -> Result<(SchemaMap, Vec<(String, Value)>), CodegenError> {
     let standalone_type_names: BTreeSet<String> = reachable_indices
         .iter()
         .filter_map(|&idx| {
@@ -69,21 +60,12 @@ pub(super) fn hoist_defs(
         &standalone_type_names,
         &is_active_source,
     );
-
-    let mut working_schemas: BTreeMap<usize, Value> = reachable_indices
-        .iter()
-        .map(|&idx| (idx, loaded[idx].schema.clone()))
-        .collect();
-    apply_collision_renames_to_schemas(loaded, &mut working_schemas, &local_def_renames);
+    apply_collision_renames_to_schemas(loaded, reachable_indices, &local_def_renames);
 
     let mut pending_overlays = Vec::new();
     for &idx in reachable_indices {
         let item = &loaded[idx];
-        let Some(defs_obj) = working_schemas
-            .get(&idx)
-            .and_then(|s| s.get("$defs"))
-            .and_then(Value::as_object)
-        else {
+        let Some(defs_obj) = item.schema.get("$defs").and_then(Value::as_object) else {
             continue;
         };
         let inactive_set = inactive_local_defs.get(&idx);
@@ -129,6 +111,7 @@ pub(super) fn hoist_defs(
                             def_val,
                             &hoisted_name,
                             &item.stem_pascal,
+                            false,
                             defs,
                             sliced_base_names,
                         )?;
@@ -144,9 +127,7 @@ pub(super) fn hoist_defs(
         if item.is_container {
             continue;
         }
-        let Some(mut root_val) = working_schemas.get(&idx).cloned() else {
-            continue;
-        };
+        let mut root_val = item.schema.clone();
         if let Some(obj) = root_val.as_object_mut() {
             obj.remove("$defs");
             obj.remove("definitions");
@@ -155,10 +136,10 @@ pub(super) fn hoist_defs(
             continue;
         }
         rewrite_refs_to_defs(&mut root_val, &item.stem_pascal, Some(&item.stem_pascal));
-        root_raw_schemas.insert(item.stem_pascal.clone(), (idx, root_val));
+        root_raw_schemas.insert(item.stem_pascal.clone(), root_val);
     }
 
-    Ok((working_schemas, root_raw_schemas, pending_overlays))
+    Ok((root_raw_schemas, pending_overlays))
 }
 
 fn classify_local_def(
@@ -170,10 +151,11 @@ fn classify_local_def(
     is_active_source: bool,
 ) -> LocalDefAction {
     if is_reverse_domain_name(def_key) {
-        if item.name.as_deref() == Some(def_key) {
-            return LocalDefAction::RoleContainer;
-        }
-        return LocalDefAction::Skip;
+        return if item.name.as_deref() == Some(def_key) {
+            LocalDefAction::RoleContainer
+        } else {
+            LocalDefAction::Skip
+        };
     }
     if inactive_set.is_some_and(|s| s.contains(def_key))
         || (item.is_container && is_container_op_key(def_key))
@@ -251,7 +233,7 @@ fn is_inplace_overlay(
                 .filter(|(k, _)| is_reverse_domain_name(k))
                 .any(|(_, v)| {
                     let mut found = false;
-                    crate::loader::for_each_schema_object(v, &mut |sub| {
+                    for_each_schema_object(v, &mut |sub| {
                         if sub.get("$ref").and_then(Value::as_str) == Some(&expected_ref) {
                             found = true;
                         }
@@ -312,41 +294,36 @@ fn compute_collision_renames(
 }
 
 fn apply_collision_renames_to_schemas(
-    loaded: &[LoadedSchema],
-    working_schemas: &mut BTreeMap<usize, Value>,
+    loaded: &mut [LoadedSchema],
+    reachable_indices: &BTreeSet<usize>,
     local_def_renames: &BTreeMap<(usize, String), String>,
 ) {
     if local_def_renames.is_empty() {
         return;
     }
+    let path_to_idx: BTreeMap<_, usize> = loaded
+        .iter()
+        .enumerate()
+        .map(|(i, item)| (item.path.clone(), i))
+        .collect();
 
-    for (&idx, schema_val) in working_schemas.iter_mut() {
-        let current_dir = loaded[idx].path.parent();
-        for_each_schema_object_mut(schema_val, &mut |obj| {
-            let Some(Value::String(ref_str)) = obj.get("$ref") else {
+    for &idx in reachable_indices {
+        let current_dir = loaded[idx].path.parent().map(std::path::Path::to_path_buf);
+        for_each_schema_object_mut(&mut loaded[idx].schema, &mut |obj| {
+            let Some(ref_str) = obj.get("$ref").and_then(Value::as_str) else {
                 return;
             };
-            if let Some(local_key) = ref_str.strip_prefix("#/$defs/") {
-                if let Some(qualified) = local_def_renames.get(&(idx, local_key.to_string())) {
-                    obj.insert(
-                        "$ref".to_string(),
-                        Value::String(format!("#/$defs/{qualified}")),
-                    );
-                }
-                return;
-            }
-            let Some((file_part, def_key)) = ref_str.split_once("#/$defs/") else {
-                return;
+            let lookup_key = if let Some(local_key) = ref_str.strip_prefix("#/$defs/") {
+                Some((idx, local_key.to_string()))
+            } else if let Some((file_part, def_key)) = ref_str.split_once("#/$defs/") {
+                current_dir
+                    .as_ref()
+                    .and_then(|dir| path_to_idx.get(&normalize_lexical_path(&dir.join(file_part))))
+                    .map(|&target_idx| (target_idx, def_key.to_string()))
+            } else {
+                None
             };
-            let target_path = current_dir.map(|dir| normalize_lexical_path(&dir.join(file_part)));
-            let Some((target_idx, _)) = loaded
-                .iter()
-                .enumerate()
-                .find(|(_, item)| target_path.as_ref() == Some(&item.path))
-            else {
-                return;
-            };
-            if let Some(qualified) = local_def_renames.get(&(target_idx, def_key.to_string())) {
+            if let Some(qualified) = lookup_key.and_then(|k| local_def_renames.get(&k)) {
                 obj.insert(
                     "$ref".to_string(),
                     Value::String(format!("#/$defs/{qualified}")),
@@ -374,6 +351,7 @@ fn hoist_self_named_role_schemas(
             role_val,
             &hoisted_name,
             stem_pascal,
+            false,
             defs,
             sliced_base_names,
         )?;
@@ -381,14 +359,15 @@ fn hoist_self_named_role_schemas(
     Ok(())
 }
 
-fn insert_sliced_or_normalized_def(
+pub(super) fn insert_sliced_or_normalized_def(
     raw_val: &Value,
     hoisted_name: &str,
     parent_pascal: &str,
+    force_slice: bool,
     defs: &mut BTreeMap<String, Value>,
     sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
-    if has_directional_annotations(raw_val) {
+    if force_slice || has_directional_annotations(raw_val) {
         sliced_base_names.insert(hoisted_name.to_string());
         let mut prepared = raw_val.clone();
         rewrite_refs_to_defs(&mut prepared, hoisted_name, Some(parent_pascal));
@@ -453,37 +432,14 @@ fn insert_ucp_def(
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::path::PathBuf;
-
-    fn make_loaded(
-        path: &str,
-        stem: &str,
-        name: Option<&str>,
-        is_extension: bool,
-        schema: Value,
-    ) -> LoadedSchema {
-        LoadedSchema {
-            path: PathBuf::from(path),
-            stem: stem.to_string(),
-            stem_pascal: to_pascal_case(stem),
-            name: name.map(str::to_string),
-            is_extension,
-            is_container: false,
-            is_capability: !is_extension && name.is_some(),
-            in_types_dir: false,
-            schema,
-        }
-    }
 
     #[test]
     fn hoist_defs_qualifies_colliding_local_defs_and_skips_pure_reexports() {
-        let loaded = vec![
-            make_loaded(
+        let mut loaded = vec![
+            LoadedSchema::from_file(
                 "/schemas/alpha.json",
-                "alpha",
-                Some("dev.ucp.shopping.alpha"),
-                false,
                 json!({
+                    "name": "dev.ucp.shopping.alpha",
                     "type": "object",
                     "properties": {
                         "detail": { "$ref": "#/$defs/shared_detail" },
@@ -495,12 +451,10 @@ mod tests {
                     }
                 }),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/beta.json",
-                "beta",
-                Some("dev.ucp.shopping.beta"),
-                false,
                 json!({
+                    "name": "dev.ucp.shopping.beta",
                     "type": "object",
                     "properties": {
                         "detail": { "$ref": "#/$defs/shared_detail" },
@@ -517,11 +471,8 @@ mod tests {
                     }
                 }),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/types/line_item.json",
-                "line_item",
-                None,
-                false,
                 json!({
                     "type": "object",
                     "properties": { "id": { "type": "string" } }
@@ -536,8 +487,8 @@ mod tests {
         let mut defs = BTreeMap::new();
         let mut sliced_base_names = BTreeSet::new();
 
-        let (_, root_raw, overlays) = hoist_defs(
-            &loaded,
+        let (root_raw, overlays) = hoist_defs(
+            &mut loaded,
             &reachable,
             &active_caps,
             &active_exts,
@@ -548,36 +499,29 @@ mod tests {
         .unwrap();
 
         assert!(overlays.is_empty());
-        // Local-vs-local collision (`count > 1`) qualifies both `shared_detail` defs
         assert!(defs.contains_key("AlphaSharedDetail"));
         assert!(defs.contains_key("BetaSharedDetail"));
-        // Self-named role container hoisted
         assert!(defs.contains_key("BetaPlatformSchema"));
-        // Pure re-export `line_item` in alpha.json was skipped (not hoisted into defs)
         assert!(!defs.contains_key("LineItem"));
 
-        // Local and cross-file `$ref`s to renamed `$defs` were updated
         assert_eq!(
-            root_raw["Alpha"].1["properties"]["detail"]["$ref"],
+            root_raw["Alpha"]["properties"]["detail"]["$ref"],
             "#/$defs/AlphaSharedDetail"
         );
         assert_eq!(
-            root_raw["Beta"].1["properties"]["detail"]["$ref"],
+            root_raw["Beta"]["properties"]["detail"]["$ref"],
             "#/$defs/BetaSharedDetail"
         );
         assert_eq!(
-            root_raw["Beta"].1["properties"]["alpha_detail"]["$ref"],
+            root_raw["Beta"]["properties"]["alpha_detail"]["$ref"],
             "#/$defs/AlphaSharedDetail"
         );
     }
 
     #[test]
     fn hoist_defs_resolves_ucp_envelopes_without_create_or_update_suffixes() {
-        let loaded = vec![make_loaded(
+        let mut loaded = vec![LoadedSchema::from_file(
             "/schemas/ucp.json",
-            "ucp",
-            None,
-            false,
             json!({
                 "$defs": {
                     "base": {
@@ -585,21 +529,13 @@ mod tests {
                         "required": ["version"],
                         "properties": {
                             "version": { "type": "string" },
-                            "map_order": {
-                                "type": "object",
-                                "ucp_request": "omit"
-                            }
+                            "map_order": { "type": "object", "ucp_request": "omit" }
                         }
                     },
                     "request_checkout_schema": {
                         "allOf": [
                             { "$ref": "#/$defs/base" },
-                            {
-                                "type": "object",
-                                "properties": {
-                                    "capabilities": { "type": "object" }
-                                }
-                            }
+                            { "type": "object", "properties": { "capabilities": { "type": "object" } } }
                         ]
                     },
                     "response_checkout_schema": {
@@ -608,9 +544,7 @@ mod tests {
                             {
                                 "type": "object",
                                 "required": ["payment_handlers"],
-                                "properties": {
-                                    "payment_handlers": { "type": "object" }
-                                }
+                                "properties": { "payment_handlers": { "type": "object" } }
                             }
                         ]
                     }
@@ -623,7 +557,7 @@ mod tests {
         let mut sliced_base_names = BTreeSet::new();
 
         hoist_defs(
-            &loaded,
+            &mut loaded,
             &reachable,
             &BTreeSet::new(),
             &BTreeSet::new(),
@@ -638,12 +572,10 @@ mod tests {
         assert!(!defs.contains_key("UcpBaseUpdateRequest"));
         assert!(!sliced_base_names.contains("UcpBase"));
 
-        // RequestCheckoutSchema resolves inherited base with request visibility (omits map_order)
         let req_base = &defs["RequestCheckoutSchema"]["allOf"][0];
         assert!(req_base["properties"].get("version").is_some());
         assert!(req_base["properties"].get("map_order").is_none());
 
-        // ResponseCheckoutSchema resolves inherited base with response visibility (retains map_order)
         let resp_base = &defs["ResponseCheckoutSchema"]["allOf"][0];
         assert!(resp_base["properties"].get("version").is_some());
         assert!(resp_base["properties"].get("map_order").is_some());

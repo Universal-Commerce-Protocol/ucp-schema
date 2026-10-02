@@ -9,33 +9,28 @@ use crate::codegen::normalizer::{
     normalize_def_schema, qualify_container_op_name, qualify_def_name, rewrite_refs_to_defs,
 };
 use crate::codegen::reachability::{is_container_op_key, LoadedSchema};
-use crate::codegen::CodegenError;
+use crate::codegen::{local_def_ref, CodegenError, SchemaMap};
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
 
-#[allow(clippy::type_complexity, clippy::too_many_arguments)]
 pub(super) fn compose_active_extensions(
     loaded: &[LoadedSchema],
-    working_schemas: &BTreeMap<usize, Value>,
     active_cap_indices: &BTreeSet<usize>,
     active_ext_indices: &BTreeSet<usize>,
     pending_overlays: Vec<(String, Value)>,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
-    defs: &mut BTreeMap<String, Value>,
+    root_raw_schemas: &mut SchemaMap,
+    defs: &mut SchemaMap,
     inlined_mixin_defs: &mut BTreeSet<String>,
-) -> Result<(BTreeMap<String, Value>, Vec<(PathBuf, Value)>), CodegenError> {
+) -> Result<(SchemaMap, Vec<(PathBuf, Value)>), CodegenError> {
     for (target_name, overlay) in pending_overlays {
-        let Some((target_idx, mut target_schema)) = root_raw_schemas.remove(&target_name) else {
-            continue;
-        };
-        merge_extension_into_schema(
-            &mut target_schema,
-            overlay,
+        modify_target_def(
             &target_name,
             root_raw_schemas,
             defs,
+            |target, roots, defs| {
+                merge_extension_into_schema(target, &overlay, &target_name, roots, defs);
+            },
         );
-        root_raw_schemas.insert(target_name, (target_idx, target_schema));
     }
 
     for &cap_idx in active_cap_indices {
@@ -43,20 +38,17 @@ pub(super) fn compose_active_extensions(
         if cap_item.is_container {
             continue;
         }
-        let Some(cap_name) = cap_item.name.as_deref() else {
-            continue;
-        };
-        let Some((target_idx, mut target_schema)) = root_raw_schemas.remove(&cap_item.stem_pascal)
-        else {
+        let (Some(cap_name), Some(mut target_schema)) = (
+            cap_item.name.as_deref(),
+            root_raw_schemas.remove(&cap_item.stem_pascal),
+        ) else {
             continue;
         };
 
         for &ext_idx in active_ext_indices {
             let ext_item = &loaded[ext_idx];
-            let Some(ext_schema) = working_schemas.get(&ext_idx) else {
-                continue;
-            };
-            let Some(ext_block) = ext_schema
+            let Some(ext_block) = ext_item
+                .schema
                 .get("$defs")
                 .and_then(Value::as_object)
                 .and_then(|d| d.get(cap_name))
@@ -65,7 +57,7 @@ pub(super) fn compose_active_extensions(
             };
             let mut prepared = deref_local_mixin_refs(
                 ext_block,
-                ext_schema,
+                &ext_item.schema,
                 &ext_item.stem_pascal,
                 inlined_mixin_defs,
             );
@@ -76,14 +68,14 @@ pub(super) fn compose_active_extensions(
             );
             merge_extension_into_schema(
                 &mut target_schema,
-                prepared,
+                &prepared,
                 &cap_item.stem_pascal,
                 root_raw_schemas,
                 defs,
             );
         }
 
-        root_raw_schemas.insert(cap_item.stem_pascal.clone(), (target_idx, target_schema));
+        root_raw_schemas.insert(cap_item.stem_pascal.clone(), target_schema);
     }
 
     let capability_resources = active_cap_indices
@@ -92,7 +84,7 @@ pub(super) fn compose_active_extensions(
             let name = &loaded[idx].stem_pascal;
             root_raw_schemas
                 .get(name)
-                .map(|(_, val)| (name.clone(), val.clone()))
+                .map(|val| (name.clone(), val.clone()))
         })
         .collect();
 
@@ -102,15 +94,10 @@ pub(super) fn compose_active_extensions(
         if !cap_item.is_container {
             continue;
         }
-        let Some(base_container) = working_schemas.get(&cap_idx) else {
-            continue;
-        };
         let composed = compose_container_capability(
             cap_item,
-            base_container,
             active_ext_indices,
             loaded,
-            working_schemas,
             root_raw_schemas,
             defs,
             inlined_mixin_defs,
@@ -122,85 +109,70 @@ pub(super) fn compose_active_extensions(
     Ok((capability_resources, container_schemas))
 }
 
+fn modify_target_def(
+    name: &str,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+    f: impl FnOnce(&mut Value, &mut BTreeMap<String, Value>, &mut BTreeMap<String, Value>),
+) -> bool {
+    if let Some(mut schema) = root_raw_schemas.remove(name) {
+        f(&mut schema, root_raw_schemas, defs);
+        root_raw_schemas.insert(name.to_string(), schema);
+        return true;
+    }
+    if let Some(mut schema) = defs.remove(name) {
+        f(&mut schema, root_raw_schemas, defs);
+        defs.insert(name.to_string(), schema);
+        return true;
+    }
+    false
+}
+
 fn deref_local_mixin_refs(
     block: &Value,
     source_schema: &Value,
     parent_pascal: &str,
     inlined_mixin_defs: &mut BTreeSet<String>,
 ) -> Value {
+    let mut current = block.clone();
     let Some(defs_obj) = source_schema.get("$defs").and_then(Value::as_object) else {
-        return block.clone();
+        return current;
     };
-    let mut current = if let Some((k, target)) = block
-        .get("$ref")
-        .and_then(Value::as_str)
-        .and_then(|r| r.strip_prefix("#/$defs/"))
-        .and_then(|k| defs_obj.get(k).map(|v| (k, v)))
-    {
-        inlined_mixin_defs.insert(qualify_def_name(parent_pascal, k));
-        target.clone()
-    } else {
-        block.clone()
-    };
-
-    if let Some(arr) = current
-        .as_object_mut()
-        .and_then(|o| o.get_mut("allOf"))
-        .and_then(Value::as_array_mut)
-    {
-        for branch in arr.iter_mut() {
-            if let Some((k, target)) = branch
-                .get("$ref")
-                .and_then(Value::as_str)
-                .and_then(|r| r.strip_prefix("#/$defs/"))
-                .and_then(|k| defs_obj.get(k).map(|v| (k, v)))
-            {
-                inlined_mixin_defs.insert(qualify_def_name(parent_pascal, k));
-                *branch = target.clone();
-            }
+    let mut inline_one = |node: &mut Value| {
+        if let Some((k, target)) = local_def_ref(node).and_then(|k| defs_obj.get(k).map(|v| (k, v)))
+        {
+            inlined_mixin_defs.insert(qualify_def_name(parent_pascal, k));
+            *node = target.clone();
         }
+    };
+    inline_one(&mut current);
+    if let Some(arr) = current.get_mut("allOf").and_then(Value::as_array_mut) {
+        arr.iter_mut().for_each(&mut inline_one);
     }
     current
 }
 
 fn merge_extension_into_schema(
     target: &mut Value,
-    ext_val: Value,
+    ext_val: &Value,
     target_name: &str,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
 ) {
-    let Some(obj) = ext_val.as_object() else {
-        return;
-    };
-    let self_ref = format!("#/$defs/{target_name}");
-    let mut branches = Vec::new();
-
-    if let Some(Value::Array(all_of)) = obj.get("allOf") {
-        branches.extend(
-            all_of
-                .iter()
-                .filter(|item| item.get("$ref").and_then(Value::as_str) != Some(&self_ref))
-                .cloned(),
-        );
+    if let Some(all_of) = ext_val.get("allOf").and_then(Value::as_array) {
+        for branch in all_of {
+            if local_def_ref(branch) != Some(target_name) {
+                merge_single_branch_into_target(target, branch, root_raw_schemas, defs);
+            }
+        }
     }
-    if obj.contains_key("properties") || obj.contains_key("required") {
-        let mut rest = obj.clone();
-        rest.remove("allOf");
-        rest.remove("title");
-        rest.remove("description");
-        branches.push(Value::Object(rest));
-    }
-
-    for branch in branches {
-        merge_single_branch_into_target(target, &branch, root_raw_schemas, defs);
-    }
+    merge_single_branch_into_target(target, ext_val, root_raw_schemas, defs);
 }
 
 fn merge_single_branch_into_target(
     target: &mut Value,
     branch: &Value,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
 ) {
     let (Some(target_obj), Some(branch_obj)) = (target.as_object_mut(), branch.as_object()) else {
@@ -242,7 +214,7 @@ fn merge_single_branch_into_target(
 fn merge_extension_property(
     base_prop: &mut Value,
     ext_prop: &Value,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
 ) {
     let (Some(base_obj), Some(ext_obj)) = (base_prop.as_object_mut(), ext_prop.as_object()) else {
@@ -270,81 +242,41 @@ fn merge_extension_property(
     }
 
     if !base_obj.contains_key("properties") && !ext_obj.contains_key("$ref") {
-        if let Some(target_def) = base_obj
-            .get("$ref")
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix("#/$defs/"))
-            .map(str::to_string)
-        {
-            let mut overlay = Map::new();
-            if let Some(props) = ext_obj.get("properties") {
-                overlay.insert("properties".to_string(), props.clone());
-            }
-            if let Some(reqs) = ext_obj.get("required") {
-                overlay.insert("required".to_string(), reqs.clone());
-            }
-            let overlay_val = Value::Object(overlay);
-            if let Some((idx, mut target_schema)) = root_raw_schemas.remove(&target_def) {
-                merge_single_branch_into_target(
-                    &mut target_schema,
-                    &overlay_val,
-                    root_raw_schemas,
-                    defs,
-                );
-                root_raw_schemas.insert(target_def, (idx, target_schema));
-                return;
-            }
-            if let Some(mut target_schema) = defs.remove(&target_def) {
-                merge_single_branch_into_target(
-                    &mut target_schema,
-                    &overlay_val,
-                    root_raw_schemas,
-                    defs,
-                );
-                defs.insert(target_def, target_schema);
+        if let Some(target_def) = local_def_ref(base_prop).map(str::to_string) {
+            if modify_target_def(
+                &target_def,
+                root_raw_schemas,
+                defs,
+                |target, roots, defs| {
+                    merge_single_branch_into_target(target, ext_prop, roots, defs);
+                },
+            ) {
                 return;
             }
         }
     }
 
-    let Some(Value::Object(ext_sub)) = ext_obj.get("properties") else {
-        return;
-    };
-    let Some(base_sub) = base_obj
-        .entry("properties".to_string())
-        .or_insert_with(|| Value::Object(Map::new()))
-        .as_object_mut()
-    else {
-        return;
-    };
-    for (k, v) in ext_sub {
-        if let Some(existing) = base_sub.get_mut(k) {
-            merge_extension_property(existing, v, root_raw_schemas, defs);
-        } else {
-            base_sub.insert(k.clone(), v.clone());
-        }
-    }
+    merge_single_branch_into_target(base_prop, ext_prop, root_raw_schemas, defs);
 }
 
 fn merge_extension_items(
     base_obj: &mut Map<String, Value>,
     ext_items: &Value,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
 ) {
-    if let Some(ext_ref_str) = ext_items.get("$ref").and_then(Value::as_str) {
+    if let Some(ext_def) = local_def_ref(ext_items) {
         let keep_base_ref = base_obj
             .get("items")
-            .and_then(|i| i.get("$ref"))
-            .and_then(Value::as_str)
-            .and_then(|r| r.strip_prefix("#/$defs/"))
-            .zip(ext_ref_str.strip_prefix("#/$defs/"))
-            .is_some_and(|(base_def, ext_def)| {
-                def_extends_target(base_def, ext_def, root_raw_schemas, defs)
-            });
+            .and_then(local_def_ref)
+            .is_some_and(|base_def| def_extends_target(base_def, ext_def, root_raw_schemas, defs));
         if !keep_base_ref {
             base_obj.insert("items".to_string(), ext_items.clone());
         }
+        return;
+    }
+    if ext_items.get("$ref").is_some() {
+        base_obj.insert("items".to_string(), ext_items.clone());
         return;
     }
 
@@ -361,16 +293,13 @@ fn merge_extension_items(
 
     if let Some(item_def) = base_obj
         .get("items")
-        .and_then(|i| i.get("$ref"))
-        .and_then(Value::as_str)
-        .and_then(|r| r.strip_prefix("#/$defs/"))
+        .and_then(local_def_ref)
         .map(str::to_string)
     {
-        if let Some((_, target_schema)) = root_raw_schemas.get_mut(&item_def) {
-            append_unique_allof_branches(target_schema, cond_branches);
-            return;
-        }
-        if let Some(target_schema) = defs.get_mut(&item_def) {
+        if let Some(target_schema) = root_raw_schemas
+            .get_mut(&item_def)
+            .or_else(|| defs.get_mut(&item_def))
+        {
             append_unique_allof_branches(target_schema, cond_branches);
             return;
         }
@@ -384,36 +313,29 @@ fn merge_extension_items(
 fn def_extends_target(
     base_def: &str,
     ext_def: &str,
-    root_raw_schemas: &BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &BTreeMap<String, Value>,
     defs: &BTreeMap<String, Value>,
 ) -> bool {
     if base_def == ext_def {
         return true;
     }
-    let expected_ref = format!("#/$defs/{ext_def}");
-    let schema = defs
+    let Some(all_of) = defs
         .get(base_def)
-        .or_else(|| root_raw_schemas.get(base_def).map(|(_, s)| s));
-    let Some(all_of) = schema
+        .or_else(|| root_raw_schemas.get(base_def))
         .and_then(|s| s.get("allOf"))
         .and_then(Value::as_array)
     else {
         return false;
     };
-    all_of
-        .iter()
-        .any(|b| b.get("$ref").and_then(Value::as_str) == Some(&expected_ref))
+    all_of.iter().any(|b| local_def_ref(b) == Some(ext_def))
 }
 
 fn append_unique_allof_branches(target: &mut Value, branches: Vec<Value>) {
-    let Some(target_obj) = target.as_object_mut() else {
-        return;
-    };
-    let Some(all_of) = target_obj
-        .entry("allOf".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-    else {
+    let Some(all_of) = target.as_object_mut().and_then(|o| {
+        o.entry("allOf".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+    }) else {
         return;
     };
     for branch in branches {
@@ -423,35 +345,26 @@ fn append_unique_allof_branches(target: &mut Value, branches: Vec<Value>) {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn compose_container_capability(
     cap_item: &LoadedSchema,
-    base_container: &Value,
     active_ext_indices: &BTreeSet<usize>,
     loaded: &[LoadedSchema],
-    working_schemas: &BTreeMap<usize, Value>,
-    root_raw_schemas: &mut BTreeMap<String, (usize, Value)>,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
     inlined_mixin_defs: &mut BTreeSet<String>,
 ) -> Result<Value, CodegenError> {
-    let mut composed = base_container.clone();
-    let Some(cap_name) = cap_item.name.as_deref() else {
-        return Ok(composed);
-    };
-    let Some(container_defs) = composed
-        .as_object_mut()
-        .and_then(|o| o.get_mut("$defs"))
-        .and_then(Value::as_object_mut)
-    else {
+    let mut composed = cap_item.schema.clone();
+    let (Some(cap_name), Some(container_defs)) = (
+        cap_item.name.as_deref(),
+        composed.get_mut("$defs").and_then(Value::as_object_mut),
+    ) else {
         return Ok(composed);
     };
 
     for &ext_idx in active_ext_indices {
         let ext_item = &loaded[ext_idx];
-        let Some(ext_schema) = working_schemas.get(&ext_idx) else {
-            continue;
-        };
-        let Some(ext_cap_block) = ext_schema
+        let Some(ext_cap_block) = ext_item
+            .schema
             .get("$defs")
             .and_then(Value::as_object)
             .and_then(|d| d.get(cap_name))
@@ -459,55 +372,37 @@ fn compose_container_capability(
             continue;
         };
 
-        if let Some(nested_defs) = ext_cap_block.get("$defs").and_then(Value::as_object) {
-            for (op_key, op_ext_val) in nested_defs {
-                let Some(target_op_schema) = container_defs.get_mut(op_key) else {
-                    continue;
-                };
-                let target_op_name = qualify_container_op_name(&cap_item.stem_pascal, op_key);
-                let mut derefed = deref_local_mixin_refs(
-                    op_ext_val,
-                    ext_schema,
-                    &ext_item.stem_pascal,
-                    inlined_mixin_defs,
-                );
-                rewrite_refs_to_defs(&mut derefed, &target_op_name, Some(&ext_item.stem_pascal));
-                merge_extension_into_schema(
-                    target_op_schema,
-                    derefed,
-                    &target_op_name,
-                    root_raw_schemas,
-                    defs,
-                );
-            }
-            continue;
-        }
-
-        let candidate_blocks: Vec<&Value> =
-            if let Some(one_of) = ext_cap_block.get("oneOf").and_then(Value::as_array) {
-                one_of.iter().collect()
+        let op_patches: Vec<(String, &Value)> =
+            if let Some(nested_defs) = ext_cap_block.get("$defs").and_then(Value::as_object) {
+                nested_defs.iter().map(|(k, v)| (k.clone(), v)).collect()
             } else {
-                vec![ext_cap_block]
+                let blocks: Vec<&Value> =
+                    if let Some(one_of) = ext_cap_block.get("oneOf").and_then(Value::as_array) {
+                        one_of.iter().collect()
+                    } else {
+                        vec![ext_cap_block]
+                    };
+                blocks
+                    .into_iter()
+                    .filter_map(|b| find_referenced_container_op(b, container_defs).map(|k| (k, b)))
+                    .collect()
             };
 
-        for block in candidate_blocks {
-            let Some(op_key) = find_referenced_container_op(block, container_defs) else {
-                continue;
-            };
+        for (op_key, block) in op_patches {
             let Some(target_op_schema) = container_defs.get_mut(&op_key) else {
                 continue;
             };
             let target_op_name = qualify_container_op_name(&cap_item.stem_pascal, &op_key);
             let mut derefed = deref_local_mixin_refs(
                 block,
-                ext_schema,
+                &ext_item.schema,
                 &ext_item.stem_pascal,
                 inlined_mixin_defs,
             );
             rewrite_refs_to_defs(&mut derefed, &target_op_name, Some(&ext_item.stem_pascal));
             merge_extension_into_schema(
                 target_op_schema,
-                derefed,
+                &derefed,
                 &target_op_name,
                 root_raw_schemas,
                 defs,
@@ -522,10 +417,8 @@ fn find_referenced_container_op(
     block: &Value,
     container_defs: &Map<String, Value>,
 ) -> Option<String> {
-    let all_of = block.get("allOf").and_then(Value::as_array)?;
-    all_of.iter().find_map(|branch| {
-        let ref_str = branch.get("$ref").and_then(Value::as_str)?;
-        let (_, def_key) = ref_str.split_once("#/$defs/")?;
+    block.get("allOf")?.as_array()?.iter().find_map(|branch| {
+        let (_, def_key) = branch.get("$ref")?.as_str()?.split_once("#/$defs/")?;
         container_defs
             .contains_key(def_key)
             .then(|| def_key.to_string())
@@ -562,7 +455,6 @@ fn hoist_container_operations(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::codegen::normalizer::to_pascal_case;
     use serde_json::json;
 
     #[test]
@@ -572,10 +464,7 @@ mod tests {
             "required": ["id"],
             "properties": {
                 "id": { "type": "string" },
-                "products": {
-                    "type": "array",
-                    "items": { "$ref": "#/$defs/Product" }
-                }
+                "products": { "type": "array", "items": { "$ref": "#/$defs/Product" } }
             }
         });
 
@@ -585,10 +474,7 @@ mod tests {
                     "type": "object",
                     "required": ["id", "extra_req"],
                     "properties": {
-                        "products": {
-                            "type": "array",
-                            "items": { "$ref": "#/$defs/FulfillmentProduct" }
-                        },
+                        "products": { "type": "array", "items": { "$ref": "#/$defs/FulfillmentProduct" } },
                         "extra_req": { "type": "string" }
                     }
                 },
@@ -613,7 +499,7 @@ mod tests {
         let mut defs = BTreeMap::new();
         merge_extension_into_schema(
             &mut target,
-            derefed,
+            &derefed,
             "Checkout",
             &mut root_raw_schemas,
             &mut defs,
@@ -634,45 +520,28 @@ mod tests {
             "properties": {
                 "actions": { "$ref": "#/$defs/Actions" },
                 "payment": { "$ref": "#/$defs/Payment" },
-                "policies": {
-                    "type": "array",
-                    "items": { "$ref": "#/$defs/Policy" }
-                }
+                "policies": { "type": "array", "items": { "$ref": "#/$defs/Policy" } }
             }
         });
         let mut root_raw_schemas = BTreeMap::from([
             (
                 "Actions".to_string(),
-                (
-                    1,
-                    json!({
-                        "type": "object",
-                        "propertyNames": { "$ref": "#/$defs/ReverseDomainName" }
-                    }),
-                ),
+                json!({ "type": "object", "propertyNames": { "$ref": "#/$defs/ReverseDomainName" } }),
             ),
             (
                 "Payment".to_string(),
-                (
-                    2,
-                    json!({
-                        "type": "object",
-                        "properties": {
-                            "instruments": {
-                                "type": "array",
-                                "items": { "$ref": "#/$defs/SelectedPaymentInstrument" }
-                            }
-                        }
-                    }),
-                ),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instruments": { "type": "array", "items": { "$ref": "#/$defs/SelectedPaymentInstrument" } }
+                    }
+                }),
             ),
-            ("Policy".to_string(), (3, json!({ "type": "object" }))),
+            ("Policy".to_string(), json!({ "type": "object" })),
         ]);
         let mut defs = BTreeMap::from([(
             "SelectedPaymentInstrument".to_string(),
-            json!({
-                "allOf": [{ "$ref": "#/$defs/PaymentInstrument" }]
-            }),
+            json!({ "allOf": [{ "$ref": "#/$defs/PaymentInstrument" }] }),
         )]);
 
         let ext = json!({
@@ -706,7 +575,7 @@ mod tests {
 
         merge_extension_into_schema(
             &mut booking,
-            ext,
+            &ext,
             "Booking",
             &mut root_raw_schemas,
             &mut defs,
@@ -714,17 +583,17 @@ mod tests {
 
         assert!(booking["properties"]["actions"].get("properties").is_none());
         assert_eq!(booking["properties"]["actions"]["ucp_request"], "omit");
-        assert!(root_raw_schemas["Actions"].1["properties"]
+        assert!(root_raw_schemas["Actions"]["properties"]
             .get("dev.ucp.common.payment.three_ds_challenge")
             .is_some());
 
         assert!(booking["properties"]["payment"].get("properties").is_none());
         assert_eq!(
-            root_raw_schemas["Payment"].1["properties"]["instruments"]["items"]["$ref"],
+            root_raw_schemas["Payment"]["properties"]["instruments"]["items"]["$ref"],
             "#/$defs/SelectedPaymentInstrument"
         );
         assert_eq!(
-            root_raw_schemas["Payment"].1["properties"]["instruments"]["ucp_request"]["complete"],
+            root_raw_schemas["Payment"]["properties"]["instruments"]["ucp_request"]["complete"],
             "required"
         );
 
@@ -733,112 +602,64 @@ mod tests {
             json!({ "$ref": "#/$defs/Policy" })
         );
         assert_eq!(
-            root_raw_schemas["Policy"].1["allOf"][0]["then"]["$ref"],
+            root_raw_schemas["Policy"]["allOf"][0]["then"]["$ref"],
             "#/$defs/CancellationItem"
         );
     }
 
     #[test]
     fn compose_container_capability_supports_nested_defs_and_oneof_allof_extensions() {
-        let cap_item = LoadedSchema {
-            path: PathBuf::from("/schemas/shopping/catalog_lookup.json"),
-            stem: "catalog_lookup".to_string(),
-            stem_pascal: to_pascal_case("catalog_lookup"),
-            name: Some("dev.ucp.shopping.catalog.lookup".to_string()),
-            is_extension: false,
-            is_container: true,
-            is_capability: true,
-            in_types_dir: false,
-            schema: json!({}),
-        };
-
-        let base_container = json!({
-            "name": "dev.ucp.shopping.catalog.lookup",
-            "$defs": {
-                "lookup_request": {
-                    "type": "object",
-                    "properties": { "ids": { "type": "array" } }
-                },
-                "lookup_response": {
-                    "type": "object",
-                    "properties": { "products": { "type": "array" } }
-                }
-            }
-        });
-
-        let ext_nested = LoadedSchema {
-            path: PathBuf::from("/schemas/shopping/fulfillment.json"),
-            stem: "fulfillment".to_string(),
-            stem_pascal: "Fulfillment".to_string(),
-            name: Some("dev.ucp.shopping.fulfillment".to_string()),
-            is_extension: true,
-            is_container: false,
-            is_capability: false,
-            in_types_dir: false,
-            schema: json!({}),
-        };
-        let ext_oneof = LoadedSchema {
-            path: PathBuf::from("/schemas/common/loyalty.json"),
-            stem: "loyalty".to_string(),
-            stem_pascal: "Loyalty".to_string(),
-            name: Some("dev.ucp.common.loyalty".to_string()),
-            is_extension: true,
-            is_container: false,
-            is_capability: false,
-            in_types_dir: false,
-            schema: json!({}),
-        };
-
-        let loaded = vec![cap_item.clone(), ext_nested, ext_oneof];
-        let mut working_schemas = BTreeMap::new();
-        working_schemas.insert(
-            1,
-            json!({
-                "$defs": {
-                    "req_mixin": {
-                        "type": "object",
-                        "properties": { "context": { "$ref": "types/context.json" } }
-                    },
-                    "dev.ucp.shopping.catalog.lookup": {
-                        "$defs": {
-                            "lookup_request": { "$ref": "#/$defs/req_mixin" }
+        let loaded = vec![
+            LoadedSchema::from_file(
+                "/schemas/shopping/catalog_lookup.json",
+                json!({
+                    "name": "dev.ucp.shopping.catalog.lookup",
+                    "$defs": {
+                        "lookup_request": { "type": "object", "properties": { "ids": { "type": "array" } } },
+                        "lookup_response": { "type": "object", "properties": { "products": { "type": "array" } } }
+                    }
+                }),
+            ),
+            LoadedSchema::from_file(
+                "/schemas/shopping/fulfillment.json",
+                json!({
+                    "name": "dev.ucp.shopping.fulfillment",
+                    "$defs": {
+                        "req_mixin": {
+                            "type": "object",
+                            "properties": { "context": { "$ref": "types/context.json" } }
+                        },
+                        "dev.ucp.shopping.catalog.lookup": {
+                            "$defs": { "lookup_request": { "$ref": "#/$defs/req_mixin" } }
                         }
                     }
-                }
-            }),
-        );
-        working_schemas.insert(
-            2,
-            json!({
-                "$defs": {
-                    "dev.ucp.shopping.catalog.lookup": {
-                        "oneOf": [
-                            {
+                }),
+            ),
+            LoadedSchema::from_file(
+                "/schemas/common/loyalty.json",
+                json!({
+                    "name": "dev.ucp.common.loyalty",
+                    "$defs": {
+                        "dev.ucp.shopping.catalog.lookup": {
+                            "oneOf": [{
                                 "allOf": [
                                     { "$ref": "catalog_lookup.json#/$defs/lookup_response" },
-                                    {
-                                        "type": "object",
-                                        "properties": {
-                                            "loyalty": { "$ref": "types/loyalty.json" }
-                                        }
-                                    }
+                                    { "type": "object", "properties": { "loyalty": { "$ref": "types/loyalty.json" } } }
                                 ]
-                            }
-                        ]
+                            }]
+                        }
                     }
-                }
-            }),
-        );
+                }),
+            ),
+        ];
 
         let mut root_raw_schemas = BTreeMap::new();
         let mut defs = BTreeMap::new();
         let mut inlined_mixin_defs = BTreeSet::new();
         let composed = compose_container_capability(
-            &cap_item,
-            &base_container,
+            &loaded[0],
             &BTreeSet::from([1, 2]),
             &loaded,
-            &working_schemas,
             &mut root_raw_schemas,
             &mut defs,
             &mut inlined_mixin_defs,
@@ -846,7 +667,7 @@ mod tests {
         .unwrap();
 
         assert!(inlined_mixin_defs.contains("ReqMixin"));
-        hoist_container_operations(&cap_item, &composed, &mut defs).unwrap();
+        hoist_container_operations(&loaded[0], &composed, &mut defs).unwrap();
 
         assert_eq!(
             defs["CatalogLookupRequest"]["properties"]["context"]["$ref"],

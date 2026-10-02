@@ -13,78 +13,18 @@ fn ucp_schemas_dir() -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-const INSTANCE_DATA_KEYS: &[&str] = &["const", "enum", "default", "examples"];
-
-fn collect_schema_refs_and_annotations(
-    val: &Value,
-    refs: &mut Vec<String>,
-    annotations: &mut Vec<String>,
-    hybrid_ref_props: &mut usize,
-    allof_branch_titles: &mut Vec<String>,
-) {
-    let Some(obj) = val.as_object() else {
-        if let Some(arr) = val.as_array() {
-            for item in arr {
-                collect_schema_refs_and_annotations(
-                    item,
-                    refs,
-                    annotations,
-                    hybrid_ref_props,
-                    allof_branch_titles,
-                );
-            }
-        }
-        return;
-    };
-
-    if let Some(Value::String(r)) = obj.get("$ref") {
-        refs.push(r.clone());
-        if obj.contains_key("properties") {
-            *hybrid_ref_props += 1;
-        }
-    }
-    if let Some(Value::Array(all_of)) = obj.get("allOf") {
-        for branch in all_of.iter().filter_map(Value::as_object) {
-            if let Some(Value::String(t)) = branch.get("title") {
-                allof_branch_titles.push(t.clone());
-            }
-        }
-    }
-    for key in obj.keys() {
-        if key == "ucp_request"
-            || key == "ucp_response"
-            || key == "ucp_shared_request"
-            || key.starts_with("x-ucp-")
-        {
-            annotations.push(key.clone());
-        }
-    }
-
-    for (k, v) in obj {
-        if INSTANCE_DATA_KEYS.contains(&k.as_str()) {
-            continue;
-        }
-        if k == "properties" || k == "$defs" || k == "definitions" || k == "patternProperties" {
-            if let Some(map) = v.as_object() {
-                for child in map.values() {
-                    collect_schema_refs_and_annotations(
-                        child,
-                        refs,
-                        annotations,
-                        hybrid_ref_props,
-                        allof_branch_titles,
-                    );
+fn visit_schema_objects(val: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
+    match val {
+        Value::Object(obj) => {
+            f(obj);
+            for (k, v) in obj {
+                if !["const", "enum", "default", "examples"].contains(&k.as_str()) {
+                    visit_schema_objects(v, f);
                 }
             }
-            continue;
         }
-        collect_schema_refs_and_annotations(
-            v,
-            refs,
-            annotations,
-            hybrid_ref_props,
-            allof_branch_titles,
-        );
+        Value::Array(arr) => arr.iter().for_each(|v| visit_schema_objects(v, f)),
+        _ => {}
     }
 }
 
@@ -96,41 +36,51 @@ fn assert_bundle_invariants(defs: &std::collections::BTreeMap<String, Value>) {
             Some(def_name.as_str()),
             "def '{def_name}' must have canonical title equal to its $defs key"
         );
-
-        let mut refs = Vec::new();
-        let mut annotations = Vec::new();
-        let mut hybrid_ref_props = 0;
-        let mut allof_branch_titles = Vec::new();
-        collect_schema_refs_and_annotations(
-            schema_val,
-            &mut refs,
-            &mut annotations,
-            &mut hybrid_ref_props,
-            &mut allof_branch_titles,
-        );
-
-        assert!(
-            annotations.is_empty(),
-            "def '{def_name}' still contains UCP annotations: {annotations:?}"
-        );
-        assert_eq!(
-            hybrid_ref_props, 0,
-            "def '{def_name}' contains hybrid $ref + inline properties node(s)"
-        );
-        assert!(
-            allof_branch_titles.is_empty(),
-            "def '{def_name}' contains inline allOf branch title(s): {allof_branch_titles:?}"
-        );
-
-        for r in refs {
-            let Some(target) = r.strip_prefix("#/$defs/") else {
-                panic!("def '{def_name}' contains non-local $ref: '{r}'");
-            };
+        visit_schema_objects(schema_val, &mut |obj| {
+            if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
+                assert!(
+                    !obj.contains_key("properties"),
+                    "def '{def_name}' contains hybrid $ref + inline properties node"
+                );
+                let target = r
+                    .strip_prefix("#/$defs/")
+                    .unwrap_or_else(|| panic!("def '{def_name}' contains non-local $ref: '{r}'"));
+                assert!(
+                    known.contains(target),
+                    "def '{def_name}' contains dangling $ref '#/$defs/{target}'"
+                );
+            }
+            if let Some(all_of) = obj.get("allOf").and_then(Value::as_array) {
+                assert!(
+                    all_of.iter().all(|b| b.get("title").is_none()),
+                    "def '{def_name}' contains inline allOf branch title"
+                );
+            }
             assert!(
-                known.contains(target),
-                "def '{def_name}' contains dangling $ref '#/$defs/{target}'"
+                !obj.keys().any(|k| {
+                    k == "ucp_request"
+                        || k == "ucp_response"
+                        || k == "ucp_shared_request"
+                        || k.starts_with("x-ucp-")
+                }),
+                "def '{def_name}' still contains UCP annotations"
             );
-        }
+        });
+    }
+}
+
+fn assert_has_defs(defs: &std::collections::BTreeMap<String, Value>, names: &[&str]) {
+    for &n in names {
+        assert!(defs.contains_key(n), "expected def '{n}' in bundle.defs");
+    }
+}
+
+fn assert_lacks_defs(defs: &std::collections::BTreeMap<String, Value>, names: &[&str]) {
+    for &n in names {
+        assert!(
+            !defs.contains_key(n),
+            "expected def '{n}' to be excluded/pruned"
+        );
     }
 }
 
@@ -180,11 +130,11 @@ fn fixture_composes_extensions_and_slices_directionally() {
     assert_eq!(bundle.title, "Custom Shopping Bundle");
     assert_eq!(bundle.description.as_deref(), Some("Test bundle"));
     assert_bundle_invariants(&bundle.defs);
-
-    assert!(bundle.defs.contains_key("Checkout"));
-    assert!(bundle.defs.contains_key("CheckoutCreateRequest"));
-    assert!(bundle.defs.contains_key("CheckoutUpdateRequest"));
-    assert!(!bundle.defs.contains_key("Cart"));
+    assert_has_defs(
+        &bundle.defs,
+        &["Checkout", "CheckoutCreateRequest", "CheckoutUpdateRequest"],
+    );
+    assert_lacks_defs(&bundle.defs, &["Cart"]);
 
     assert!(bundle.defs["Checkout"]["properties"]
         .get("discounts")
@@ -221,46 +171,40 @@ fn ucp_corpus_checkout_with_discount_scoping_and_slicing() {
 
     let bundle = generate_types(&opts).unwrap();
     assert_bundle_invariants(&bundle.defs);
-
-    for expected in [
-        "Checkout",
-        "CheckoutCreateRequest",
-        "CheckoutUpdateRequest",
-        "CheckoutCompleteRequest",
-        "DiscountsObject",
-        "DiscountsObjectCreateRequest",
-        "DiscountsObjectUpdateRequest",
-        "AppliedDiscount",
-        "Allocation",
-        "LineItem",
-        "LineItemCreateRequest",
-        "LineItemUpdateRequest",
-        "Buyer",
-        "Total",
-        "ErrorResponse",
-        "UcpBase",
-    ] {
-        assert!(
-            bundle.defs.contains_key(expected),
-            "expected def '{expected}' in bundle.defs"
-        );
-    }
-
-    for excluded in [
-        "Cart",
-        "CartCreateRequest",
-        "Order",
-        "Booking",
-        "CatalogSearchRequest",
-        "CatalogLookupRequest",
-        "UcpBaseCreateRequest",
-        "UcpBaseUpdateRequest",
-    ] {
-        assert!(
-            !bundle.defs.contains_key(excluded),
-            "expected inactive capability def '{excluded}' to be excluded"
-        );
-    }
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "Checkout",
+            "CheckoutCreateRequest",
+            "CheckoutUpdateRequest",
+            "CheckoutCompleteRequest",
+            "DiscountsObject",
+            "DiscountsObjectCreateRequest",
+            "DiscountsObjectUpdateRequest",
+            "AppliedDiscount",
+            "Allocation",
+            "LineItem",
+            "LineItemCreateRequest",
+            "LineItemUpdateRequest",
+            "Buyer",
+            "Total",
+            "ErrorResponse",
+            "UcpBase",
+        ],
+    );
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "Cart",
+            "CartCreateRequest",
+            "Order",
+            "Booking",
+            "CatalogSearchRequest",
+            "CatalogLookupRequest",
+            "UcpBaseCreateRequest",
+            "UcpBaseUpdateRequest",
+        ],
+    );
 
     assert_eq!(
         bundle.defs["Checkout"]["properties"]["discounts"]["$ref"],
@@ -274,12 +218,9 @@ fn ucp_corpus_checkout_with_discount_scoping_and_slicing() {
         bundle.defs["CheckoutUpdateRequest"]["properties"]["discounts"]["$ref"],
         "#/$defs/DiscountsObjectUpdateRequest"
     );
-    assert!(
-        bundle.defs["CheckoutCompleteRequest"]["properties"]
-            .get("discounts")
-            .is_none(),
-        "discounts has complete: omit in discount.json"
-    );
+    assert!(bundle.defs["CheckoutCompleteRequest"]["properties"]
+        .get("discounts")
+        .is_none());
     assert!(bundle.defs["DiscountsObjectCreateRequest"]["properties"]
         .get("applied")
         .is_none());
@@ -312,45 +253,41 @@ fn ucp_corpus_multi_extension_and_container_composition() {
     let bundle = generate_types(&opts).unwrap();
     assert_bundle_invariants(&bundle.defs);
 
-    // 1. BuyerConsent composed in-place into Buyer and overrides CheckoutCompleteRequest.buyer;
-    // unreachable ConsentPurpose*Request slices and inlined Fulfillment*Request/Response mixins are pruned
     assert_eq!(
         bundle.defs["Buyer"]["properties"]["consent"]["$ref"],
         "#/$defs/Consent"
     );
-    assert!(bundle.defs.contains_key("ConsentPurpose"));
-    assert!(bundle.defs.contains_key("ConsentSegment"));
-    for pruned in [
-        "ConsentPurposeCreateRequest",
-        "ConsentPurposeUpdateRequest",
-        "ConsentSegmentCreateRequest",
-        "ConsentSegmentUpdateRequest",
-        "FulfillmentSearchRequest",
-        "FulfillmentSearchResponse",
-        "FulfillmentLookupRequest",
-        "FulfillmentLookupResponse",
-        "FulfillmentGetProductRequest",
-        "FulfillmentGetProductResponse",
-    ] {
-        assert!(
-            !bundle.defs.contains_key(pruned),
-            "expected dead/unreferenced def '{pruned}' to be pruned"
-        );
-    }
-    assert!(
-        bundle.defs["CheckoutCompleteRequest"]["properties"]
-            .get("buyer")
-            .is_some(),
-        "buyer_consent sets buyer.ucp_request.complete = optional"
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "ConsentPurpose",
+            "ConsentSegment",
+            "BusinessSplitPaymentsConfig",
+            "PaymentSplitPaymentsBusinessSchema",
+        ],
     );
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "ConsentPurposeCreateRequest",
+            "ConsentPurposeUpdateRequest",
+            "ConsentSegmentCreateRequest",
+            "ConsentSegmentUpdateRequest",
+            "FulfillmentSearchRequest",
+            "FulfillmentSearchResponse",
+            "FulfillmentLookupRequest",
+            "FulfillmentLookupResponse",
+            "FulfillmentGetProductRequest",
+            "FulfillmentGetProductResponse",
+        ],
+    );
+    assert!(bundle.defs["CheckoutCompleteRequest"]["properties"]
+        .get("buyer")
+        .is_some());
 
-    // 2. PaymentTerms and PaymentSplitPayments composed in-place into Payment (without hybrid $ref + properties on Checkout.properties.payment)
     assert!(bundle.defs["Checkout"]["properties"]["payment"]
         .get("properties")
         .is_none());
-    assert!(bundle.defs["Payment"]["properties"]
-        .get("instruments")
-        .is_some());
     assert_eq!(
         bundle.defs["Payment"]["properties"]["instruments"]["items"]["$ref"],
         "#/$defs/SelectedPaymentInstrument"
@@ -372,18 +309,11 @@ fn ucp_corpus_multi_extension_and_container_composition() {
         bundle.defs["PaymentCompleteRequest"]["required"],
         serde_json::json!(["instruments"])
     );
-
-    // 3. PaymentSplitPayments composed in-place into PaymentInstrument and role schema hoisted
     assert_eq!(
         bundle.defs["PaymentInstrument"]["properties"]["amount"]["$ref"],
         "#/$defs/Amount"
     );
-    assert!(bundle.defs.contains_key("BusinessSplitPaymentsConfig"));
-    assert!(bundle
-        .defs
-        .contains_key("PaymentSplitPaymentsBusinessSchema"));
 
-    // 4. Fulfillment + Loyalty composed into CatalogSearch and CatalogLookup container ops
     assert_eq!(
         bundle.defs["CatalogSearchRequest"]["properties"]["filters"]["$ref"],
         "#/$defs/FulfillmentSearchFilters"
@@ -419,84 +349,70 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         return;
     };
 
-    let opts = GenerateTypesOptions::new().schema_dir(schema_dir);
-
-    let bundle = generate_types(&opts).unwrap();
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(schema_dir)).unwrap();
     assert_bundle_invariants(&bundle.defs);
 
-    // Verify self-named capability role schemas and helper defs are present
-    for expected in [
-        "Provider",
-        "ScopePolicy",
-        "ScopeToken",
-        "IdentityLinkingPlatformSchema",
-        "IdentityLinkingBusinessSchema",
-        "PermalinkEndpoint",
-        "PermalinkConfig",
-        "PermalinkPlatformSchema",
-        "PermalinkBusinessSchema",
-        "PermalinkResponseSchema",
-        "FulfillmentPlatformSchema",
-        "FulfillmentBusinessSchema",
-        "PaymentSplitPaymentsBusinessSchema",
-        // Collision-qualified $defs alongside standalone types
-        "ErrorCode",
-        "PaymentAp2MandateErrorCode",
-        "ErrorResponse",
-        "JsonrpcErrorResponse",
-        "Message",
-        "A2aMessageMessage",
-        // Standalone map-valued schema with $defs
-        "Actions",
-        "Instance",
-        // Lodging cancellation policy item wired into Policy.allOf
-        "Policy",
-        "CancellationItem",
-        // Container capabilities
-        "CatalogSearchRequest",
-        "CatalogSearchResponse",
-        "CatalogLookupRequest",
-        "CatalogLookupResponse",
-        "CatalogGetProductRequest",
-        "CatalogGetProductResponse",
-        "LocationSearchRequest",
-        "LocationSearchResponse",
-        "LocationLookupRequest",
-        "LocationLookupResponse",
-    ] {
-        assert!(
-            bundle.defs.contains_key(expected),
-            "expected '{expected}' in full corpus bundle.defs"
-        );
-    }
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "Provider",
+            "ScopePolicy",
+            "ScopeToken",
+            "IdentityLinkingPlatformSchema",
+            "IdentityLinkingBusinessSchema",
+            "PermalinkEndpoint",
+            "PermalinkConfig",
+            "PermalinkPlatformSchema",
+            "PermalinkBusinessSchema",
+            "PermalinkResponseSchema",
+            "FulfillmentPlatformSchema",
+            "FulfillmentBusinessSchema",
+            "PaymentSplitPaymentsBusinessSchema",
+            "ErrorCode",
+            "PaymentAp2MandateErrorCode",
+            "ErrorResponse",
+            "JsonrpcErrorResponse",
+            "Message",
+            "A2aMessageMessage",
+            "Actions",
+            "Instance",
+            "Policy",
+            "CancellationItem",
+            "CatalogSearchRequest",
+            "CatalogSearchResponse",
+            "CatalogLookupRequest",
+            "CatalogLookupResponse",
+            "CatalogGetProductRequest",
+            "CatalogGetProductResponse",
+            "LocationSearchRequest",
+            "LocationSearchResponse",
+            "LocationLookupRequest",
+            "LocationLookupResponse",
+        ],
+    );
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "PaymentActions",
+            "FulfillmentSearchRequest",
+            "FulfillmentSearchResponse",
+            "FulfillmentLookupRequest",
+            "FulfillmentLookupResponse",
+            "FulfillmentGetProductRequest",
+            "FulfillmentGetProductResponse",
+            "LocationCreateRequest",
+            "LocationUpdateRequest",
+            "DailyHourCreateRequest",
+            "DailyHourUpdateRequest",
+            "ExceptionHourCreateRequest",
+            "ExceptionHourUpdateRequest",
+            "StayCompleteRequest",
+            "TokenCredentialCreateRequest",
+            "TokenCredentialUpdateRequest",
+            "TokenCredentialCompleteRequest",
+        ],
+    );
 
-    // Verify inlined mixin defs and unreachable non-capability request slices are pruned
-    for pruned in [
-        "PaymentActions",
-        "FulfillmentSearchRequest",
-        "FulfillmentSearchResponse",
-        "FulfillmentLookupRequest",
-        "FulfillmentLookupResponse",
-        "FulfillmentGetProductRequest",
-        "FulfillmentGetProductResponse",
-        "LocationCreateRequest",
-        "LocationUpdateRequest",
-        "DailyHourCreateRequest",
-        "DailyHourUpdateRequest",
-        "ExceptionHourCreateRequest",
-        "ExceptionHourUpdateRequest",
-        "StayCompleteRequest",
-        "TokenCredentialCreateRequest",
-        "TokenCredentialUpdateRequest",
-        "TokenCredentialCompleteRequest",
-    ] {
-        assert!(
-            !bundle.defs.contains_key(pruned),
-            "expected unreferenced def '{pruned}' to be pruned from full corpus bundle"
-        );
-    }
-
-    // Verify payment_authentication.json merges action properties into Actions (leaving Checkout.properties.actions as a pure $ref)
     assert!(bundle.defs["Checkout"]["properties"]["actions"]
         .get("properties")
         .is_none());
@@ -511,7 +427,6 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         .get("dev.ucp.common.payment.three_ds_challenge")
         .is_some());
 
-    // Verify lodging/policy_cancellation.json attaches its conditional if/then branch to Policy.allOf
     assert_eq!(
         bundle.defs["Booking"]["properties"]["policies"]["items"],
         serde_json::json!({ "$ref": "#/$defs/Policy" })
@@ -521,7 +436,6 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         "#/$defs/CancellationItem"
     );
 
-    // Verify payment_ap2_mandate.json response-only Ap2WithMerchantAuthorization is omitted from CheckoutCompleteRequest.properties.ap2.allOf
     let complete_ap2_allof = bundle.defs["CheckoutCompleteRequest"]["properties"]["ap2"]["allOf"]
         .as_array()
         .expect("CheckoutCompleteRequest.properties.ap2.allOf must be an array");
@@ -538,7 +452,6 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
         return;
     };
 
-    // 1. Passing --capability dev.ucp.shopping.checkout with extensions: None excludes unrequested extensions
     let checkout_only = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
@@ -553,7 +466,6 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
         .get("fulfillment")
         .is_none());
 
-    // 2. Passing an extension ("dev.ucp.shopping.fulfillment") via capabilities reclassifies it into active extensions
     let reclassified = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
@@ -569,8 +481,6 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
         .get("discounts")
         .is_none());
 
-    // 3. Passing --capability dev.ucp.shopping.cart alone does not pull in Checkout; passing both cart and checkout
-    // composes cart.json#/$defs/checkout (adding cart_id) into Checkout.
     let cart_only = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
@@ -578,8 +488,8 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
     )
     .unwrap();
     assert_bundle_invariants(&cart_only.defs);
-    assert!(cart_only.defs.contains_key("Cart"));
-    assert!(!cart_only.defs.contains_key("Checkout"));
+    assert_has_defs(&cart_only.defs, &["Cart"]);
+    assert_lacks_defs(&cart_only.defs, &["Checkout"]);
 
     let cart_and_checkout = generate_types(
         &GenerateTypesOptions::new()
@@ -591,11 +501,9 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
     assert!(
         cart_and_checkout.defs["CheckoutCreateRequest"]["properties"]
             .get("cart_id")
-            .is_some(),
-        "expected cart.json#/$defs/checkout overlay to add cart_id to CheckoutCreateRequest"
+            .is_some()
     );
 
-    // 4. Short names ("checkout") are rejected with InvalidCapability
     let err = generate_types(
         &GenerateTypesOptions::new()
             .schema_dir(&schema_dir)
