@@ -115,6 +115,48 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
     Ok(current.clone())
 }
 
+/// Returns true if `path` is a `.json` schema file (excluding `*.openapi.json` and `*.types.json` bundles).
+fn is_schema_json_file(path: &Path) -> bool {
+    if path.extension().and_then(|e| e.to_str()) != Some("json") {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    !name.ends_with(".openapi.json") && !name.ends_with(".types.json")
+}
+
+/// Collect all `.json` schema files in a path (file or directory), excluding
+/// `*.openapi.json` and `*.types.json` bundle files.
+pub(crate) fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        if is_schema_json_file(path) {
+            return vec![path.to_path_buf()];
+        }
+        return vec![];
+    }
+
+    let mut files = Vec::new();
+    collect_files_recursive(path, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files_recursive(&path, files);
+        } else if is_schema_json_file(&path) {
+            files.push(path);
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Bundling (flatten) — built on the upstream `jsonschema` resolution engine.
 //
@@ -1018,6 +1060,22 @@ mod tests {
 
         let schema = load_schema_auto(file.path().to_str().unwrap()).unwrap();
         assert_eq!(schema["type"], "string");
+    }
+
+    #[test]
+    fn collect_schema_files_excludes_openapi_and_types_bundles() {
+        let dir = tempfile::tempdir().unwrap();
+        let checkout = dir.path().join("checkout.json");
+        let openapi = dir.path().join("rest.openapi.json");
+        let types = dir.path().join("shopping.types.json");
+        let readme = dir.path().join("README.md");
+        std::fs::write(&checkout, "{}").unwrap();
+        std::fs::write(&openapi, "{}").unwrap();
+        std::fs::write(&types, "{}").unwrap();
+        std::fs::write(&readme, "# docs").unwrap();
+
+        let collected = collect_schema_files(dir.path());
+        assert_eq!(collected, vec![checkout]);
     }
 
     // Remote tests run against a local mockito server so they're deterministic

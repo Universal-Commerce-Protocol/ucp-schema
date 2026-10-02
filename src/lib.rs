@@ -54,6 +54,7 @@
 //! { "ucp_request": { "create": "omit", "update": "required" } }
 //! ```
 
+pub mod codegen;
 mod compose;
 mod error;
 mod linter;
