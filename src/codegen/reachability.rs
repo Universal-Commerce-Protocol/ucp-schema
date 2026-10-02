@@ -33,13 +33,14 @@ pub(super) struct LoadedSchema {
     pub schema: Value,
 }
 
-pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, CodegenError> {
-    let files = collect_schema_files(schema_dir);
-    let mut loaded = Vec::with_capacity(files.len());
-    for file_path in files {
-        let schema = load_schema(&file_path)?;
-        let path = normalize_lexical_path(&file_path);
-        let stem = file_stem_str(&path);
+impl LoadedSchema {
+    pub(super) fn from_file(file_path: impl AsRef<Path>, schema: Value) -> Self {
+        let path = normalize_lexical_path(file_path.as_ref());
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
         let stem_pascal = to_pascal_case(&stem);
         let name = schema
             .get("name")
@@ -56,7 +57,7 @@ pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, C
             && !in_transports_dir
             && !AMBIENT_ROOT_STEMS.contains(&stem.as_str())
             && (name.is_some() || is_container);
-        loaded.push(LoadedSchema {
+        Self {
             path,
             stem,
             stem_pascal,
@@ -66,9 +67,15 @@ pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, C
             is_capability,
             in_types_dir,
             schema,
-        });
+        }
     }
-    Ok(loaded)
+}
+
+pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, CodegenError> {
+    collect_schema_files(schema_dir)
+        .into_iter()
+        .map(|p| Ok(LoadedSchema::from_file(&p, load_schema(&p)?)))
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -81,54 +88,48 @@ pub(super) fn select_active_schemas(
     let ext_queries = ext_queries.filter(|q| !q.is_empty());
     let mut active_caps = BTreeSet::new();
     let mut active_exts = BTreeSet::new();
+    let resolve_query = |query: &str, kind: &str| -> Result<usize, CodegenError> {
+        let trimmed = query.trim();
+        loaded
+            .iter()
+            .position(|item| item.name.as_deref() == Some(trimmed))
+            .ok_or_else(|| {
+                CodegenError::ComposeError(ComposeError::InvalidCapability {
+                    name: query.to_string(),
+                    message: format!("{kind} schema not found in schema_dir"),
+                })
+            })
+    };
 
-    match cap_queries {
-        Some(queries) => {
-            for query in queries {
-                let idx = find_matching_schema(loaded, query).ok_or_else(|| {
-                    CodegenError::ComposeError(ComposeError::InvalidCapability {
-                        name: query.clone(),
-                        message: "capability schema not found in schema_dir".to_string(),
-                    })
-                })?;
-                if loaded[idx].is_extension {
-                    active_exts.insert(idx);
-                } else {
-                    active_caps.insert(idx);
-                }
+    if let Some(queries) = cap_queries {
+        for query in queries {
+            let idx = resolve_query(query, "capability")?;
+            if loaded[idx].is_extension {
+                active_exts.insert(idx);
+            } else {
+                active_caps.insert(idx);
             }
         }
-        None => {
-            active_caps.extend(
-                loaded
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| s.is_capability.then_some(i)),
-            );
-        }
+    } else {
+        active_caps.extend(
+            loaded
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.is_capability.then_some(i)),
+        );
     }
 
-    match ext_queries {
-        Some(queries) => {
-            for query in queries {
-                let idx = find_matching_schema(loaded, query).ok_or_else(|| {
-                    CodegenError::ComposeError(ComposeError::InvalidCapability {
-                        name: query.clone(),
-                        message: "extension schema not found in schema_dir".to_string(),
-                    })
-                })?;
-                active_exts.insert(idx);
-            }
+    if let Some(queries) = ext_queries {
+        for query in queries {
+            active_exts.insert(resolve_query(query, "extension")?);
         }
-        None if cap_queries.is_none() => {
-            active_exts.extend(
-                loaded
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, s)| s.is_extension.then_some(i)),
-            );
-        }
-        None => {}
+    } else if cap_queries.is_none() {
+        active_exts.extend(
+            loaded
+                .iter()
+                .enumerate()
+                .filter_map(|(i, s)| s.is_extension.then_some(i)),
+        );
     }
 
     let mut active_capabilities = BTreeSet::new();
@@ -179,7 +180,7 @@ pub(super) fn compute_reachable_closure(
             continue;
         };
         let inactive_locals = compute_inactive_local_defs(item, active_capabilities);
-        for ref_str in collect_active_external_refs(item, &inactive_locals, active_capabilities) {
+        for ref_str in collect_active_external_refs(item, &inactive_locals) {
             let file_part = ref_str.split('#').next().unwrap_or("");
             if file_part.is_empty() {
                 continue;
@@ -220,10 +221,10 @@ pub(super) fn compute_inactive_local_defs(
         if !is_reverse_domain_name(k) {
             continue;
         }
-        let is_active = item.name.as_deref() == Some(k.as_str()) || active_capabilities.contains(k);
-        if is_active {
+        if item.name.as_deref() == Some(k.as_str()) || active_capabilities.contains(k) {
             active_seeds.push(v);
         } else {
+            inactive.insert(k.clone());
             inactive_seeds.push(v);
         }
     }
@@ -236,8 +237,7 @@ pub(super) fn compute_inactive_local_defs(
             continue;
         }
         let is_external_ref_alias = def_val
-            .as_object()
-            .and_then(|o| o.get("$ref"))
+            .get("$ref")
             .and_then(Value::as_str)
             .is_some_and(|r| !r.starts_with('#'));
         if used_by_inactive.contains(def_key) || is_external_ref_alias {
@@ -249,33 +249,6 @@ pub(super) fn compute_inactive_local_defs(
 
 pub(super) fn is_container_op_key(key: &str) -> bool {
     key.ends_with("_request") || key.ends_with("_response")
-}
-
-pub(super) fn has_root_schema_body(schema: &Value) -> bool {
-    let Some(obj) = schema.as_object() else {
-        return false;
-    };
-    [
-        "properties",
-        "allOf",
-        "oneOf",
-        "anyOf",
-        "$ref",
-        "enum",
-        "const",
-        "pattern",
-        "propertyNames",
-        "items",
-    ]
-    .iter()
-    .any(|k| obj.contains_key(*k))
-        || obj
-            .get("additionalProperties")
-            .is_some_and(Value::is_object)
-        || obj
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(|t| t != "object")
 }
 
 pub(super) fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -324,22 +297,16 @@ fn is_container_capability(schema: &Value, is_extension: bool, in_types_dir: boo
         .is_some_and(|defs| defs.keys().any(|k| is_container_op_key(k)))
 }
 
-fn find_matching_schema(loaded: &[LoadedSchema], query: &str) -> Option<usize> {
-    let trimmed = query.trim();
-    loaded
-        .iter()
-        .position(|item| item.name.as_deref() == Some(trimmed))
-}
-
 fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) -> BTreeSet<String> {
     let mut visited = BTreeSet::new();
     let mut queue = VecDeque::new();
     let push_refs = |val: &Value, q: &mut VecDeque<String>| {
         for_each_schema_object(val, &mut |obj| {
-            let Some(Value::String(r)) = obj.get("$ref") else {
-                return;
-            };
-            if let Some(k) = r.strip_prefix("#/$defs/") {
+            if let Some(k) = obj
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|r| r.strip_prefix("#/$defs/"))
+            {
                 q.push_back(k.to_string());
             }
         });
@@ -349,11 +316,10 @@ fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) ->
         push_refs(seed, &mut queue);
     }
     while let Some(def_key) = queue.pop_front() {
-        if !visited.insert(def_key.clone()) {
-            continue;
-        }
-        if let Some(def_val) = defs_obj.get(&def_key) {
-            push_refs(def_val, &mut queue);
+        if visited.insert(def_key.clone()) {
+            if let Some(def_val) = defs_obj.get(&def_key) {
+                push_refs(def_val, &mut queue);
+            }
         }
     }
     visited
@@ -362,16 +328,14 @@ fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) ->
 fn collect_active_external_refs(
     item: &LoadedSchema,
     inactive_locals: &BTreeSet<String>,
-    active_capabilities: &BTreeSet<String>,
 ) -> Vec<String> {
     let mut out = Vec::new();
     let mut push_ext_refs = |val: &Value| {
         for_each_schema_object(val, &mut |obj| {
-            let Some(r) = obj.get("$ref").and_then(Value::as_str) else {
-                return;
-            };
-            if !r.starts_with('#') {
-                out.push(r.to_string());
+            if let Some(r) = obj.get("$ref").and_then(Value::as_str) {
+                if !r.starts_with('#') {
+                    out.push(r.to_string());
+                }
             }
         });
     };
@@ -391,28 +355,12 @@ fn collect_active_external_refs(
             continue;
         };
         for (def_k, def_v) in defs_obj {
-            if inactive_locals.contains(def_k) {
-                continue;
+            if !inactive_locals.contains(def_k) {
+                push_ext_refs(def_v);
             }
-            if is_reverse_domain_name(def_k) {
-                let is_active = item.name.as_deref() == Some(def_k.as_str())
-                    || active_capabilities.contains(def_k);
-                if !is_active {
-                    continue;
-                }
-            }
-            push_ext_refs(def_v);
         }
     }
     out
-}
-
-fn file_stem_str(path: &Path) -> String {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or_default();
-    name.strip_suffix(".json").unwrap_or(name).to_string()
 }
 
 #[cfg(test)]
@@ -420,53 +368,20 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn make_loaded(
-        path: &str,
-        stem: &str,
-        name: Option<&str>,
-        is_extension: bool,
-        in_types_dir: bool,
-        schema: Value,
-    ) -> LoadedSchema {
-        LoadedSchema {
-            path: PathBuf::from(path),
-            stem: stem.to_string(),
-            stem_pascal: to_pascal_case(stem),
-            name: name.map(str::to_string),
-            is_extension,
-            is_container: false,
-            is_capability: !is_extension && !in_types_dir && name.is_some(),
-            in_types_dir,
-            schema,
-        }
-    }
-
     #[test]
     fn select_active_schemas_reclassifies_extensions_and_supports_default_caps_with_explicit_exts()
     {
         let loaded = vec![
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/checkout.json",
-                "checkout",
-                Some("dev.ucp.shopping.checkout"),
-                false,
-                false,
-                json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+                json!({"name": "dev.ucp.shopping.checkout", "type": "object", "properties": {"id": {"type": "string"}}}),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/discount.json",
-                "discount",
-                Some("dev.ucp.shopping.discount"),
-                true,
-                false,
-                json!({"$defs": {"dev.ucp.shopping.checkout": {"properties": {}}}}),
+                json!({"name": "dev.ucp.shopping.discount", "$defs": {"dev.ucp.shopping.checkout": {"properties": {}}}}),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/types/discount.json",
-                "discount",
-                None,
-                false,
-                true,
                 json!({"type": "object"}),
             ),
         ];
@@ -507,13 +422,10 @@ mod tests {
 
     #[test]
     fn compute_inactive_local_defs_prunes_inactive_extension_helpers_and_cart_checkout() {
-        let ext = make_loaded(
+        let ext = LoadedSchema::from_file(
             "/schemas/shopping/ext.json",
-            "ext",
-            Some("dev.ucp.shopping.ext"),
-            true,
-            false,
             json!({
+                "name": "dev.ucp.shopping.ext",
                 "$defs": {
                     "active_helper": { "type": "object" },
                     "shared_helper": { "type": "object" },
@@ -548,13 +460,10 @@ mod tests {
         assert!(!inactive.contains("active_helper"));
         assert!(!inactive.contains("shared_helper"));
 
-        let cart = make_loaded(
+        let cart = LoadedSchema::from_file(
             "/schemas/shopping/cart.json",
-            "cart",
-            Some("dev.ucp.shopping.cart"),
-            false,
-            false,
             json!({
+                "name": "dev.ucp.shopping.cart",
                 "type": "object",
                 "$defs": { "checkout": { "type": "object" } }
             }),
@@ -566,56 +475,31 @@ mod tests {
     #[test]
     fn compute_reachable_closure_follows_active_refs_and_skips_inactive_extension_refs() {
         let loaded = vec![
-            make_loaded(
-                "/schemas/ucp.json",
-                "ucp",
-                None,
-                false,
-                false,
-                json!({"type": "object"}),
-            ),
-            make_loaded(
+            LoadedSchema::from_file("/schemas/ucp.json", json!({"type": "object"})),
+            LoadedSchema::from_file(
                 "/schemas/shopping/types/service.json",
-                "service",
-                None,
-                false,
-                true,
                 json!({"type": "object"}),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/checkout.json",
-                "checkout",
-                Some("dev.ucp.shopping.checkout"),
-                false,
-                false,
                 json!({
+                    "name": "dev.ucp.shopping.checkout",
                     "type": "object",
                     "properties": { "buyer": { "$ref": "types/buyer.json" } }
                 }),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/types/buyer.json",
-                "buyer",
-                None,
-                false,
-                true,
                 json!({"type": "object"}),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/types/order_only.json",
-                "order_only",
-                None,
-                false,
-                true,
                 json!({"type": "object"}),
             ),
-            make_loaded(
+            LoadedSchema::from_file(
                 "/schemas/shopping/ext.json",
-                "ext",
-                Some("dev.ucp.shopping.ext"),
-                true,
-                false,
                 json!({
+                    "name": "dev.ucp.shopping.ext",
                     "$defs": {
                         "order_helper": { "$ref": "types/order_only.json" },
                         "dev.ucp.shopping.checkout": { "properties": {} },

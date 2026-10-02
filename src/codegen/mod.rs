@@ -12,16 +12,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::codegen::compose::compose_active_extensions;
-use crate::codegen::hoist::hoist_defs;
-use crate::codegen::normalizer::{
-    align_directional_refs, has_directional_annotations, normalize_def_schema,
-    slice_directional_schemas,
-};
+use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
+use crate::codegen::normalizer::align_directional_refs;
 use crate::codegen::reachability::{
-    compute_reachable_closure, load_all_schemas, select_active_schemas, LoadedSchema,
+    compute_reachable_closure, load_all_schemas, select_active_schemas,
 };
 use crate::error::{ComposeError, ResolveError};
-use crate::loader::for_each_schema_object;
+use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
 
 /// Configuration options for [`compile_types`] and [`generate_types`].
 #[derive(Debug, Clone)]
@@ -169,7 +166,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     };
 
     // Stage 1: Entrypoint & Transitive $ref Reachability Crawl
-    let loaded = load_all_schemas(schema_dir)?;
+    let mut loaded = load_all_schemas(schema_dir)?;
     let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
     let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
     let (active_cap_indices, active_ext_indices, active_capabilities) =
@@ -186,8 +183,8 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     // Stage 2: Upfront $defs Hoisting & Collision Qualification
     let mut defs = BTreeMap::new();
     let mut sliced_base_names = BTreeSet::new();
-    let (working_schemas, mut root_raw_schemas, pending_overlays) = hoist_defs(
-        &loaded,
+    let (mut root_raw_schemas, pending_overlays) = hoist_defs(
+        &mut loaded,
         &reachable_indices,
         &active_cap_indices,
         &active_ext_indices,
@@ -200,7 +197,6 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     let mut inlined_mixin_defs = BTreeSet::new();
     let (capability_resources, container_schemas) = compose_active_extensions(
         &loaded,
-        &working_schemas,
         &active_cap_indices,
         &active_ext_indices,
         pending_overlays,
@@ -212,13 +208,16 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     // Stage 4: Inline Conditional Variant Hoisting (added in Phase 3 / Task 6)
 
     // Stage 5: Directional Slicing & Base Normalization
-    slice_and_normalize_defs(
-        &loaded,
-        &active_cap_indices,
-        &root_raw_schemas,
-        &mut defs,
-        &mut sliced_base_names,
-    )?;
+    for (base_name, raw_schema) in &root_raw_schemas {
+        insert_sliced_or_normalized_def(
+            raw_schema,
+            base_name,
+            base_name,
+            capability_resources.contains_key(base_name),
+            &mut defs,
+            &mut sliced_base_names,
+        )?;
+    }
 
     // Stage 6: Directional $ref Alignment
     align_all_directional_refs(&mut defs, &sliced_base_names);
@@ -263,28 +262,14 @@ pub fn generate_types(options: &GenerateTypesOptions) -> Result<TypesBundleDoc, 
     })
 }
 
-fn slice_and_normalize_defs(
-    loaded: &[LoadedSchema],
-    active_cap_indices: &BTreeSet<usize>,
-    root_raw_schemas: &BTreeMap<String, (usize, Value)>,
-    defs: &mut BTreeMap<String, Value>,
-    sliced_base_names: &mut BTreeSet<String>,
-) -> Result<(), CodegenError> {
-    for (base_name, (idx, raw_schema)) in root_raw_schemas {
-        let is_active_root_cap = active_cap_indices.contains(idx) && !loaded[*idx].is_container;
-        if is_active_root_cap || has_directional_annotations(raw_schema) {
-            sliced_base_names.insert(base_name.clone());
-            for (slice_name, slice_val) in slice_directional_schemas(raw_schema, base_name)? {
-                defs.insert(slice_name, slice_val);
-            }
-        } else {
-            defs.insert(
-                base_name.clone(),
-                normalize_def_schema(raw_schema, base_name, Some(base_name)),
-            );
-        }
-    }
-    Ok(())
+pub(super) type SchemaMap = BTreeMap<String, Value>;
+
+pub(super) fn local_def_ref(val: &Value) -> Option<&str> {
+    val.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
+}
+
+pub(super) fn has_root_schema_body(val: &Value) -> bool {
+    val.is_object() && !is_empty_object_schema(val)
 }
 
 fn align_all_directional_refs(
@@ -300,19 +285,12 @@ fn align_all_directional_refs(
             continue;
         };
         align_directional_refs(schema_val, suffix, &known_defs);
-        crate::loader::for_each_schema_object_mut(schema_val, &mut |obj| {
+        for_each_schema_object_mut(schema_val, &mut |obj| {
             let Some(Value::Array(all_of)) = obj.get_mut("allOf") else {
                 return;
             };
             all_of.retain(|branch| {
-                let Some(target) = branch
-                    .get("$ref")
-                    .and_then(Value::as_str)
-                    .and_then(|r| r.strip_prefix("#/$defs/"))
-                else {
-                    return true;
-                };
-                !sliced_base_names.contains(target)
+                local_def_ref(branch).is_none_or(|target| !sliced_base_names.contains(target))
             });
         });
     }
@@ -376,8 +354,9 @@ fn is_empty_object_schema(val: &Value) -> bool {
         || obj
             .get("additionalProperties")
             .is_some_and(Value::is_object);
-    let has_scalar_constraints =
-        obj.contains_key("enum") || obj.contains_key("const") || obj.contains_key("pattern");
+    let has_scalar_constraints = ["enum", "const", "pattern", "items"]
+        .iter()
+        .any(|k| obj.contains_key(*k));
 
     !(has_props || has_composition || has_ref || has_map_schema || has_scalar_constraints)
 }
@@ -400,10 +379,7 @@ mod tests {
             ),
             (
                 "DeadChildCreateRequest".to_string(),
-                json!({
-                    "type": "object",
-                    "properties": { "leaf": { "$ref": "#/$defs/DeadLeafCreateRequest" } }
-                }),
+                json!({ "type": "object", "properties": { "leaf": { "$ref": "#/$defs/DeadLeafCreateRequest" } } }),
             ),
             (
                 "DeadLeafCreateRequest".to_string(),
@@ -423,18 +399,11 @@ mod tests {
             ),
             (
                 "ActionsMap".to_string(),
-                json!({
-                    "type": "object",
-                    "propertyNames": { "pattern": "^[a-z]+$" },
-                    "additionalProperties": { "type": "boolean" }
-                }),
+                json!({ "type": "object", "propertyNames": { "pattern": "^[a-z]+$" }, "additionalProperties": { "type": "boolean" } }),
             ),
             (
                 "Holder".to_string(),
-                json!({
-                    "type": "object",
-                    "properties": { "marker": { "$ref": "#/$defs/ReferencedEmpty" } }
-                }),
+                json!({ "type": "object", "properties": { "marker": { "$ref": "#/$defs/ReferencedEmpty" } } }),
             ),
         ]);
 
@@ -444,15 +413,26 @@ mod tests {
             &BTreeSet::from(["CheckoutCreateRequest".to_string()]),
         );
 
-        assert!(!defs.contains_key("UnreferencedEmpty"));
-        assert!(!defs.contains_key("InlinedMixin"));
-        assert!(!defs.contains_key("DeadChildCreateRequest"));
-        assert!(!defs.contains_key("DeadLeafCreateRequest"));
-        assert!(defs.contains_key("CheckoutCreateRequest"));
-        assert!(defs.contains_key("ReferencedEmpty"));
-        assert!(defs.contains_key("ErrorResponse"));
-        assert!(defs.contains_key("ActionsMap"));
-        assert!(defs.contains_key("Holder"));
+        for pruned in [
+            "UnreferencedEmpty",
+            "InlinedMixin",
+            "DeadChildCreateRequest",
+            "DeadLeafCreateRequest",
+        ] {
+            assert!(!defs.contains_key(pruned), "expected {pruned} to be pruned");
+        }
+        for retained in [
+            "CheckoutCreateRequest",
+            "ReferencedEmpty",
+            "ErrorResponse",
+            "ActionsMap",
+            "Holder",
+        ] {
+            assert!(
+                defs.contains_key(retained),
+                "expected {retained} to be retained"
+            );
+        }
     }
 
     #[test]
