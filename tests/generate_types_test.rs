@@ -432,8 +432,12 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         serde_json::json!({ "$ref": "#/$defs/Policy" })
     );
     assert_eq!(
-        bundle.defs["Policy"]["allOf"][0]["then"]["$ref"],
+        bundle.defs["Policy"]["anyOf"][0]["$ref"],
         "#/$defs/CancellationItem"
+    );
+    assert_eq!(
+        bundle.defs["Policy"]["anyOf"][1]["$ref"],
+        "#/$defs/PolicyBase"
     );
 
     let complete_ap2_allof = bundle.defs["CheckoutCompleteRequest"]["properties"]["ap2"]["allOf"]
@@ -1248,4 +1252,132 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
             ["$ref"],
         "#/$defs/ServicePlatformSchema"
     );
+}
+
+#[test]
+fn open_union_lowering_on_ucp_corpus_enforces_ou1_through_ou4() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    let expected_open_unions: &[(&str, &[(&str, &str)])] = &[
+        (
+            "FulfillmentDestination",
+            &[
+                ("LocationDestination", "business_location"),
+                ("ShippingDestination", "shipping_address"),
+            ],
+        ),
+        (
+            "FulfillmentMethod",
+            &[("PickupMethod", "pickup"), ("ShippingMethod", "shipping")],
+        ),
+        (
+            "FulfillmentMethodCreateRequest",
+            &[
+                ("PickupMethodCreateRequest", "pickup"),
+                ("ShippingMethodCreateRequest", "shipping"),
+            ],
+        ),
+        (
+            "FulfillmentMethodUpdateRequest",
+            &[
+                ("PickupMethodUpdateRequest", "pickup"),
+                ("ShippingMethodUpdateRequest", "shipping"),
+            ],
+        ),
+        (
+            "Media",
+            &[
+                ("MediaExternalVideo", "external_video"),
+                ("MediaImage", "image"),
+                ("MediaModel3d", "model_3d"),
+                ("MediaVideo", "video"),
+            ],
+        ),
+        ("Provider", &[("Oauth2Provider", "oauth2")]),
+        (
+            "Policy",
+            &[("CancellationItem", "dev.ucp.lodging.policy.cancellation")],
+        ),
+    ];
+
+    for (union_name, variants) in expected_open_unions {
+        let union_def = &bundle.defs[*union_name];
+        let base_name = format!("{union_name}Base");
+        assert!(
+            bundle.defs.contains_key(&base_name),
+            "expected {base_name} in $defs"
+        );
+
+        // OU-3: No closed discriminator keyword on union
+        assert!(
+            union_def.get("discriminator").is_none(),
+            "{union_name} must not have discriminator keyword"
+        );
+        assert!(
+            union_def.get("allOf").is_none(),
+            "{union_name} must not retain allOf"
+        );
+        assert!(
+            union_def.get("properties").is_none(),
+            "{union_name} must not retain properties"
+        );
+
+        // OU-1: <Union>Base is the final element of anyOf
+        let any_of = union_def["anyOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{union_name} must have anyOf array"));
+        assert_eq!(any_of.len(), variants.len() + 1);
+        for (idx, (variant_name, tag)) in variants.iter().enumerate() {
+            assert_eq!(any_of[idx]["$ref"], format!("#/$defs/{variant_name}"));
+            let variant_def = &bundle.defs[*variant_name];
+            assert_eq!(variant_def["properties"]["type"]["const"], *tag);
+            // OU-4: No default on variant discriminator property
+            assert!(
+                variant_def["properties"]["type"].get("default").is_none(),
+                "{variant_name}.properties.type must not have default"
+            );
+        }
+        assert_eq!(
+            any_of.last().unwrap()["$ref"],
+            format!("#/$defs/{base_name}"),
+            "{base_name} must be last in {union_name}.anyOf"
+        );
+
+        // OU-2: <Union>Base.properties.type.not.enum contains all known variant tags
+        let base_def = &bundle.defs[&base_name];
+        assert_eq!(base_def["type"], "object");
+        assert_eq!(base_def["additionalProperties"], true);
+        let expected_tags: Vec<serde_json::Value> = variants
+            .iter()
+            .map(|(_, tag)| serde_json::Value::String((*tag).to_string()))
+            .collect();
+        assert_eq!(
+            base_def["properties"]["type"]["not"]["enum"],
+            serde_json::Value::Array(expected_tags)
+        );
+        // OU-4: No default on <Union>Base discriminator property
+        assert!(
+            base_def["properties"]["type"].get("default").is_none(),
+            "{base_name}.properties.type must not have default"
+        );
+    }
+
+    // MediaImage and CancellationItem inherit parent properties
+    assert_eq!(
+        bundle.defs["MediaImage"]["properties"]["url"]["format"],
+        "uri"
+    );
+    assert!(bundle.defs["CancellationItem"].get("allOf").is_none());
+    assert_eq!(
+        bundle.defs["CancellationItem"]["properties"]["description"]["$ref"],
+        "#/$defs/Description"
+    );
+    assert!(bundle.defs["PolicyBase"]["properties"]["type"]
+        .get("pattern")
+        .is_some());
 }
