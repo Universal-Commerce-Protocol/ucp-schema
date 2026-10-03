@@ -5,6 +5,7 @@ mod hoist;
 pub mod normalizer;
 pub mod profile;
 mod reachability;
+pub mod reify;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -14,7 +15,7 @@ use serde_json::Value;
 
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
-use crate::codegen::normalizer::align_directional_refs;
+use crate::codegen::normalizer::{align_directional_refs, flatten_object_allof};
 pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
@@ -222,7 +223,12 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         &mut inlined_mixin_defs,
     )?;
 
-    // Stage 4: Inline Conditional Variant Hoisting (added in Phase 3 / Task 6)
+    // Stage 4: Inline Conditional Variant Hoisting
+    reify::hoist_inline_conditional_variants(
+        &mut root_raw_schemas,
+        &mut defs,
+        &mut sliced_base_names,
+    )?;
 
     // Stage 5: Directional Slicing & Base Normalization
     for (base_name, raw_schema) in &root_raw_schemas {
@@ -236,8 +242,9 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         )?;
     }
 
-    // Stage 6: Directional $ref Alignment
+    // Stage 6: Directional $ref Alignment & Single-Object/Array allOf Flattening
     align_all_directional_refs(&mut defs, &sliced_base_names);
+    flatten_object_allof(&mut defs);
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
 
