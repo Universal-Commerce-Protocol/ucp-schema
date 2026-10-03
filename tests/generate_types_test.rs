@@ -1129,3 +1129,123 @@ fn cli_generate_types_profile_mode_orphaned_warning_and_flag_conflicts() {
         );
     }
 }
+
+#[test]
+fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(schema_dir)).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    // 1. Pre-slicing inline variant hoisting on FulfillmentMethod -> ShippingMethod, PickupMethod
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "ShippingMethod",
+            "ShippingMethodCreateRequest",
+            "ShippingMethodUpdateRequest",
+            "PickupMethod",
+            "PickupMethodCreateRequest",
+            "PickupMethodUpdateRequest",
+            "Oauth2Provider",
+        ],
+    );
+    assert_eq!(
+        bundle.defs["ShippingMethodCreateRequest"]["properties"]["destinations"]["items"]["$ref"],
+        "#/$defs/ShippingDestinationCreateRequest"
+    );
+    assert!(
+        bundle.defs["PickupMethodCreateRequest"]["properties"]
+            .get("destinations")
+            .is_none(),
+        "PickupMethodCreateRequest must omit response-only destinations"
+    );
+    assert_eq!(
+        bundle.defs["Oauth2Provider"]["properties"]["type"]["const"],
+        "oauth2"
+    );
+    assert!(bundle.defs["Oauth2Provider"]["properties"]
+        .get("auth_url")
+        .is_some());
+
+    // 2. Scalar value constraints in Total are NOT hoisted into variant classes
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "DiscountTotal",
+            "SubtotalTotal",
+            "ItemsDiscountTotal",
+            "FulfillmentTotal",
+        ],
+    );
+
+    // 3. Totals strips top-level contains allOf and flattens items.allOf
+    assert!(bundle.defs["Totals"].get("allOf").is_none());
+    assert_eq!(bundle.defs["Totals"]["items"]["type"], "object");
+    assert!(bundle.defs["Totals"]["items"]["properties"]
+        .get("amount")
+        .is_some());
+    assert!(bundle.defs["Totals"]["items"]["properties"]
+        .get("lines")
+        .is_some());
+
+    // 4. Bare anyOf property distribution on ValueConstraint and StayCreateRequest
+    assert!(bundle.defs["ValueConstraint"].get("properties").is_none());
+    assert_eq!(bundle.defs["ValueConstraint"]["anyOf"][0]["type"], "object");
+    assert!(bundle.defs["ValueConstraint"]["anyOf"][0]["properties"]
+        .get("enum")
+        .is_some());
+    assert!(bundle.defs["StayCreateRequest"].get("properties").is_none());
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["properties"]["accommodation_type"]["$ref"],
+        "#/$defs/AccommodationTypeCreateRequest"
+    );
+    assert!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["properties"]["accommodation_type"]
+            .get("required")
+            .is_none(),
+        "base $ref property must stay isolated without sibling required keys"
+    );
+
+    // 5. Scalar-or-array union normalization on CapabilityBase.properties.extends
+    assert!(bundle.defs["CapabilityBase"]["properties"]["extends"]
+        .get("oneOf")
+        .is_none());
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["type"],
+        "array"
+    );
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["items"]["$ref"],
+        "#/$defs/ReverseDomainName"
+    );
+
+    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument
+    for def_name in [
+        "ShippingDestination",
+        "ShippingDestinationCreateRequest",
+        "LocationDestination",
+        "CardPaymentInstrument",
+        "UcpPlatformSchema",
+    ] {
+        assert!(
+            bundle.defs[def_name].get("allOf").is_none(),
+            "expected {def_name}.allOf to be flattened"
+        );
+        assert_eq!(bundle.defs[def_name]["type"], "object");
+    }
+    assert!(bundle.defs["ShippingDestination"]["properties"]
+        .get("street_address")
+        .is_some());
+    assert_eq!(
+        bundle.defs["UcpPlatformSchema"]["properties"]["services"]["type"],
+        "object"
+    );
+    assert_eq!(
+        bundle.defs["UcpPlatformSchema"]["properties"]["services"]["additionalProperties"]["items"]
+            ["$ref"],
+        "#/$defs/ServicePlatformSchema"
+    );
+}
