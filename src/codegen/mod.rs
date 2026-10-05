@@ -15,7 +15,9 @@ use serde_json::Value;
 
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
-use crate::codegen::normalizer::{align_directional_refs, flatten_object_allof};
+use crate::codegen::normalizer::{
+    align_directional_refs, flatten_object_allof, qualify_inline_object_titles,
+};
 pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
@@ -236,7 +238,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
             raw_schema,
             base_name,
             base_name,
-            capability_resources.contains_key(base_name),
+            false,
             &mut defs,
             &mut sliced_base_names,
         )?;
@@ -245,6 +247,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     // Stage 6: Directional $ref Alignment & Single-Object/Array allOf Flattening
     align_all_directional_refs(&mut defs, &sliced_base_names);
     flatten_object_allof(&mut defs);
+    qualify_inline_object_titles(&mut defs);
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
 

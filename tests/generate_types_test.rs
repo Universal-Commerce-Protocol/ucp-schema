@@ -1170,7 +1170,7 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         .get("auth_url")
         .is_some());
 
-    // 2. Scalar value constraints in Total are NOT hoisted into variant classes
+    // 2. Scalar value constraints in Total are NOT hoisted into variant classes, and propertyless request slices are omitted
     assert_lacks_defs(
         &bundle.defs,
         &[
@@ -1178,26 +1178,85 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
             "SubtotalTotal",
             "ItemsDiscountTotal",
             "FulfillmentTotal",
+            "TotalCreateRequest",
+            "TotalUpdateRequest",
+            "TotalsCreateRequest",
+            "TotalsUpdateRequest",
+            "OrderCreateRequest",
+            "OrderUpdateRequest",
         ],
     );
+    assert!(bundle.defs["ShippingMethodUpdateRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("type".to_string())));
+    assert!(bundle.defs["PickupMethodUpdateRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("type".to_string())));
 
-    // 3. Totals strips top-level contains allOf and flattens items.allOf
+    // 3. Totals strips top-level contains allOf, flattens items.allOf, and qualifies inline object titles
     assert!(bundle.defs["Totals"].get("allOf").is_none());
     assert_eq!(bundle.defs["Totals"]["items"]["type"], "object");
+    assert_eq!(bundle.defs["Totals"]["items"]["title"], "TotalsItem");
+    assert_eq!(
+        bundle.defs["Totals"]["items"]["properties"]["lines"]["items"]["title"],
+        "TotalsItemLine"
+    );
     assert!(bundle.defs["Totals"]["items"]["properties"]
         .get("amount")
         .is_some());
     assert!(bundle.defs["Totals"]["items"]["properties"]
         .get("lines")
         .is_some());
+    assert_eq!(
+        bundle.defs["Adjustment"]["properties"]["line_items"]["items"]["title"],
+        "AdjustmentLineItem"
+    );
+    assert_eq!(
+        bundle.defs["Expectation"]["properties"]["line_items"]["items"]["title"],
+        "ExpectationLineItem"
+    );
+    assert_eq!(
+        bundle.defs["FulfillmentEvent"]["properties"]["line_items"]["items"]["title"],
+        "FulfillmentEventLineItem"
+    );
+    assert_eq!(
+        bundle.defs["Order"]["properties"]["fulfillment"]["title"],
+        "OrderFulfillment"
+    );
+    assert_eq!(
+        bundle.defs["UnitPrice"]["properties"]["measure"]["title"],
+        "UnitPriceMeasure"
+    );
+    assert_eq!(
+        bundle.defs["UnitPrice"]["properties"]["reference"]["title"],
+        "UnitPriceReference"
+    );
 
-    // 4. Bare anyOf property distribution on ValueConstraint and StayCreateRequest
+    // 4. Bare anyOf property distribution and branch title qualification on ValueConstraint and StayCreateRequest
     assert!(bundle.defs["ValueConstraint"].get("properties").is_none());
     assert_eq!(bundle.defs["ValueConstraint"]["anyOf"][0]["type"], "object");
+    assert_eq!(
+        bundle.defs["ValueConstraint"]["anyOf"][0]["title"],
+        "ValueConstraintEnum"
+    );
+    assert_eq!(
+        bundle.defs["ValueConstraint"]["anyOf"][1]["title"],
+        "ValueConstraintConst"
+    );
     assert!(bundle.defs["ValueConstraint"]["anyOf"][0]["properties"]
         .get("enum")
         .is_some());
     assert!(bundle.defs["StayCreateRequest"].get("properties").is_none());
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][0]["title"],
+        "StayCreateRequestId"
+    );
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["title"],
+        "StayCreateRequestAccommodationType"
+    );
     assert_eq!(
         bundle.defs["StayCreateRequest"]["anyOf"][1]["properties"]["accommodation_type"]["$ref"],
         "#/$defs/AccommodationTypeCreateRequest"
@@ -1247,5 +1306,9 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         bundle.defs["UcpPlatformSchema"]["properties"]["services"]["additionalProperties"]["items"]
             ["$ref"],
         "#/$defs/ServicePlatformSchema"
+    );
+    assert_eq!(
+        bundle.defs["ServicePlatformSchema"]["anyOf"][0]["title"],
+        "ServicePlatformSchemaRest"
     );
 }

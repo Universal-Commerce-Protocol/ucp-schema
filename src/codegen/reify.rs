@@ -8,6 +8,7 @@ use serde_json::{json, Map, Value};
 use crate::codegen::hoist::insert_sliced_or_normalized_def;
 use crate::codegen::normalizer::{merge_schema_property, to_pascal_case};
 use crate::codegen::CodegenError;
+use crate::types::UCP_ANNOTATIONS;
 
 /// Derive a canonical PascalCase variant name from `parent_name` and a discriminator `tag_value`.
 ///
@@ -187,6 +188,9 @@ fn build_hoisted_variant_schema(
         .entry(disc_prop.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if let Some(disc_map) = disc_entry.as_object_mut() {
+        for key in UCP_ANNOTATIONS {
+            disc_map.remove(*key);
+        }
         disc_map.remove("enum");
         disc_map.remove("$ref");
         disc_map.insert("type".to_string(), Value::String("string".to_string()));
