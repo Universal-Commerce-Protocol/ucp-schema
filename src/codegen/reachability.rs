@@ -205,11 +205,14 @@ pub(super) fn compute_inactive_local_defs(
         return inactive;
     };
 
-    if item.stem == "cart"
-        && !active_capabilities.contains("checkout")
-        && defs_obj.contains_key("checkout")
-    {
-        inactive.insert("checkout".to_string());
+    if item.is_capability {
+        for (def_key, def_val) in defs_obj {
+            if !active_capabilities.contains(def_key)
+                && is_unreferenced_cross_capability_overlay(item, def_key, def_val)
+            {
+                inactive.insert(def_key.clone());
+            }
+        }
     }
     if !item.is_extension {
         return inactive;
@@ -245,6 +248,54 @@ pub(super) fn compute_inactive_local_defs(
         }
     }
     inactive
+}
+
+fn is_unreferenced_cross_capability_overlay(
+    item: &LoadedSchema,
+    def_key: &str,
+    def_val: &Value,
+) -> bool {
+    let target_file = format!("{def_key}.json");
+    let target_suffix = format!("/{target_file}");
+    let extends_other_cap = def_val
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|all_of| {
+            all_of.iter().any(|b| {
+                b.get("$ref")
+                    .and_then(Value::as_str)
+                    .is_some_and(|r| r == target_file || r.ends_with(&target_suffix))
+            })
+        });
+    if !extends_other_cap {
+        return false;
+    }
+    let local_ref = format!("#/$defs/{def_key}");
+    let mut referenced = false;
+    if let Some(root_obj) = item.schema.as_object() {
+        for (k, v) in root_obj {
+            if k == "$defs" {
+                if let Some(defs) = v.as_object() {
+                    for (other_k, other_v) in defs {
+                        if other_k != def_key {
+                            for_each_schema_object(other_v, &mut |obj| {
+                                if obj.get("$ref").and_then(Value::as_str) == Some(&local_ref) {
+                                    referenced = true;
+                                }
+                            });
+                        }
+                    }
+                }
+            } else {
+                for_each_schema_object(v, &mut |obj| {
+                    if obj.get("$ref").and_then(Value::as_str) == Some(&local_ref) {
+                        referenced = true;
+                    }
+                });
+            }
+        }
+    }
+    !referenced
 }
 
 pub(super) fn is_container_op_key(key: &str) -> bool {
@@ -465,11 +516,24 @@ mod tests {
             json!({
                 "name": "dev.ucp.shopping.cart",
                 "type": "object",
-                "$defs": { "checkout": { "type": "object" } }
+                "$defs": {
+                    "checkout": {
+                        "allOf": [{ "$ref": "checkout.json" }, { "type": "object" }]
+                    },
+                    "internal_helper": {
+                        "allOf": [{ "$ref": "internal_helper.json" }],
+                        "type": "object"
+                    }
+                },
+                "properties": {
+                    "helper": { "$ref": "#/$defs/internal_helper" }
+                }
             }),
         );
         let cart_only_caps = BTreeSet::from(["cart".to_string()]);
-        assert!(compute_inactive_local_defs(&cart, &cart_only_caps).contains("checkout"));
+        let cart_inactive = compute_inactive_local_defs(&cart, &cart_only_caps);
+        assert!(cart_inactive.contains("checkout"));
+        assert!(!cart_inactive.contains("internal_helper"));
     }
 
     #[test]
