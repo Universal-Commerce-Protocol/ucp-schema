@@ -49,7 +49,7 @@ This means you can develop and test third-party extensions locally before publis
 
 ## How does direction auto-detection work?
 
-**The validator infers direction from payload structure:**
+**For self-describing payloads, the validator infers direction from payload structure:**
 
 | Payload has        | Detected direction                               |
 | ------------------ | ------------------------------------------------ |
@@ -57,7 +57,11 @@ This means you can develop and test third-party extensions locally before publis
 | `meta.profile`     | Request                                          |
 | Neither            | Error (must specify `--request` or `--response`) |
 
-This applies to both `validate` and `resolve` when the input is a self-describing payload. When resolving a plain schema file, explicit `--request` or `--response` is required.
+This applies when `validate` or `resolve` receives a self-describing payload.
+When `validate` uses an explicit `--schema`, payload metadata is not required;
+if neither direction flag is set, validation defaults to request direction. Pass
+`--response` when validating against a response schema. When resolving a plain
+schema file, explicit `--request` or `--response` is required.
 
 ---
 
