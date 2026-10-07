@@ -233,7 +233,7 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
-        /// Suppress progress output, only show errors
+        /// Suppress per-file progress output; the final summary is still printed
         #[arg(long, short)]
         quiet: bool,
     },
