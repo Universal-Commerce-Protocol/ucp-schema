@@ -115,34 +115,49 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
     Ok(current.clone())
 }
 
-/// Returns true if `path` is a `.json` schema file (excluding `*.openapi.json` and `*.types.json` bundles).
-fn is_schema_json_file(path: &Path) -> bool {
-    if path.extension().and_then(|e| e.to_str()) != Some("json") {
-        return false;
-    }
-    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-        return false;
+/// Collect all `.json` files in a path (file or directory), excluding generated
+/// `*.types.json` bundle files. Includes `*.openapi.json` and `*.openrpc.json`
+/// service definitions so `ucp-schema lint` checks their `$ref`s.
+pub(crate) fn collect_json_files(path: &Path) -> Vec<PathBuf> {
+    let is_json = |p: &Path| {
+        p.extension().and_then(|e| e.to_str()) == Some("json")
+            && !p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".types.json"))
     };
-    !name.ends_with(".openapi.json") && !name.ends_with(".types.json")
-}
-
-/// Collect all `.json` schema files in a path (file or directory), excluding
-/// `*.openapi.json` and `*.types.json` bundle files.
-pub(crate) fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
     if path.is_file() {
-        if is_schema_json_file(path) {
-            return vec![path.to_path_buf()];
-        }
-        return vec![];
+        return is_json(path)
+            .then(|| path.to_path_buf())
+            .into_iter()
+            .collect();
     }
 
     let mut files = Vec::new();
-    collect_files_recursive(path, &mut files);
+    collect_files_recursive(path, &is_json, &mut files);
     files.sort();
     files
 }
 
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
+/// Collect all JSON Schema files in a path (file or directory), excluding
+/// `*.openapi.json`, `*.openrpc.json`, and `*.types.json` files.
+#[allow(dead_code)]
+pub(crate) fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
+    collect_json_files(path)
+        .into_iter()
+        .filter(|p| {
+            !p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.ends_with(".openapi.json") || n.ends_with(".openrpc.json"))
+        })
+        .collect()
+}
+
+fn collect_files_recursive(
+    dir: &Path,
+    predicate: &dyn Fn(&Path) -> bool,
+    files: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -150,8 +165,8 @@ fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            collect_files_recursive(&path, files);
-        } else if is_schema_json_file(&path) {
+            collect_files_recursive(&path, predicate, files);
+        } else if predicate(&path) {
             files.push(path);
         }
     }
@@ -1063,19 +1078,24 @@ mod tests {
     }
 
     #[test]
-    fn collect_schema_files_excludes_openapi_and_types_bundles() {
+    fn collect_json_and_schema_files_filter_service_and_types_bundles() {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("checkout.json");
         let openapi = dir.path().join("rest.openapi.json");
+        let openrpc = dir.path().join("mcp.openrpc.json");
         let types = dir.path().join("shopping.types.json");
         let readme = dir.path().join("README.md");
         std::fs::write(&checkout, "{}").unwrap();
         std::fs::write(&openapi, "{}").unwrap();
+        std::fs::write(&openrpc, "{}").unwrap();
         std::fs::write(&types, "{}").unwrap();
         std::fs::write(&readme, "# docs").unwrap();
 
-        let collected = collect_schema_files(dir.path());
-        assert_eq!(collected, vec![checkout]);
+        let lint_files = collect_json_files(dir.path());
+        assert_eq!(lint_files, vec![checkout.clone(), openrpc, openapi]);
+
+        let schema_files = collect_schema_files(dir.path());
+        assert_eq!(schema_files, vec![checkout]);
     }
 
     // Remote tests run against a local mockito server so they're deterministic

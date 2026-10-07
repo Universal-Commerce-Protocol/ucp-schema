@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::loader::{collect_schema_files, load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
+use crate::loader::{collect_json_files, load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
 use crate::types::{
     is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
     UCP_ANNOTATIONS, VALID_OPERATIONS,
@@ -78,7 +78,7 @@ impl LintResult {
 /// If `strict` is true, warnings are treated as errors.
 /// Returns aggregated results for all files.
 pub fn lint(path: &Path, strict: bool) -> LintResult {
-    let files = collect_schema_files(path);
+    let files = collect_json_files(path);
     let mut results = Vec::new();
     let mut total_errors = 0;
     let mut total_warnings = 0;
