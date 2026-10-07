@@ -1,4 +1,5 @@
 /target
 /local
+/dist
 node_modules/
 .vscode/
