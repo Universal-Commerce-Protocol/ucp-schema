@@ -54,6 +54,7 @@
 //! { "ucp_request": { "create": "omit", "update": "required" } }
 //! ```
 
+mod ambient;
 mod compose;
 mod error;
 mod linter;
@@ -63,6 +64,7 @@ mod resolver;
 mod types;
 mod validator;
 
+pub use ambient::resolve_with_ucp_members;
 pub use compose::{
     capability_short_name, check_version_constraints, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
