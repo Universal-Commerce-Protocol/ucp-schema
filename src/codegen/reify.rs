@@ -166,7 +166,6 @@ fn build_hoisted_variant_schema(
         return variant_schema;
     };
     variant_obj.remove("allOf");
-    variant_obj.remove("dependentRequired");
     variant_obj.insert("title".to_string(), Value::String(variant_name.to_string()));
 
     let variant_props = variant_obj
@@ -212,6 +211,24 @@ fn build_hoisted_variant_schema(
     let disc_val = Value::String(disc_prop.to_string());
     if !req_arr.contains(&disc_val) {
         req_arr.push(disc_val);
+    }
+
+    let req_set: BTreeSet<String> = req_arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    if let Some(Value::Object(dep_req)) = variant_obj.get_mut("dependentRequired") {
+        dep_req.retain(|_, deps_val| {
+            let Some(deps_arr) = deps_val.as_array_mut() else {
+                return false;
+            };
+            deps_arr.retain(|d| d.as_str().is_none_or(|s| !req_set.contains(s)));
+            !deps_arr.is_empty()
+        });
+        if dep_req.is_empty() {
+            variant_obj.remove("dependentRequired");
+        }
     }
 
     variant_schema

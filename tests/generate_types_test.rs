@@ -1273,12 +1273,30 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         .get("oneOf")
         .is_none());
     assert_eq!(
-        bundle.defs["CapabilityBase"]["properties"]["extends"]["type"],
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][0]["$ref"],
+        "#/$defs/ReverseDomainName"
+    );
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][1]["type"],
         "array"
     );
     assert_eq!(
-        bundle.defs["CapabilityBase"]["properties"]["extends"]["items"]["$ref"],
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][1]["items"]["$ref"],
         "#/$defs/ReverseDomainName"
+    );
+    assert_eq!(
+        bundle.defs["Location"]["dependentRequired"],
+        serde_json::json!({
+            "exception_hours": ["timezone"],
+            "hours": ["timezone"]
+        })
+    );
+    assert_eq!(
+        bundle.defs["LookupLocation"]["dependentRequired"],
+        serde_json::json!({
+            "exception_hours": ["timezone"],
+            "hours": ["timezone"]
+        })
     );
 
     // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument
