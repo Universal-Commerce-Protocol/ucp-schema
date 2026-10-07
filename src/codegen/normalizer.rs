@@ -68,8 +68,8 @@ pub fn qualify_def_name(parent_pascal: &str, def_key: &str) -> String {
         } else {
             format!("{parent_pascal}{def_pascal}")
         }
-    } else if (parent_pascal.ends_with("Search") || parent_pascal.ends_with("Lookup"))
-        && (def_key.ends_with("_request") || def_key.ends_with("_response"))
+    } else if (def_key.ends_with("_request") || def_key.ends_with("_response"))
+        && def_key != "complete_request"
     {
         qualify_container_op_name(parent_pascal, def_key)
     } else {
@@ -363,6 +363,18 @@ mod tests {
         assert_eq!(
             qualify_def_name("Profile", "jwk_public_key"),
             "JwkPublicKey"
+        );
+        assert_eq!(
+            qualify_def_name("CatalogSearch", "search_request"),
+            "CatalogSearchRequest"
+        );
+        assert_eq!(
+            qualify_def_name("OrderManage", "cancel_request"),
+            "OrderCancelRequest"
+        );
+        assert_eq!(
+            qualify_def_name("Checkout", "complete_request"),
+            "CompleteRequest"
         );
     }
 
