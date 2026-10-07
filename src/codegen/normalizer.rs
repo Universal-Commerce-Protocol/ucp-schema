@@ -210,8 +210,8 @@ pub fn distribute_properties_in_bare_anyof(value: &mut Value) {
     }
 }
 
-/// Collapse 2-element `oneOf` unions of a scalar/ref schema `S` and `{"type": "array", "items": S}`
-/// (such as `CapabilityBase.properties.extends`) into the canonical array schema.
+/// Normalize 2-element `oneOf` unions of a scalar/ref schema `S` and `{"type": "array", "items": S}`
+/// (such as `CapabilityBase.properties.extends`) into `anyOf: [S, {"type": "array", "items": S}]`.
 pub fn normalize_scalar_or_array_unions(value: &mut Value) {
     for_each_schema_object_mut(value, &mut |obj| {
         let Some(Value::Array(one_of)) = obj.get("oneOf") else {
@@ -239,13 +239,9 @@ pub fn normalize_scalar_or_array_unions(value: &mut Value) {
         if !matches {
             return;
         }
-        let Some(array_obj) = array_b.as_object().cloned() else {
-            return;
-        };
+        let any_of = Value::Array(vec![scalar_b.clone(), array_b.clone()]);
         obj.remove("oneOf");
-        for (k, v) in array_obj {
-            obj.entry(k).or_insert(v);
-        }
+        obj.insert("anyOf".to_string(), any_of);
     });
 }
 
@@ -315,6 +311,7 @@ fn attach_default_if_const(obj: &mut Map<String, Value>) {
 /// into flat `"type": "object"` schemas while preserving conditional `if`/`then` union blocks.
 pub fn flatten_object_allof(defs: &mut BTreeMap<String, Value>) {
     for schema_val in defs.values_mut() {
+        normalize_presence_if_then_to_dependent_required(schema_val);
         let Some(obj) = schema_val.as_object_mut() else {
             continue;
         };
@@ -335,6 +332,7 @@ pub fn flatten_object_allof(defs: &mut BTreeMap<String, Value>) {
         let mut changed = false;
         for schema_val in defs.values_mut() {
             if flatten_single_object_allof(schema_val, &snapshot) {
+                normalize_presence_if_then_to_dependent_required(schema_val);
                 changed = true;
             }
             if let Some(Value::Object(props)) = schema_val
@@ -345,6 +343,7 @@ pub fn flatten_object_allof(defs: &mut BTreeMap<String, Value>) {
                     if has_hybrid_ref_and_inline_allof(prop_val)
                         && flatten_single_object_allof(prop_val, &snapshot)
                     {
+                        normalize_presence_if_then_to_dependent_required(prop_val);
                         changed = true;
                     }
                 }
@@ -356,6 +355,7 @@ pub fn flatten_object_allof(defs: &mut BTreeMap<String, Value>) {
                 continue;
             };
             if flatten_single_object_allof(items_val, &snapshot) {
+                normalize_presence_if_then_to_dependent_required(items_val);
                 changed = true;
             }
         }
@@ -824,6 +824,148 @@ fn has_hybrid_ref_and_inline_allof(val: &Value) -> bool {
     has_ref && has_non_ref
 }
 
+fn normalize_presence_if_then_to_dependent_required(schema_val: &mut Value) {
+    for_each_schema_object_mut(schema_val, &mut |obj| {
+        if !obj.contains_key("else") {
+            if let (Some(if_val), Some(then_val)) = (obj.get("if"), obj.get("then")) {
+                if let Some(dep_map) = extract_presence_if_then_dependent_required(if_val, then_val)
+                {
+                    obj.remove("if");
+                    obj.remove("then");
+                    merge_dependent_required_map(obj, &dep_map);
+                }
+            }
+        }
+        let mut extracted_from_allof = Vec::new();
+        if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
+            all_of.retain(|branch| {
+                let Some(b_obj) = branch.as_object() else {
+                    return true;
+                };
+                if !b_obj
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "if" | "then" | "title" | "description"))
+                {
+                    return true;
+                }
+                let (Some(if_val), Some(then_val)) = (b_obj.get("if"), b_obj.get("then")) else {
+                    return true;
+                };
+                if let Some(dep_map) = extract_presence_if_then_dependent_required(if_val, then_val)
+                {
+                    extracted_from_allof.push(dep_map);
+                    false
+                } else {
+                    true
+                }
+            });
+            if all_of.is_empty() {
+                obj.remove("allOf");
+            }
+        }
+        for dep_map in extracted_from_allof {
+            merge_dependent_required_map(obj, &dep_map);
+        }
+    });
+}
+
+fn extract_presence_if_then_dependent_required(
+    if_val: &Value,
+    then_val: &Value,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    let if_obj = if_val.as_object()?;
+    let then_obj = then_val.as_object()?;
+    if !then_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "required" | "title" | "description"))
+    {
+        return None;
+    }
+    let then_reqs: Vec<String> = then_obj
+        .get("required")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect::<Option<Vec<_>>>()?;
+    if then_reqs.is_empty() {
+        return None;
+    }
+
+    let triggers: Vec<String> = if if_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "required" | "title" | "description"))
+    {
+        let reqs = if_obj.get("required")?.as_array()?;
+        if reqs.len() != 1 {
+            return None;
+        }
+        vec![reqs[0].as_str()?.to_string()]
+    } else if if_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "anyOf" | "title" | "description"))
+    {
+        let branches = if_obj.get("anyOf")?.as_array()?;
+        if branches.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(branches.len());
+        for b in branches {
+            let b_obj = b.as_object()?;
+            if !b_obj.keys().all(|k| k == "required") {
+                return None;
+            }
+            let reqs = b_obj.get("required")?.as_array()?;
+            if reqs.len() != 1 {
+                return None;
+            }
+            out.push(reqs[0].as_str()?.to_string());
+        }
+        out
+    } else {
+        return None;
+    };
+
+    let mut out = BTreeMap::new();
+    for trigger in triggers {
+        let deps: Vec<String> = then_reqs
+            .iter()
+            .filter(|r| **r != trigger)
+            .cloned()
+            .collect();
+        if !deps.is_empty() {
+            out.insert(trigger, deps);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn merge_dependent_required_map(
+    obj: &mut Map<String, Value>,
+    dep_map: &BTreeMap<String, Vec<String>>,
+) {
+    if dep_map.is_empty() {
+        return;
+    }
+    let dep_obj = obj
+        .entry("dependentRequired".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("dependentRequired is an object");
+    for (trigger, deps) in dep_map {
+        let arr = dep_obj
+            .entry(trigger.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("dependentRequired entry is an array");
+        for dep in deps {
+            let val = Value::String(dep.clone());
+            if !arr.contains(&val) {
+                arr.push(val);
+            }
+        }
+    }
+}
+
 fn flatten_single_object_allof(
     target: &mut Value,
     defs_snapshot: &BTreeMap<String, Value>,
@@ -837,6 +979,8 @@ fn flatten_single_object_allof(
 
     let mut merged_props = Map::new();
     let mut merged_reqs: Vec<Value> = Vec::new();
+    let mut merged_dep_req: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut merged_constraints = Map::new();
     let mut kept_all_of: Vec<Value> = Vec::new();
     let mut any_flattened = false;
 
@@ -851,11 +995,27 @@ fn flatten_single_object_allof(
                 .and_then(Value::as_object)
                 .filter(|b| is_flattenable_base_object(b))
             {
-                merge_props_and_reqs_from_object(base_obj, &mut merged_props, &mut merged_reqs);
+                merge_props_and_reqs_from_object(
+                    base_obj,
+                    &mut merged_props,
+                    &mut merged_reqs,
+                    &mut merged_dep_req,
+                    &mut merged_constraints,
+                );
+                let mut base_cond = Map::new();
                 for cond_key in ["if", "then", "else"] {
                     if let Some(cond_val) = base_obj.get(cond_key) {
-                        obj.entry(cond_key.to_string())
-                            .or_insert_with(|| cond_val.clone());
+                        base_cond.insert(cond_key.to_string(), cond_val.clone());
+                    }
+                }
+                if !base_cond.is_empty() {
+                    if ["if", "then", "else"].iter().any(|k| obj.contains_key(*k)) {
+                        let cond_branch = Value::Object(base_cond);
+                        if !kept_all_of.contains(&cond_branch) {
+                            kept_all_of.push(cond_branch);
+                        }
+                    } else {
+                        obj.extend(base_cond);
                     }
                 }
                 if let Some(Value::Array(base_all_of)) = base_obj.get("allOf") {
@@ -881,7 +1041,13 @@ fn flatten_single_object_allof(
         });
         if is_inline_flattenable {
             if let Some(branch_obj) = branch.as_object() {
-                merge_props_and_reqs_from_object(branch_obj, &mut merged_props, &mut merged_reqs);
+                merge_props_and_reqs_from_object(
+                    branch_obj,
+                    &mut merged_props,
+                    &mut merged_reqs,
+                    &mut merged_dep_req,
+                    &mut merged_constraints,
+                );
                 any_flattened = true;
                 continue;
             }
@@ -908,6 +1074,10 @@ fn flatten_single_object_allof(
                 merged_reqs.push(req);
             }
         }
+    }
+    merge_dependent_required_map(obj, &merged_dep_req);
+    for (k, v) in merged_constraints {
+        obj.entry(k).or_insert(v);
     }
 
     let promoted_anyof = if kept_all_of.len() == 1 && !obj.contains_key("anyOf") {
@@ -980,6 +1150,8 @@ fn merge_props_and_reqs_from_object(
     source: &Map<String, Value>,
     merged_props: &mut Map<String, Value>,
     merged_reqs: &mut Vec<Value>,
+    merged_dep_req: &mut BTreeMap<String, Vec<String>>,
+    merged_constraints: &mut Map<String, Value>,
 ) {
     if let Some(Value::Object(props)) = source.get("properties") {
         for (k, v) in props {
@@ -997,25 +1169,72 @@ fn merge_props_and_reqs_from_object(
             }
         }
     }
+    if let Some(Value::Object(dep_obj)) = source.get("dependentRequired") {
+        for (trigger, deps_val) in dep_obj {
+            if let Some(deps_arr) = deps_val.as_array() {
+                let entry = merged_dep_req.entry(trigger.clone()).or_default();
+                for dep in deps_arr.iter().filter_map(Value::as_str) {
+                    let dep_str = dep.to_string();
+                    if !entry.contains(&dep_str) {
+                        entry.push(dep_str);
+                    }
+                }
+            }
+        }
+    }
+    for key in ["minProperties", "maxProperties", "propertyNames"] {
+        if let Some(val) = source.get(key) {
+            merged_constraints.insert(key.to_string(), val.clone());
+        }
+    }
 }
 
 pub(crate) fn merge_schema_property(base_prop: &mut Value, override_prop: &Value) {
+    const REF_SIBLING_KEYS: &[&str] = &[
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "ucp_request",
+        "ucp_response",
+        "x-ucp-schema-transition",
+    ];
     let (Some(base_obj), Some(override_obj)) =
         (base_prop.as_object_mut(), override_prop.as_object())
     else {
         *base_prop = override_prop.clone();
         return;
     };
+    let replace_preserving_siblings =
+        |base_obj: &mut Map<String, Value>, override_obj: &Map<String, Value>| {
+            let mut merged = override_obj.clone();
+            for &key in REF_SIBLING_KEYS {
+                if let Some(base_val) = base_obj.get(key) {
+                    merged
+                        .entry(key.to_string())
+                        .or_insert_with(|| base_val.clone());
+                }
+            }
+            *base_obj = merged;
+        };
     if override_obj.contains_key("$ref") {
-        *base_prop = override_prop.clone();
+        replace_preserving_siblings(base_obj, override_obj);
         return;
     }
     if base_obj.contains_key("$ref") {
-        if override_obj.contains_key("const")
-            || override_obj.contains_key("enum")
-            || override_obj.contains_key("type")
+        if ["const", "enum", "type"]
+            .iter()
+            .any(|k| override_obj.contains_key(*k))
         {
-            *base_prop = override_prop.clone();
+            replace_preserving_siblings(base_obj, override_obj);
+        } else {
+            for &key in REF_SIBLING_KEYS {
+                if let Some(val) = override_obj.get(key) {
+                    base_obj.insert(key.to_string(), val.clone());
+                }
+            }
         }
         return;
     }
@@ -1037,6 +1256,16 @@ pub(crate) fn merge_schema_property(base_prop: &mut Value, override_prop: &Value
     }
 }
 
+fn stamp_inline_object_title_and_defaults(node: &mut Value, title: &str) {
+    if let Some(obj) = node.as_object_mut() {
+        obj.insert("title".to_string(), Value::String(title.to_string()));
+        obj.entry("type".to_string())
+            .or_insert_with(|| Value::String("object".to_string()));
+        obj.entry("additionalProperties".to_string())
+            .or_insert(Value::Bool(true));
+    }
+}
+
 fn qualify_schema_node(
     node: &mut Value,
     parent_title: &str,
@@ -1051,9 +1280,7 @@ fn qualify_schema_node(
         if let Some(items) = obj.get_mut("items") {
             let item_title = format!("{parent_title}Item");
             if is_inline_object_with_props(items) {
-                if let Some(items_obj) = items.as_object_mut() {
-                    items_obj.insert("title".to_string(), Value::String(item_title.clone()));
-                }
+                stamp_inline_object_title_and_defaults(items, &item_title);
                 used_titles.insert(item_title.clone());
             }
             qualify_schema_node(items, &item_title, false, used_titles);
@@ -1065,9 +1292,7 @@ fn qualify_schema_node(
             let prop_pascal = to_pascal_case(prop_name);
             let prop_title = append_pascal_suffix(parent_title, &prop_pascal);
             if is_inline_object_with_props(prop_schema) {
-                if let Some(prop_obj) = prop_schema.as_object_mut() {
-                    prop_obj.insert("title".to_string(), Value::String(prop_title.clone()));
-                }
+                stamp_inline_object_title_and_defaults(prop_schema, &prop_title);
                 used_titles.insert(prop_title.clone());
                 qualify_schema_node(prop_schema, &prop_title, false, used_titles);
                 continue;
@@ -1080,10 +1305,7 @@ fn qualify_schema_node(
                 let item_title = append_pascal_suffix(parent_title, &singular_pascal);
                 if let Some(items) = prop_schema.get_mut("items") {
                     if is_inline_object_with_props(items) {
-                        if let Some(items_obj) = items.as_object_mut() {
-                            items_obj
-                                .insert("title".to_string(), Value::String(item_title.clone()));
-                        }
+                        stamp_inline_object_title_and_defaults(items, &item_title);
                         used_titles.insert(item_title.clone());
                         qualify_schema_node(items, &item_title, false, used_titles);
                     } else if is_constrained_inline_scalar(items)
@@ -1117,9 +1339,7 @@ fn qualify_schema_node(
             }
             let suffix = derive_branch_suffix(branch, &common_req, idx);
             let branch_title = append_pascal_suffix(parent_title, &suffix);
-            if let Some(branch_obj) = branch.as_object_mut() {
-                branch_obj.insert("title".to_string(), Value::String(branch_title.clone()));
-            }
+            stamp_inline_object_title_and_defaults(branch, &branch_title);
             used_titles.insert(branch_title.clone());
             qualify_schema_node(branch, &branch_title, false, used_titles);
         }
@@ -1129,9 +1349,7 @@ fn qualify_schema_node(
         if add_props.is_object() {
             let ap_title = format!("{parent_title}Value");
             if is_inline_object_with_props(add_props) {
-                if let Some(ap_obj) = add_props.as_object_mut() {
-                    ap_obj.insert("title".to_string(), Value::String(ap_title.clone()));
-                }
+                stamp_inline_object_title_and_defaults(add_props, &ap_title);
                 used_titles.insert(ap_title.clone());
             }
             qualify_schema_node(add_props, &ap_title, false, used_titles);
@@ -1231,6 +1449,53 @@ fn derive_branch_suffix(branch: &Value, common_req: &BTreeSet<String>, idx: usiz
 }
 
 fn singularize_pascal(s: &str) -> String {
+    let last_word = s
+        .rfind(|c: char| c.is_ascii_uppercase())
+        .map_or(s, |idx| &s[idx..]);
+    if s.ends_with("ss")
+        || s.ends_with("us")
+        || s.ends_with("is")
+        || s.ends_with("os")
+        || matches!(
+            last_word,
+            "Status"
+                | "Series"
+                | "Species"
+                | "Basis"
+                | "Analysis"
+                | "Diagnosis"
+                | "Synopsis"
+                | "Thesis"
+                | "Crisis"
+                | "Axis"
+                | "Alias"
+                | "Address"
+                | "Process"
+                | "Access"
+                | "Success"
+                | "Progress"
+                | "Details"
+                | "Hours"
+                | "Ages"
+                | "Params"
+                | "Goods"
+                | "Means"
+                | "Customs"
+                | "News"
+                | "Headquarters"
+                | "Analytics"
+                | "Logistics"
+                | "Statistics"
+                | "Metrics"
+                | "Mathematics"
+                | "Physics"
+                | "Economics"
+                | "Politics"
+                | "Ethics"
+        )
+    {
+        return s.to_string();
+    }
     if s.ends_with("ies") && s.len() > 3 {
         return format!("{}y", &s[..s.len() - 3]);
     }
@@ -1239,13 +1504,7 @@ fn singularize_pascal(s: &str) -> String {
             return s[..s.len() - 2].to_string();
         }
     }
-    if s.ends_with('s')
-        && s.len() > 1
-        && !s.ends_with("ss")
-        && !s.ends_with("us")
-        && !s.ends_with("is")
-        && !matches!(s, "Hours" | "Ages" | "Params")
-    {
+    if s.ends_with('s') && s.len() > 1 {
         return s[..s.len() - 1].to_string();
     }
     s.to_string()
@@ -2170,11 +2429,16 @@ mod tests {
         attach_const_defaults(&mut schema);
 
         assert!(schema["properties"]["extends"].get("oneOf").is_none());
-        assert_eq!(schema["properties"]["extends"]["type"], "array");
-        assert_eq!(schema["properties"]["extends"]["minItems"], 1);
         assert_eq!(
-            schema["properties"]["extends"]["items"]["$ref"],
-            "#/$defs/ReverseDomainName"
+            schema["properties"]["extends"]["anyOf"],
+            json!([
+                { "$ref": "#/$defs/ReverseDomainName" },
+                {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/ReverseDomainName" },
+                    "minItems": 1
+                }
+            ])
         );
 
         assert_eq!(
@@ -2262,6 +2526,37 @@ mod tests {
                     ]
                 }),
             ),
+            (
+                "Location".to_string(),
+                json!({
+                    "title": "Location",
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "latitude": { "type": "number" },
+                        "longitude": { "type": "number" }
+                    },
+                    "if": {
+                        "anyOf": [
+                            { "required": ["latitude"] },
+                            { "required": ["longitude"] }
+                        ]
+                    },
+                    "then": {
+                        "required": ["latitude", "longitude"]
+                    }
+                }),
+            ),
+            (
+                "LookupLocation".to_string(),
+                json!({
+                    "title": "LookupLocation",
+                    "allOf": [
+                        { "$ref": "#/$defs/Location" },
+                        { "required": ["name"] }
+                    ]
+                }),
+            ),
         ]);
 
         flatten_object_allof(&mut defs);
@@ -2286,5 +2581,31 @@ mod tests {
             defs["SubtypeChild"]["properties"]["code"],
             json!({ "type": "string" })
         );
+
+        // Presence-only if/then on Location becomes dependentRequired and propagates to LookupLocation
+        assert!(defs["Location"].get("if").is_none());
+        assert!(defs["Location"].get("then").is_none());
+        assert_eq!(
+            defs["Location"]["dependentRequired"],
+            json!({
+                "latitude": ["longitude"],
+                "longitude": ["latitude"]
+            })
+        );
+        assert_eq!(
+            defs["LookupLocation"]["dependentRequired"],
+            json!({
+                "latitude": ["longitude"],
+                "longitude": ["latitude"]
+            })
+        );
+
+        // Verify singularize_pascal exclusions
+        assert_eq!(singularize_pascal("Series"), "Series");
+        assert_eq!(singularize_pascal("TimeSeries"), "TimeSeries");
+        assert_eq!(singularize_pascal("Species"), "Species");
+        assert_eq!(singularize_pascal("Address"), "Address");
+        assert_eq!(singularize_pascal("Categories"), "Category");
+        assert_eq!(singularize_pascal("LineItems"), "LineItem");
     }
 }

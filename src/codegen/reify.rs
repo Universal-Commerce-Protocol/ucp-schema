@@ -164,8 +164,17 @@ fn build_hoisted_variant_schema(
     let Some(variant_obj) = variant_schema.as_object_mut() else {
         return variant_schema;
     };
-    variant_obj.remove("allOf");
-    variant_obj.remove("dependentRequired");
+    if let Some(Value::Array(all_of)) = variant_obj.get_mut("allOf") {
+        all_of.retain(|b| {
+            b.get("if")
+                .and_then(Value::as_object)
+                .and_then(extract_if_discriminator)
+                .is_none()
+        });
+        if all_of.is_empty() {
+            variant_obj.remove("allOf");
+        }
+    }
     variant_obj.insert("title".to_string(), Value::String(variant_name.to_string()));
 
     let variant_props = variant_obj
@@ -187,8 +196,16 @@ fn build_hoisted_variant_schema(
         .entry(disc_prop.to_string())
         .or_insert_with(|| Value::Object(Map::new()));
     if let Some(disc_map) = disc_entry.as_object_mut() {
-        for key in UCP_ANNOTATIONS {
-            disc_map.remove(*key);
+        for &key in UCP_ANNOTATIONS {
+            match disc_map.get_mut(key) {
+                Some(Value::String(s)) if s == "optional" => *s = "required".to_string(),
+                Some(Value::Object(m)) => m.values_mut().for_each(|v| {
+                    if v.as_str() == Some("optional") {
+                        *v = Value::String("required".to_string());
+                    }
+                }),
+                _ => {}
+            }
         }
         disc_map.remove("enum");
         disc_map.remove("$ref");
@@ -213,17 +230,49 @@ fn build_hoisted_variant_schema(
         req_arr.push(disc_val);
     }
 
+    let req_set: BTreeSet<String> = req_arr
+        .iter()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    if let Some(Value::Object(dep_req)) = variant_obj.get_mut("dependentRequired") {
+        dep_req.retain(|_, deps_val| {
+            let Some(deps_arr) = deps_val.as_array_mut() else {
+                return false;
+            };
+            deps_arr.retain(|d| d.as_str().is_none_or(|s| !req_set.contains(s)));
+            !deps_arr.is_empty()
+        });
+        if dep_req.is_empty() {
+            variant_obj.remove("dependentRequired");
+        }
+    }
+
     variant_schema
 }
 
 pub(crate) fn extract_if_discriminator(if_obj: &Map<String, Value>) -> Option<(String, String)> {
-    let props = if_obj.get("properties")?.as_object()?;
-    for (prop_name, prop_val) in props {
-        if let Some(tag) = extract_const_or_single_enum_str(prop_val) {
-            return Some((prop_name.clone(), tag));
-        }
+    if !if_obj.keys().all(|k| {
+        matches!(
+            k.as_str(),
+            "properties" | "required" | "title" | "description" | "type"
+        )
+    }) {
+        return None;
     }
-    None
+    let props = if_obj.get("properties")?.as_object()?;
+    if props.len() != 1 {
+        return None;
+    }
+    let (prop_name, prop_val) = props.iter().next()?;
+    if if_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|reqs| reqs.iter().any(|r| r.as_str() != Some(prop_name.as_str())))
+    {
+        return None;
+    }
+    extract_const_or_single_enum_str(prop_val).map(|tag| (prop_name.clone(), tag))
 }
 
 pub(crate) fn extract_const_or_single_enum_str(prop_val: &Value) -> Option<String> {
@@ -403,5 +452,11 @@ mod tests {
 
         assert!(!root_raw.contains_key("DiscountTotal"));
         assert!(root_raw["Total"]["allOf"][0]["then"].get("$ref").is_none());
+
+        // Compound if conditions (multiple properties or forbidden keywords) are ignored
+        let compound_if = json!({
+            "properties": { "type": { "const": "shipping" }, "mode": { "const": "express" } }
+        });
+        assert!(extract_if_discriminator(compound_if.as_object().unwrap()).is_none());
     }
 }
