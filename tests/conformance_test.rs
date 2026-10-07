@@ -496,6 +496,145 @@ fn transitively_referenced_documents_resolve() {
     assert!(!oracle_is_valid(&bundled, &json!({ "mid": { "leaf": 0 } })));
 }
 
+/// A referencing document's declared `$id` can imply a directory nested
+/// one level deeper than its actual disk location relative to a sibling
+/// directory (real shape: a UCP source checkout where `discovery/` sits on
+/// disk beside `schemas/`, but `discovery/profile_schema.json` declares
+/// `$id: https://ucp.dev/schemas/discovery/profile.json` — nesting
+/// `discovery` *under* `schemas` in URL terms). A relative `$ref` written
+/// to be correct on disk (`../shared/mid.json`, walking up to the common
+/// parent and back down into the sibling) is then wrong when resolved by
+/// pure URL join against the declared `$id`: it doubles the shared
+/// directory segment (`shared/shared/mid.json`).
+///
+/// The retriever still locates the right file on disk (its directory-anchor
+/// relocation cancels the extra segment), but upstream dereference
+/// independently re-derives the same doubled URI when it resolves the
+/// referencing document's `$ref`, and then resolves *that* document's own
+/// relative refs against the URI it was reached by rather than its
+/// declared `$id` — so any further hop must be reachable under the doubled
+/// base too, or bundling fails with "not present in a registry" even
+/// though every file exists exactly where its `$id` and disk layout
+/// (independently) say it should.
+#[test]
+fn sibling_directory_nested_under_id_resolves_without_doubling() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("outer")).unwrap();
+    fs::create_dir_all(dir.path().join("shared")).unwrap();
+    fs::write(
+        dir.path().join("outer/entry.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/shared/outer/entry.json",
+            "$ref": "../shared/mid.json#/$defs/base"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("shared/mid.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/shared/mid.json",
+            "$defs": {
+                "base": {
+                    "type": "object",
+                    "properties": { "code": { "$ref": "leaf.json" } },
+                    "required": ["code"],
+                    "additionalProperties": false
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("shared/leaf.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/shared/leaf.json",
+            "type": "string",
+            "pattern": "^[a-z]+$"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundled = bundle(dir.path(), "outer/entry.json");
+    assert!(oracle_is_valid(&bundled, &json!({ "code": "abc" })));
+    assert!(
+        !oracle_is_valid(&bundled, &json!({ "code": "ABC" })),
+        "leaf.json's pattern must survive being reached through the doubled base"
+    );
+    assert!(!oracle_is_valid(&bundled, &json!({})));
+}
+
+/// The same sibling/nested-under-`$id` layout mismatch, through
+/// `bundle_refs_with_url_mapping` (the `--schema-local-base` +
+/// `--schema-remote-base` pair, also used internally by `compose` for
+/// cross-URL capability schema resolution). The two bundling entry points
+/// share the same `crawl_external_refs` core, but
+/// `bundle_refs_with_url_mapping` had no direct test before this; its only
+/// prior coverage came through CLI fixtures whose declared `$id` and disk
+/// layout agree.
+#[test]
+fn sibling_directory_nested_under_id_resolves_without_doubling_with_url_mapping() {
+    let dir = TempDir::new().unwrap();
+    fs::create_dir_all(dir.path().join("outer")).unwrap();
+    fs::create_dir_all(dir.path().join("shared")).unwrap();
+    fs::write(
+        dir.path().join("outer/entry.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/draft/shared/outer/entry.json",
+            "$ref": "../shared/mid.json#/$defs/base"
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("shared/mid.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/draft/shared/mid.json",
+            "$defs": {
+                "base": {
+                    "type": "object",
+                    "properties": { "code": { "$ref": "leaf.json" } },
+                    "required": ["code"],
+                    "additionalProperties": false
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join("shared/leaf.json"),
+        json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://example.test/draft/shared/leaf.json",
+            "type": "string",
+            "pattern": "^[a-z]+$"
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let path = dir.path().join("outer/entry.json");
+    let mut schema = load_schema(&path).unwrap();
+    ucp_schema::bundle_refs_with_url_mapping(
+        &mut schema,
+        path.parent().unwrap(),
+        dir.path(),
+        "https://example.test/draft",
+    )
+    .expect("bundling succeeds");
+
+    assert!(oracle_is_valid(&schema, &json!({ "code": "abc" })));
+    assert!(!oracle_is_valid(&schema, &json!({ "code": "ABC" })));
+}
+
 /// A fragment ref into a fetched resource whose target pointer-refs a
 /// *sibling* definition: `#/$defs/wrapper` inside lib.json refs
 /// `#/$defs/base` — both pointers must keep resolving within lib.json.
