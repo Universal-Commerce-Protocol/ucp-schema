@@ -512,3 +512,166 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
     .expect_err("short capability names must be rejected");
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn cli_generate_types_stdout_pretty_and_compact() {
+    let bin = env!("CARGO_BIN_EXE_ucp-schema");
+    let schema_dir = fixture_schemas_dir();
+
+    // 1. Default --pretty is true (multi-line JSON to stdout)
+    let out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "-s",
+            schema_dir.to_str().unwrap(),
+            "--capability",
+            "dev.ucp.shopping.checkout",
+            "--extension",
+            "dev.ucp.shopping.discount",
+        ])
+        .output()
+        .expect("run ucp-schema generate-types");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout.lines().count() > 5,
+        "expected pretty multi-line JSON by default"
+    );
+    let doc: ucp_schema::TypesBundleDoc = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        doc.schema_dialect,
+        "https://json-schema.org/draft/2020-12/schema"
+    );
+    assert_eq!(doc.title, "UCP Schema Types");
+    assert_bundle_invariants(&doc.defs);
+    assert!(doc.defs.contains_key("Checkout"));
+    assert!(doc.defs.contains_key("CheckoutCreateRequest"));
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("discounts")
+        .is_some());
+    assert!(!doc.defs.contains_key("Cart"));
+
+    // 2. --pretty=false emits compact single-line JSON, and --schema-local-base alias works
+    let compact_out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--schema-local-base",
+            schema_dir.to_str().unwrap(),
+            "--capabilities",
+            "dev.ucp.shopping.checkout,dev.ucp.shopping.cart",
+            "--extensions",
+            "dev.ucp.shopping.discount",
+            "--pretty=false",
+        ])
+        .output()
+        .expect("run ucp-schema generate-types --pretty=false");
+    assert!(
+        compact_out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&compact_out.stderr)
+    );
+    let compact_stdout = String::from_utf8(compact_out.stdout).unwrap();
+    assert_eq!(
+        compact_stdout.trim().lines().count(),
+        1,
+        "expected single-line JSON with --pretty=false"
+    );
+    let compact_doc: ucp_schema::TypesBundleDoc = serde_json::from_str(&compact_stdout).unwrap();
+    assert_bundle_invariants(&compact_doc.defs);
+    assert!(compact_doc.defs.contains_key("Checkout"));
+    assert!(compact_doc.defs.contains_key("Cart"));
+}
+
+#[test]
+fn cli_generate_types_output_file_and_repeatable_flags() {
+    let bin = env!("CARGO_BIN_EXE_ucp-schema");
+    let schema_dir = fixture_schemas_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let output_path = tmp.path().join("bundle.types.json");
+
+    let out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--schema-dir",
+            schema_dir.to_str().unwrap(),
+            "--capability",
+            "dev.ucp.shopping.checkout",
+            "--capability",
+            "dev.ucp.shopping.cart",
+            "--extension",
+            "dev.ucp.shopping.discount",
+            "--pretty",
+            "-o",
+            output_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ucp-schema generate-types -o");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        out.stdout.is_empty(),
+        "stdout should be empty when -o is used"
+    );
+
+    let file_contents = std::fs::read_to_string(&output_path).unwrap();
+    let doc: ucp_schema::TypesBundleDoc = serde_json::from_str(&file_contents).unwrap();
+    assert_bundle_invariants(&doc.defs);
+    assert!(doc.defs.contains_key("Checkout"));
+    assert!(doc.defs.contains_key("Cart"));
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("discounts")
+        .is_some());
+}
+
+#[test]
+fn cli_generate_types_error_exit_codes() {
+    let bin = env!("CARGO_BIN_EXE_ucp-schema");
+    let schema_dir = fixture_schemas_dir();
+
+    // 1. Missing --schema-dir without --profile -> exit code 2
+    let missing_dir = std::process::Command::new(bin)
+        .arg("generate-types")
+        .output()
+        .unwrap();
+    assert_eq!(missing_dir.status.code(), Some(2));
+
+    // 2. Nonexistent --schema-dir -> exit code 3
+    let bad_dir = std::process::Command::new(bin)
+        .args(["generate-types", "--schema-dir", "/nonexistent/ucp/schemas"])
+        .output()
+        .unwrap();
+    assert_eq!(bad_dir.status.code(), Some(3));
+
+    // 3. Unknown capability -> exit code 2
+    let bad_cap = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--schema-dir",
+            schema_dir.to_str().unwrap(),
+            "--capability",
+            "dev.ucp.shopping.nonexistent",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_cap.status.code(), Some(2));
+
+    // 4. Unwritable --output path -> exit code 3
+    let bad_out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--schema-dir",
+            schema_dir.to_str().unwrap(),
+            "--output",
+            "/nonexistent/dir/bundle.json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_out.status.code(), Some(3));
+}
