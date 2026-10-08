@@ -247,8 +247,8 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     qualify_inline_object_titles(&mut defs);
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration
-    reify::lower_conditional_unions(&mut defs);
-    reify::register_extended_subtypes(&mut defs);
+    let lowered_unions = reify::lower_conditional_unions(&mut defs);
+    reify::register_extended_subtypes(&mut defs, &lowered_unions);
 
     // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning
     let active_cap_root_requests: BTreeSet<String> = active_cap_indices
