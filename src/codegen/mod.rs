@@ -249,7 +249,8 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     flatten_object_allof(&mut defs);
     qualify_inline_object_titles(&mut defs);
 
-    // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
+    // Stage 7: Ordered anyOf Union Lowering & Subtype Registration
+    reify::lower_conditional_unions(&mut defs);
 
     // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning
     let active_cap_root_requests: BTreeSet<String> = active_cap_indices
@@ -349,9 +350,16 @@ fn prune_empty_object_defs(
             if is_empty_object_schema(val) || inlined_mixin_defs.contains(name) {
                 return false;
             }
-            let is_request_slice = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
-                .iter()
-                .any(|s| name.ends_with(s));
+            let is_request_slice = [
+                "CreateRequest",
+                "UpdateRequest",
+                "CompleteRequest",
+                "CreateRequestBase",
+                "UpdateRequestBase",
+                "CompleteRequestBase",
+            ]
+            .iter()
+            .any(|s| name.ends_with(s));
             !(is_request_slice && !active_cap_root_requests.contains(name))
         });
         if defs.len() == before {
