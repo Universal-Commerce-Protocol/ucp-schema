@@ -555,11 +555,11 @@ fn cli_generate_types_stdout_pretty_and_compact() {
         .is_some());
     assert!(!doc.defs.contains_key("Cart"));
 
-    // 2. --pretty=false emits compact single-line JSON, and --schema-local-base alias works
+    // 2. --pretty=false emits compact single-line JSON, and --capabilities/--extensions aliases work
     let compact_out = std::process::Command::new(bin)
         .args([
             "generate-types",
-            "--schema-local-base",
+            "--schema-dir",
             schema_dir.to_str().unwrap(),
             "--capabilities",
             "dev.ucp.shopping.checkout,dev.ucp.shopping.cart",
@@ -674,4 +674,458 @@ fn cli_generate_types_error_exit_codes() {
         .output()
         .unwrap();
     assert_eq!(bad_out.status.code(), Some(3));
+}
+
+#[test]
+fn profile_mode_matches_directory_mode_closure_and_prunes_orphaned_extensions() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    let profile_json = serde_json::json!({
+        "ucp": {
+            "version": "2026-08-25",
+            "services": {
+                "dev.ucp.shopping": [{
+                    "version": "2026-08-25",
+                    "transport": "rest",
+                    "endpoint": "https://merchant.example.com/ucp",
+                    "schema": "https://ucp.dev/2026-08-25/services/shopping/rest.openapi.json"
+                }]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/discount.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.cart"]
+                }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.order"]
+                }],
+                "dev.ucp.lodging.policy.cancellation": [{
+                    "version": "2026-08-25",
+                    "schema": s("lodging/policy_cancellation.json"),
+                    "extends": "dev.ucp.lodging.booking"
+                }]
+            }
+        }
+    });
+    std::fs::write(&profile_path, profile_json.to_string()).unwrap();
+
+    let parsed = ucp_schema::parse_profile_source(profile_path.to_str().unwrap()).unwrap();
+    assert_eq!(parsed.capabilities.len(), 3);
+    assert_eq!(parsed.rest_services.len(), 1);
+    assert_eq!(
+        parsed.rest_services[0].endpoint.as_deref(),
+        Some("https://merchant.example.com/ucp")
+    );
+
+    let profile_bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&profile_bundle.defs);
+    assert_lacks_defs(&profile_bundle.defs, &["CancellationItem", "Booking"]);
+
+    let directory_bundle = generate_types(
+        &GenerateTypesOptions::new()
+            .schema_dir(&schema_dir)
+            .capabilities(["dev.ucp.shopping.checkout"])
+            .extensions(["dev.ucp.shopping.discount", "dev.ucp.shopping.fulfillment"]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile_bundle.defs, directory_bundle.defs,
+        "--profile mode must produce the exact same $defs bundle as equivalent --capability/--extension flags"
+    );
+}
+
+#[test]
+fn profile_mode_allbirds_multi_origin_shopify_catalog_extension() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shopify_catalog_path = tmp.path().join("shopify_catalog.json");
+    let ucp_url = |rel: &str| format!("https://ucp.dev/2026-08-25/schemas/{rel}");
+
+    let shopify_catalog_schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://shopify.dev/ucp/schemas/2026-08-25/shopify_catalog.json",
+        "name": "dev.shopify.catalog",
+        "version": "2026-08-25",
+        "title": "Shopify Catalog Extensions",
+        "$defs": {
+            "collection": {
+                "type": "object",
+                "required": ["id", "handle", "title", "description"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "handle": { "type": "string" },
+                    "title": { "type": "string" },
+                    "description": { "$ref": ucp_url("common/types/description.json") },
+                    "media": { "$ref": ucp_url("common/types/media.json") }
+                }
+            },
+            "selling_plan_price": {
+                "type": "object",
+                "required": ["total"],
+                "properties": { "total": { "$ref": ucp_url("common/types/price.json") } }
+            },
+            "selling_plan": {
+                "type": "object",
+                "required": ["id", "name", "price"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "price": { "$ref": "#/$defs/selling_plan_price" }
+                }
+            },
+            "shopify_variant": {
+                "title": "Shopify Variant",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/variant.json") },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "checkout_url": { "type": "string", "format": "uri" },
+                            "selling_plans": {
+                                "type": "array",
+                                "items": { "$ref": "#/$defs/selling_plan" },
+                                "ucp_response": {
+                                    "transition": {
+                                        "from": "omit",
+                                        "to": "optional",
+                                        "description": "Planned: subscription selling plans."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "shopify_product": {
+                "title": "Shopify Product",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/product.json") },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "variants": { "type": "array", "items": { "$ref": "#/$defs/shopify_variant" } }
+                        }
+                    }
+                ]
+            },
+            "storefront_variant": {
+                "title": "Storefront Variant",
+                "allOf": [{ "$ref": "#/$defs/shopify_variant" }]
+            },
+            "storefront_product": {
+                "title": "Storefront Product",
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_product" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "gift_card": { "type": "boolean" },
+                            "collections": { "type": "array", "items": { "$ref": "#/$defs/collection" } },
+                            "variants": { "type": "array", "items": { "$ref": "#/$defs/storefront_variant" } }
+                        }
+                    }
+                ]
+            },
+            "shopify_filters": {
+                "type": "object",
+                "title": "Shopify Filters",
+                "properties": { "available": { "type": "boolean", "default": true } }
+            },
+            "shopify_search_filters": {
+                "title": "Shopify Search Filters",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/search_filters.json") },
+                    { "$ref": "#/$defs/shopify_filters" }
+                ]
+            },
+            "shopify_search_request": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_search.json#/$defs/search_request") },
+                    { "type": "object", "properties": { "filters": { "$ref": "#/$defs/shopify_search_filters" } } }
+                ]
+            },
+            "shopify_search_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_search.json#/$defs/search_response") },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/shopify_product" } } } }
+                ]
+            },
+            "shopify_lookup_request": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/lookup_request") },
+                    { "type": "object", "properties": { "filters": { "$ref": "#/$defs/shopify_filters" } } }
+                ]
+            },
+            "shopify_lookup_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/lookup_response") },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/shopify_product" } } } }
+                ]
+            },
+            "shopify_get_product_request": {
+                "allOf": [{ "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/get_product_request") }]
+            },
+            "shopify_get_product_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/get_product_response") },
+                    { "type": "object", "properties": { "product": { "$ref": "#/$defs/shopify_product" } } }
+                ]
+            },
+            "storefront_search_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_search_request" }],
+                "required": ["query"]
+            },
+            "storefront_search_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_search_response" },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/storefront_product" } } } }
+                ]
+            },
+            "storefront_lookup_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_lookup_request" }]
+            },
+            "storefront_lookup_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_lookup_response" },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/storefront_product" } } } }
+                ]
+            },
+            "storefront_get_product_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_get_product_request" }]
+            },
+            "storefront_get_product_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_get_product_response" },
+                    { "type": "object", "properties": { "product": { "$ref": "#/$defs/storefront_product" } } }
+                ]
+            },
+            "dev.ucp.shopping.catalog.search": {
+                "$defs": {
+                    "search_request": { "$ref": "#/$defs/storefront_search_request" },
+                    "search_response": { "$ref": "#/$defs/storefront_search_response" }
+                }
+            },
+            "dev.ucp.shopping.catalog.lookup": {
+                "$defs": {
+                    "lookup_request": { "$ref": "#/$defs/storefront_lookup_request" },
+                    "lookup_response": { "$ref": "#/$defs/storefront_lookup_response" },
+                    "get_product_request": { "$ref": "#/$defs/storefront_get_product_request" },
+                    "get_product_response": { "$ref": "#/$defs/storefront_get_product_response" }
+                }
+            }
+        }
+    });
+    std::fs::write(&shopify_catalog_path, shopify_catalog_schema.to_string()).unwrap();
+
+    let allbirds_profile_path = tmp.path().join("allbirds_profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+    let allbirds_profile = serde_json::json!({
+        "ucp": {
+            "version": "2026-08-25",
+            "services": {
+                "dev.ucp.shopping": [{
+                    "version": "2026-08-25",
+                    "transport": "mcp",
+                    "endpoint": "https://weareallbirds.myshopify.com/api/ucp/mcp",
+                    "schema": "https://ucp.dev/2026-08-25/services/shopping/mcp.openrpc.json"
+                }]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.order"]
+                }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/discount.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.cart"]
+                }],
+                "dev.ucp.shopping.cart": [{ "version": "2026-08-25", "schema": s("shopping/cart.json") }],
+                "dev.ucp.shopping.order": [{ "version": "2026-08-25", "schema": s("shopping/order.json") }],
+                "dev.ucp.shopping.catalog.search": [{ "version": "2026-08-25", "schema": s("shopping/catalog_search.json") }],
+                "dev.ucp.shopping.catalog.lookup": [{ "version": "2026-08-25", "schema": s("shopping/catalog_lookup.json") }],
+                "dev.shopify.catalog": [{
+                    "version": "2026-08-25",
+                    "schema": shopify_catalog_path.to_str().unwrap(),
+                    "extends": ["dev.ucp.shopping.catalog.search", "dev.ucp.shopping.catalog.lookup"]
+                }],
+                "dev.ucp.common.identity_linking": [{ "version": "2026-08-25", "schema": s("common/identity_linking.json") }],
+                "dev.ucp.shopping.permalink": [{ "version": "2026-08-25", "schema": s("shopping/permalink.json") }]
+            }
+        }
+    });
+    std::fs::write(&allbirds_profile_path, allbirds_profile.to_string()).unwrap();
+
+    let bundle = generate_types(
+        &GenerateTypesOptions::new().profile(allbirds_profile_path.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "Checkout",
+            "CheckoutCreateRequest",
+            "Cart",
+            "Order",
+            "CatalogSearchRequest",
+            "CatalogSearchResponse",
+            "CatalogLookupRequest",
+            "CatalogLookupResponse",
+            "CatalogGetProductRequest",
+            "CatalogGetProductResponse",
+            "StorefrontProduct",
+            "StorefrontVariant",
+            "ShopifyProduct",
+            "ShopifyVariant",
+            "Collection",
+            "SellingPlan",
+            "SellingPlanPrice",
+            "ShopifyFilters",
+            "ShopifySearchFilters",
+            "IdentityLinkingPlatformSchema",
+            "PermalinkPlatformSchema",
+            "ErrorResponse",
+        ],
+    );
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "Booking",
+            "StorefrontSearchRequest",
+            "ShopifySearchRequest",
+            "StorefrontSearchResponse",
+            "ShopifySearchResponse",
+            "StorefrontLookupRequest",
+            "ShopifyLookupRequest",
+            "StorefrontLookupResponse",
+            "ShopifyLookupResponse",
+            "StorefrontGetProductRequest",
+            "ShopifyGetProductRequest",
+            "StorefrontGetProductResponse",
+            "ShopifyGetProductResponse",
+        ],
+    );
+
+    assert_eq!(
+        bundle.defs["CatalogSearchRequest"]["properties"]["filters"]["$ref"],
+        "#/$defs/ShopifySearchFilters"
+    );
+    assert!(bundle.defs["CatalogSearchRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("query".to_string())));
+    assert_eq!(
+        bundle.defs["CatalogSearchResponse"]["properties"]["products"]["items"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+    assert_eq!(
+        bundle.defs["CatalogLookupResponse"]["properties"]["products"]["items"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+    assert_eq!(
+        bundle.defs["CatalogGetProductResponse"]["properties"]["product"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+}
+
+#[test]
+fn cli_generate_types_profile_mode_orphaned_warning_and_flag_conflicts() {
+    let bin = env!("CARGO_BIN_EXE_ucp-schema");
+    let schema_dir = fixture_schemas_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    let profile_json = serde_json::json!({
+        "ucp": {
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-01-11", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/discount.json"),
+                    "extends": "dev.ucp.shopping.checkout"
+                }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": "dev.ucp.shopping.order"
+                }]
+            }
+        }
+    });
+    std::fs::write(&profile_path, profile_json.to_string()).unwrap();
+
+    // 1. Valid --profile execution emits orphaned extension warning to stderr and valid bundle to stdout
+    let out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--profile",
+            profile_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ucp-schema generate-types --profile");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: pruning orphaned extension 'dev.ucp.shopping.fulfillment'"),
+        "expected orphaned extension warning on stderr, got: {stderr}"
+    );
+    let doc: ucp_schema::TypesBundleDoc = serde_json::from_slice(&out.stdout).unwrap();
+    assert_bundle_invariants(&doc.defs);
+    assert_has_defs(
+        &doc.defs,
+        &["Checkout", "CheckoutCreateRequest", "CheckoutUpdateRequest"],
+    );
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("discounts")
+        .is_some());
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("fulfillment")
+        .is_none());
+
+    // 2. --profile conflicts with --schema-dir, --capability, and --extension (exit code 2)
+    for extra_args in [
+        ["--schema-dir", schema_dir.to_str().unwrap()],
+        ["--capability", "dev.ucp.shopping.checkout"],
+        ["--extension", "dev.ucp.shopping.discount"],
+    ] {
+        let conflict = std::process::Command::new(bin)
+            .args([
+                "generate-types",
+                "--profile",
+                profile_path.to_str().unwrap(),
+            ])
+            .args(extra_args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            conflict.status.code(),
+            Some(2),
+            "expected clap conflict exit code 2 for {extra_args:?}"
+        );
+    }
 }
