@@ -116,39 +116,51 @@ pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, Resolv
 }
 
 /// Collect all `.json` files in a path (file or directory), excluding generated
-/// `*.types.json` bundle files. Includes `*.openapi.json` and `*.openrpc.json`
-/// service definitions so `ucp-schema lint` checks their `$ref`s.
+/// `*.types.json` bundle files during directory walks. Includes `openapi.json`,
+/// `*.openapi.json`, `openrpc.json`, and `*.openrpc.json` service definitions
+/// so `ucp-schema lint` checks their `$ref`s.
 pub(crate) fn collect_json_files(path: &Path) -> Vec<PathBuf> {
-    let is_json = |p: &Path| {
+    if path.is_file() {
+        return (path.extension().and_then(|e| e.to_str()) == Some("json"))
+            .then(|| path.to_path_buf())
+            .into_iter()
+            .collect();
+    }
+
+    let is_lint_json = |p: &Path| {
         p.extension().and_then(|e| e.to_str()) == Some("json")
             && !p
                 .file_name()
                 .and_then(|n| n.to_str())
                 .is_some_and(|n| n.ends_with(".types.json"))
     };
-    if path.is_file() {
-        return is_json(path)
-            .then(|| path.to_path_buf())
-            .into_iter()
-            .collect();
-    }
-
     let mut files = Vec::new();
-    collect_files_recursive(path, &is_json, &mut files);
+    collect_files_recursive(path, &is_lint_json, &mut files);
     files.sort();
     files
 }
 
 /// Collect all JSON Schema files in a path (file or directory), excluding
-/// `*.openapi.json`, `*.openrpc.json`, and `*.types.json` files.
+/// `openapi.json`, `*.openapi.json`, `openrpc.json`, `*.openrpc.json`, and
+/// `*.types.json` files during directory walks.
 #[allow(dead_code)]
 pub(crate) fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
+    if path.is_file() {
+        return (path.extension().and_then(|e| e.to_str()) == Some("json"))
+            .then(|| path.to_path_buf())
+            .into_iter()
+            .collect();
+    }
+
     collect_json_files(path)
         .into_iter()
         .filter(|p| {
-            !p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".openapi.json") || n.ends_with(".openrpc.json"))
+            !p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                n == "openapi.json"
+                    || n.ends_with(".openapi.json")
+                    || n == "openrpc.json"
+                    || n.ends_with(".openrpc.json")
+            })
         })
         .collect()
 }
@@ -1081,21 +1093,30 @@ mod tests {
     fn collect_json_and_schema_files_filter_service_and_types_bundles() {
         let dir = tempfile::tempdir().unwrap();
         let checkout = dir.path().join("checkout.json");
+        let bare_openapi = dir.path().join("openapi.json");
         let openapi = dir.path().join("rest.openapi.json");
         let openrpc = dir.path().join("mcp.openrpc.json");
         let types = dir.path().join("shopping.types.json");
         let readme = dir.path().join("README.md");
         std::fs::write(&checkout, "{}").unwrap();
+        std::fs::write(&bare_openapi, "{}").unwrap();
         std::fs::write(&openapi, "{}").unwrap();
         std::fs::write(&openrpc, "{}").unwrap();
         std::fs::write(&types, "{}").unwrap();
         std::fs::write(&readme, "# docs").unwrap();
 
         let lint_files = collect_json_files(dir.path());
-        assert_eq!(lint_files, vec![checkout.clone(), openrpc, openapi]);
+        assert_eq!(
+            lint_files,
+            vec![checkout.clone(), openrpc, bare_openapi, openapi.clone()]
+        );
 
         let schema_files = collect_schema_files(dir.path());
         assert_eq!(schema_files, vec![checkout]);
+
+        // Explicitly passed single files are never filtered out
+        assert_eq!(collect_json_files(&types), vec![types]);
+        assert_eq!(collect_schema_files(&openapi), vec![openapi]);
     }
 
     // Remote tests run against a local mockito server so they're deterministic

@@ -8,15 +8,19 @@ use crate::compose::capability_short_name;
 use crate::loader::for_each_schema_object_mut;
 use crate::types::{is_valid_version, UCP_ANNOTATIONS};
 
-/// Convert a snake_case, kebab-case, or reverse-domain identifier into PascalCase.
+/// Convert a snake_case, kebab-case, dotted, or reverse-domain identifier into PascalCase.
 pub fn to_pascal_case(s: &str) -> String {
-    let base = if s.contains('.') && !s.ends_with(".json") {
+    if !s.contains(['_', '-', ' ', '/', '.']) && s.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return s.to_string();
+    }
+
+    let base = if is_reverse_domain_name(s) {
         capability_short_name(s)
     } else {
         s.to_string()
     };
 
-    base.split(['_', '-', ' ', '/'])
+    base.split(['_', '-', ' ', '/', '.'])
         .filter(|part| !part.is_empty())
         .map(|part| {
             let mixed = part.chars().any(|c| c.is_ascii_uppercase())
@@ -98,13 +102,16 @@ pub fn qualify_container_op_name(stem_pascal: &str, op_key: &str) -> String {
 /// Resolve a `$ref` string (`#`, `#/$defs/<key>`, `<file>#/$defs/<key>`, or `<file>.json`)
 /// to its canonical PascalCase `$defs` key name.
 pub fn ref_to_def_name(ref_str: &str, parent_name: Option<&str>) -> String {
-    if ref_str == "#" {
+    if ref_str == "#" || ref_str == "#/" {
         return parent_name.map_or_else(|| "Self".to_string(), to_pascal_case);
     }
     if let Some(def_key) = ref_str
         .strip_prefix("#/$defs/")
         .or_else(|| ref_str.strip_prefix("#/definitions/"))
     {
+        if def_key.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return def_key.to_string();
+        }
         let parent_pascal = parent_name.map(to_pascal_case).unwrap_or_default();
         return qualify_def_name(&parent_pascal, def_key);
     }
@@ -162,7 +169,7 @@ pub fn strip_ucp_keywords(value: &mut Value) {
 
     if let Some(root) = value.as_object_mut() {
         clean_vacuous_anyof(root);
-        prune_dangling_required(root);
+        prune_dangling_required(root, &BTreeSet::new(), false);
     }
 }
 
@@ -207,20 +214,67 @@ fn inspect_allof_props(obj: &Map<String, Value>, props: &mut BTreeSet<String>) -
     (has_props, has_ref)
 }
 
-fn prune_dangling_required(obj: &mut Map<String, Value>) {
-    if !obj.get("required").is_some_and(Value::is_array) {
-        return;
+fn prune_dangling_required(
+    obj: &mut Map<String, Value>,
+    inherited_props: &BTreeSet<String>,
+    inherited_has_ref: bool,
+) {
+    let mut effective_props = inherited_props.clone();
+    let (local_has_props, local_has_ref) = inspect_allof_props(obj, &mut effective_props);
+    let effective_has_ref = inherited_has_ref || local_has_ref;
+
+    if let Some(Value::Array(reqs)) = obj.get_mut("required") {
+        if local_has_props && !effective_has_ref {
+            reqs.retain(|v| v.as_str().is_some_and(|k| effective_props.contains(k)));
+        }
+        if reqs.is_empty() {
+            obj.remove("required");
+        }
     }
-    let mut declared = BTreeSet::new();
-    let (has_props, has_ref) = inspect_allof_props(obj, &mut declared);
-    let Some(Value::Array(reqs)) = obj.get_mut("required") else {
-        return;
-    };
-    if has_props && !has_ref {
-        reqs.retain(|v| v.as_str().is_some_and(|k| declared.contains(k)));
+
+    for key in ["allOf", "anyOf", "oneOf"] {
+        let Some(Value::Array(arr)) = obj.get_mut(key) else {
+            continue;
+        };
+        for branch in arr.iter_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(branch, &effective_props, effective_has_ref);
+        }
     }
-    if reqs.is_empty() {
-        obj.remove("required");
+    for key in ["if", "then", "else", "not"] {
+        if let Some(child) = obj.get_mut(key).and_then(Value::as_object_mut) {
+            prune_dangling_required(child, &effective_props, effective_has_ref);
+        }
+    }
+    if let Some(Value::Object(dep_schemas)) = obj.get_mut("dependentSchemas") {
+        for child in dep_schemas.values_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &effective_props, effective_has_ref);
+        }
+    }
+
+    let empty_props = BTreeSet::new();
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        let Some(Value::Object(map)) = obj.get_mut(key) else {
+            continue;
+        };
+        for child in map.values_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
+    }
+    for key in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "items",
+        "contains",
+        "propertyNames",
+    ] {
+        if let Some(child) = obj.get_mut(key).and_then(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
+    }
+    if let Some(Value::Array(prefix_items)) = obj.get_mut("prefixItems") {
+        for child in prefix_items.iter_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
     }
 }
 
@@ -285,7 +339,15 @@ mod tests {
             to_pascal_case("dev.ucp.shopping.buyer_consent"),
             "BuyerConsent"
         );
+        assert_eq!(
+            to_pascal_case("checkout.complete_request"),
+            "CheckoutCompleteRequest"
+        );
         assert_eq!(to_pascal_case("PlatformSchema"), "PlatformSchema");
+        assert_eq!(to_pascal_case("a_b"), "AB");
+        assert_eq!(to_pascal_case("AB"), "AB");
+        assert_eq!(to_pascal_case("v1_v2"), "V1V2");
+        assert_eq!(to_pascal_case("V1V2"), "V1V2");
     }
 
     #[test]
@@ -417,8 +479,17 @@ mod tests {
             "PaymentInstrument"
         );
         assert_eq!(
+            ref_to_def_name("#/", Some("PaymentInstrument")),
+            "PaymentInstrument"
+        );
+        assert_eq!(ref_to_def_name("#/", None), "Self");
+        assert_eq!(
             ref_to_def_name("#/$defs/base", Some("Profile")),
             "ProfileBase"
+        );
+        assert_eq!(
+            ref_to_def_name("#/$defs/Quantity", Some("Checkout")),
+            "Quantity"
         );
         assert_eq!(
             ref_to_def_name("#/$defs/jwk_public_key", Some("Profile")),
@@ -561,6 +632,36 @@ mod tests {
         strip_ucp_keywords(&mut empty_req);
         assert!(empty_req.get("required").is_none());
 
+        // Nested object schemas (inside properties and items) prune dangling required entries
+        let mut nested_dangling = json!({
+            "type": "object",
+            "properties": {
+                "child": {
+                    "type": "object",
+                    "properties": {
+                        "kept": { "type": "string" }
+                    },
+                    "required": ["kept", "omitted_child_prop"]
+                },
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {},
+                        "required": ["all_omitted"]
+                    }
+                }
+            }
+        });
+        strip_ucp_keywords(&mut nested_dangling);
+        assert_eq!(
+            nested_dangling["properties"]["child"]["required"],
+            json!(["kept"])
+        );
+        assert!(nested_dangling["properties"]["list"]["items"]
+            .get("required")
+            .is_none());
+
         // Nested anyOf inside allOf (ServicePlatformSchema pattern) preserves inherited required fields
         let mut service_platform = json!({
             "allOf": [
@@ -661,7 +762,9 @@ mod tests {
             ],
             "properties": {
                 "parent": { "$ref": "#" },
+                "root_ptr": { "$ref": "#/" },
                 "item": { "$ref": "types/line_item.json" },
+                "qty": { "$ref": "types/quantity.json" },
                 "example_payload": {
                     "type": "object",
                     "examples": [
@@ -681,7 +784,9 @@ mod tests {
         assert_eq!(schema["allOf"][1]["$ref"], "#/$defs/ProfileBase");
         assert_eq!(schema["allOf"][2]["$ref"], "#/$defs/JwkPublicKey");
         assert_eq!(schema["properties"]["parent"]["$ref"], "#/$defs/Profile");
+        assert_eq!(schema["properties"]["root_ptr"]["$ref"], "#/$defs/Profile");
         assert_eq!(schema["properties"]["item"]["$ref"], "#/$defs/LineItem");
+        assert_eq!(schema["properties"]["qty"]["$ref"], "#/$defs/Quantity");
         assert_eq!(
             schema["properties"]["example_payload"]["examples"][0]["$ref"],
             "should/not/be/rewritten.json"
@@ -691,7 +796,7 @@ mod tests {
             "#"
         );
 
-        // Idempotence check: running a second time preserves already-rewritten refs
+        // Idempotence check: running a second time preserves already-rewritten refs (including #/$defs/Quantity)
         let once = schema.clone();
         rewrite_refs_to_defs(&mut schema, "Profile", Some("Profile"));
         assert_eq!(schema, once);
