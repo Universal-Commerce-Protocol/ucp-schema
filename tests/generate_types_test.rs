@@ -448,6 +448,14 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         complete_ap2_allof[0]["$ref"],
         "#/$defs/Ap2WithCheckoutMandateCompleteRequest"
     );
+    assert_eq!(
+        bundle.defs["CheckoutCompleteRequest"]["required"],
+        serde_json::json!(["payment"])
+    );
+    assert_eq!(
+        bundle.defs["Ap2WithCheckoutMandateCompleteRequest"]["required"],
+        serde_json::json!(["checkout_mandate"])
+    );
 }
 
 #[test]
@@ -1307,12 +1315,13 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         })
     );
 
-    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument
+    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument, LookupLocation
     for def_name in [
         "ShippingDestination",
         "ShippingDestinationCreateRequest",
         "LocationDestination",
         "CardPaymentInstrument",
+        "LookupLocation",
         "UcpPlatformSchema",
     ] {
         assert!(
@@ -1465,4 +1474,143 @@ fn open_union_lowering_on_ucp_corpus_enforces_ou1_through_ou4() {
     assert!(bundle.defs["PolicyBase"]["properties"]["type"]
         .get("pattern")
         .is_some());
+}
+
+#[test]
+fn extended_subtypes_discovery_and_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("shipping_destination.json"),
+        &serde_json::json!({
+            "title": "Shipping Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string" },
+                "type": { "type": "string", "const": "shipping_address" },
+                "street_address": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("location_destination.json"),
+        &serde_json::json!({
+            "title": "Location Destination",
+            "type": "object",
+            "required": ["id", "type", "name"],
+            "properties": {
+                "id": { "type": "string" },
+                "type": { "type": "string", "const": "business_location" },
+                "name": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("fulfillment_destination.json"),
+        &serde_json::json!({
+            "title": "Fulfillment Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string" },
+                "type": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "shipping_address" } } },
+                    "then": { "$ref": "shipping_destination.json" }
+                },
+                {
+                    "if": { "properties": { "type": { "const": "business_location" } } },
+                    "then": { "$ref": "location_destination.json" }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("locker_destination.json"),
+        &serde_json::json!({
+            "title": "Locker Destination",
+            "allOf": [
+                { "$ref": "fulfillment_destination.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "locker_code"],
+                    "properties": {
+                        "type": { "type": "string", "const": "locker" },
+                        "locker_code": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("checkout.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.checkout",
+            "title": "Checkout",
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" },
+                "destination": { "$ref": "types/fulfillment_destination.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    assert!(bundle.defs["LockerDestination"].get("allOf").is_none());
+    assert_eq!(bundle.defs["LockerDestination"]["type"], "object");
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["id"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["locker_code"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["type"]["const"],
+        "locker"
+    );
+    assert!(bundle.defs["LockerDestination"]["properties"]["type"]
+        .get("default")
+        .is_none());
+
+    let dest_anyof = bundle.defs["FulfillmentDestination"]["anyOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(dest_anyof.len(), 4);
+    assert_eq!(dest_anyof[0]["$ref"], "#/$defs/LocationDestination");
+    assert_eq!(dest_anyof[1]["$ref"], "#/$defs/ShippingDestination");
+    assert_eq!(dest_anyof[2]["$ref"], "#/$defs/LockerDestination");
+    assert_eq!(dest_anyof[3]["$ref"], "#/$defs/FulfillmentDestinationBase");
+
+    assert_eq!(
+        bundle.defs["FulfillmentDestinationBase"]["properties"]["type"]["not"]["enum"],
+        serde_json::json!(["business_location", "shipping_address", "locker"])
+    );
+
+    if let Some(schema_dir) = ucp_schemas_dir() {
+        let corpus_bundle =
+            generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+        assert_bundle_invariants(&corpus_bundle.defs);
+        let policy_anyof = corpus_bundle.defs["Policy"]["anyOf"].as_array().unwrap();
+        assert_eq!(policy_anyof.len(), 2);
+        assert_eq!(policy_anyof[0]["$ref"], "#/$defs/CancellationItem");
+        assert_eq!(policy_anyof[1]["$ref"], "#/$defs/PolicyBase");
+        assert_eq!(
+            corpus_bundle.defs["PolicyBase"]["properties"]["type"]["not"]["enum"],
+            serde_json::json!(["dev.ucp.lodging.policy.cancellation"])
+        );
+    }
 }
