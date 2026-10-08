@@ -1,0 +1,681 @@
+//! Stage 3: Capability, sub-type overlay, and container extension composition.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+
+use serde_json::{Map, Value};
+
+use crate::codegen::normalizer::{
+    normalize_def_schema, qualify_container_op_name, qualify_def_name, rewrite_refs_to_defs,
+};
+use crate::codegen::reachability::{is_container_op_key, LoadedSchema};
+use crate::codegen::{local_def_ref, CodegenError, SchemaMap};
+use crate::resolver::resolve;
+use crate::types::{Direction, ResolveOptions};
+
+pub(super) fn compose_active_extensions(
+    loaded: &[LoadedSchema],
+    active_cap_indices: &BTreeSet<usize>,
+    active_ext_indices: &BTreeSet<usize>,
+    pending_overlays: Vec<(String, Value)>,
+    root_raw_schemas: &mut SchemaMap,
+    defs: &mut SchemaMap,
+    inlined_mixin_defs: &mut BTreeSet<String>,
+) -> Result<(SchemaMap, Vec<(PathBuf, Value)>), CodegenError> {
+    for (target_name, overlay) in pending_overlays {
+        modify_target_def(
+            &target_name,
+            root_raw_schemas,
+            defs,
+            |target, roots, defs| {
+                merge_extension_into_schema(target, &overlay, &target_name, roots, defs);
+            },
+        );
+    }
+
+    for &cap_idx in active_cap_indices {
+        let cap_item = &loaded[cap_idx];
+        if cap_item.is_container {
+            continue;
+        }
+        let (Some(cap_name), Some(mut target_schema)) = (
+            cap_item.name.as_deref(),
+            root_raw_schemas.remove(&cap_item.stem_pascal),
+        ) else {
+            continue;
+        };
+
+        for &ext_idx in active_ext_indices {
+            let ext_item = &loaded[ext_idx];
+            let Some(ext_block) = ext_item
+                .schema
+                .get("$defs")
+                .and_then(Value::as_object)
+                .and_then(|d| d.get(cap_name))
+            else {
+                continue;
+            };
+            let mut prepared = deref_local_mixin_refs(
+                ext_block,
+                &ext_item.schema,
+                &ext_item.stem_pascal,
+                inlined_mixin_defs,
+            );
+            rewrite_refs_to_defs(
+                &mut prepared,
+                &cap_item.stem_pascal,
+                Some(&ext_item.stem_pascal),
+            );
+            merge_extension_into_schema(
+                &mut target_schema,
+                &prepared,
+                &cap_item.stem_pascal,
+                root_raw_schemas,
+                defs,
+            );
+        }
+
+        root_raw_schemas.insert(cap_item.stem_pascal.clone(), target_schema);
+    }
+
+    let capability_resources = active_cap_indices
+        .iter()
+        .filter_map(|&idx| {
+            let name = &loaded[idx].stem_pascal;
+            root_raw_schemas
+                .get(name)
+                .map(|val| (name.clone(), val.clone()))
+        })
+        .collect();
+
+    let mut container_schemas = Vec::new();
+    for &cap_idx in active_cap_indices {
+        let cap_item = &loaded[cap_idx];
+        if !cap_item.is_container {
+            continue;
+        }
+        let composed = compose_container_capability(
+            cap_item,
+            active_ext_indices,
+            loaded,
+            root_raw_schemas,
+            defs,
+            inlined_mixin_defs,
+        )?;
+        hoist_container_operations(cap_item, &composed, defs)?;
+        container_schemas.push((cap_item.path.clone(), composed));
+    }
+
+    Ok((capability_resources, container_schemas))
+}
+
+fn modify_target_def(
+    name: &str,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+    f: impl FnOnce(&mut Value, &mut BTreeMap<String, Value>, &mut BTreeMap<String, Value>),
+) -> bool {
+    if let Some(mut schema) = root_raw_schemas.remove(name) {
+        f(&mut schema, root_raw_schemas, defs);
+        root_raw_schemas.insert(name.to_string(), schema);
+        return true;
+    }
+    if let Some(mut schema) = defs.remove(name) {
+        f(&mut schema, root_raw_schemas, defs);
+        defs.insert(name.to_string(), schema);
+        return true;
+    }
+    false
+}
+
+fn deref_local_mixin_refs(
+    block: &Value,
+    source_schema: &Value,
+    parent_pascal: &str,
+    inlined_mixin_defs: &mut BTreeSet<String>,
+) -> Value {
+    let mut current = block.clone();
+    let Some(defs_obj) = source_schema.get("$defs").and_then(Value::as_object) else {
+        return current;
+    };
+    let mut inline_one = |node: &mut Value| {
+        if let Some((k, target)) = local_def_ref(node).and_then(|k| defs_obj.get(k).map(|v| (k, v)))
+        {
+            inlined_mixin_defs.insert(qualify_def_name(parent_pascal, k));
+            *node = target.clone();
+        }
+    };
+    inline_one(&mut current);
+    if let Some(arr) = current.get_mut("allOf").and_then(Value::as_array_mut) {
+        arr.iter_mut().for_each(&mut inline_one);
+    }
+    current
+}
+
+fn merge_extension_into_schema(
+    target: &mut Value,
+    ext_val: &Value,
+    target_name: &str,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+) {
+    if let Some(all_of) = ext_val.get("allOf").and_then(Value::as_array) {
+        for branch in all_of {
+            if local_def_ref(branch) != Some(target_name) {
+                merge_single_branch_into_target(target, branch, root_raw_schemas, defs);
+            }
+        }
+    }
+    merge_single_branch_into_target(target, ext_val, root_raw_schemas, defs);
+}
+
+fn merge_single_branch_into_target(
+    target: &mut Value,
+    branch: &Value,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+) {
+    let (Some(target_obj), Some(branch_obj)) = (target.as_object_mut(), branch.as_object()) else {
+        return;
+    };
+
+    if let Some(ext_props) = branch_obj.get("properties").and_then(Value::as_object) {
+        if let Some(target_props_map) = target_obj
+            .entry("properties".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+        {
+            for (prop_name, ext_prop) in ext_props {
+                if let Some(existing_prop) = target_props_map.get_mut(prop_name) {
+                    merge_extension_property(existing_prop, ext_prop, root_raw_schemas, defs);
+                } else {
+                    target_props_map.insert(prop_name.clone(), ext_prop.clone());
+                }
+            }
+        }
+    }
+
+    let Some(ext_reqs) = branch_obj.get("required").and_then(Value::as_array) else {
+        return;
+    };
+    if let Some(req_arr) = target_obj
+        .entry("required".to_string())
+        .or_insert_with(|| Value::Array(Vec::new()))
+        .as_array_mut()
+    {
+        for req in ext_reqs {
+            if !req_arr.contains(req) {
+                req_arr.push(req.clone());
+            }
+        }
+    }
+}
+
+fn merge_extension_property(
+    base_prop: &mut Value,
+    ext_prop: &Value,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+) {
+    let (Some(base_obj), Some(ext_obj)) = (base_prop.as_object_mut(), ext_prop.as_object()) else {
+        return;
+    };
+    for key in ["$ref", "ucp_request", "ucp_response", "description"] {
+        if let Some(val) = ext_obj.get(key) {
+            base_obj.insert(key.to_string(), val.clone());
+        }
+    }
+    if let Some(ext_items) = ext_obj.get("items") {
+        merge_extension_items(base_obj, ext_items, root_raw_schemas, defs);
+    }
+
+    let has_ext_props = ext_obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let has_ext_reqs = ext_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .is_some_and(|a| !a.is_empty());
+    if !(has_ext_props || has_ext_reqs) {
+        return;
+    }
+
+    if !base_obj.contains_key("properties") && !ext_obj.contains_key("$ref") {
+        if let Some(target_def) = local_def_ref(base_prop).map(str::to_string) {
+            if modify_target_def(
+                &target_def,
+                root_raw_schemas,
+                defs,
+                |target, roots, defs| {
+                    merge_single_branch_into_target(target, ext_prop, roots, defs);
+                },
+            ) {
+                return;
+            }
+        }
+    }
+
+    merge_single_branch_into_target(base_prop, ext_prop, root_raw_schemas, defs);
+}
+
+fn merge_extension_items(
+    base_obj: &mut Map<String, Value>,
+    ext_items: &Value,
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+) {
+    if let Some(ext_def) = local_def_ref(ext_items) {
+        let keep_base_ref = base_obj
+            .get("items")
+            .and_then(local_def_ref)
+            .is_some_and(|base_def| def_extends_target(base_def, ext_def, root_raw_schemas, defs));
+        if !keep_base_ref {
+            base_obj.insert("items".to_string(), ext_items.clone());
+        }
+        return;
+    }
+    if ext_items.get("$ref").is_some() {
+        base_obj.insert("items".to_string(), ext_items.clone());
+        return;
+    }
+
+    let Some(ext_items_obj) = ext_items.as_object() else {
+        return;
+    };
+    let cond_branches: Vec<Value> = if let Some(Value::Array(arr)) = ext_items_obj.get("allOf") {
+        arr.clone()
+    } else if ext_items_obj.contains_key("if") || ext_items_obj.contains_key("then") {
+        vec![ext_items.clone()]
+    } else {
+        return;
+    };
+
+    if let Some(item_def) = base_obj
+        .get("items")
+        .and_then(local_def_ref)
+        .map(str::to_string)
+    {
+        if let Some(target_schema) = root_raw_schemas
+            .get_mut(&item_def)
+            .or_else(|| defs.get_mut(&item_def))
+        {
+            append_unique_allof_branches(target_schema, cond_branches);
+            return;
+        }
+    }
+
+    if let Some(base_items) = base_obj.get_mut("items") {
+        append_unique_allof_branches(base_items, cond_branches);
+    }
+}
+
+fn def_extends_target(
+    base_def: &str,
+    ext_def: &str,
+    root_raw_schemas: &BTreeMap<String, Value>,
+    defs: &BTreeMap<String, Value>,
+) -> bool {
+    if base_def == ext_def {
+        return true;
+    }
+    let Some(all_of) = defs
+        .get(base_def)
+        .or_else(|| root_raw_schemas.get(base_def))
+        .and_then(|s| s.get("allOf"))
+        .and_then(Value::as_array)
+    else {
+        return false;
+    };
+    all_of.iter().any(|b| local_def_ref(b) == Some(ext_def))
+}
+
+fn append_unique_allof_branches(target: &mut Value, branches: Vec<Value>) {
+    let Some(all_of) = target.as_object_mut().and_then(|o| {
+        o.entry("allOf".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+    }) else {
+        return;
+    };
+    for branch in branches {
+        if !all_of.contains(&branch) {
+            all_of.push(branch);
+        }
+    }
+}
+
+fn compose_container_capability(
+    cap_item: &LoadedSchema,
+    active_ext_indices: &BTreeSet<usize>,
+    loaded: &[LoadedSchema],
+    root_raw_schemas: &mut BTreeMap<String, Value>,
+    defs: &mut BTreeMap<String, Value>,
+    inlined_mixin_defs: &mut BTreeSet<String>,
+) -> Result<Value, CodegenError> {
+    let mut composed = cap_item.schema.clone();
+    let (Some(cap_name), Some(container_defs)) = (
+        cap_item.name.as_deref(),
+        composed.get_mut("$defs").and_then(Value::as_object_mut),
+    ) else {
+        return Ok(composed);
+    };
+
+    for &ext_idx in active_ext_indices {
+        let ext_item = &loaded[ext_idx];
+        let Some(ext_cap_block) = ext_item
+            .schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .and_then(|d| d.get(cap_name))
+        else {
+            continue;
+        };
+
+        let op_patches: Vec<(String, &Value)> =
+            if let Some(nested_defs) = ext_cap_block.get("$defs").and_then(Value::as_object) {
+                nested_defs.iter().map(|(k, v)| (k.clone(), v)).collect()
+            } else {
+                let blocks: Vec<&Value> =
+                    if let Some(one_of) = ext_cap_block.get("oneOf").and_then(Value::as_array) {
+                        one_of.iter().collect()
+                    } else {
+                        vec![ext_cap_block]
+                    };
+                blocks
+                    .into_iter()
+                    .filter_map(|b| find_referenced_container_op(b, container_defs).map(|k| (k, b)))
+                    .collect()
+            };
+
+        for (op_key, block) in op_patches {
+            let Some(target_op_schema) = container_defs.get_mut(&op_key) else {
+                continue;
+            };
+            let target_op_name = qualify_container_op_name(&cap_item.stem_pascal, &op_key);
+            let mut derefed = deref_local_mixin_refs(
+                block,
+                &ext_item.schema,
+                &ext_item.stem_pascal,
+                inlined_mixin_defs,
+            );
+            rewrite_refs_to_defs(&mut derefed, &target_op_name, Some(&ext_item.stem_pascal));
+            merge_extension_into_schema(
+                target_op_schema,
+                &derefed,
+                &target_op_name,
+                root_raw_schemas,
+                defs,
+            );
+        }
+    }
+
+    Ok(composed)
+}
+
+fn find_referenced_container_op(
+    block: &Value,
+    container_defs: &Map<String, Value>,
+) -> Option<String> {
+    block.get("allOf")?.as_array()?.iter().find_map(|branch| {
+        let (_, def_key) = branch.get("$ref")?.as_str()?.split_once("#/$defs/")?;
+        container_defs
+            .contains_key(def_key)
+            .then(|| def_key.to_string())
+    })
+}
+
+fn hoist_container_operations(
+    cap_item: &LoadedSchema,
+    composed_container: &Value,
+    defs: &mut BTreeMap<String, Value>,
+) -> Result<(), CodegenError> {
+    let Some(container_defs) = composed_container.get("$defs").and_then(Value::as_object) else {
+        return Ok(());
+    };
+
+    for (op_key, op_schema) in container_defs {
+        if !is_container_op_key(op_key) {
+            continue;
+        }
+        let hoisted_name = qualify_container_op_name(&cap_item.stem_pascal, op_key);
+        let opts = match op_key.strip_suffix("_request") {
+            Some(op_prefix) => ResolveOptions::new(Direction::Request, op_prefix),
+            None => ResolveOptions::new(Direction::Response, "read"),
+        };
+        let resolved = resolve(op_schema, &opts)?;
+        defs.insert(
+            hoisted_name.clone(),
+            normalize_def_schema(&resolved, &hoisted_name, Some(&cap_item.stem_pascal)),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn merge_extension_into_schema_merges_properties_items_and_required_without_duplicates() {
+        let mut target = json!({
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string" },
+                "products": { "type": "array", "items": { "$ref": "#/$defs/Product" } }
+            }
+        });
+
+        let ext_source = json!({
+            "$defs": {
+                "mixin_props": {
+                    "type": "object",
+                    "required": ["id", "extra_req"],
+                    "properties": {
+                        "products": { "type": "array", "items": { "$ref": "#/$defs/FulfillmentProduct" } },
+                        "extra_req": { "type": "string" }
+                    }
+                },
+                "dev.ucp.shopping.checkout": {
+                    "allOf": [
+                        { "$ref": "#/$defs/Checkout" },
+                        { "$ref": "#/$defs/mixin_props" }
+                    ]
+                }
+            }
+        });
+
+        let mut inlined_mixin_defs = BTreeSet::new();
+        let derefed = deref_local_mixin_refs(
+            &ext_source["$defs"]["dev.ucp.shopping.checkout"],
+            &ext_source,
+            "Fulfillment",
+            &mut inlined_mixin_defs,
+        );
+        assert!(inlined_mixin_defs.contains("MixinProps"));
+        let mut root_raw_schemas = BTreeMap::new();
+        let mut defs = BTreeMap::new();
+        merge_extension_into_schema(
+            &mut target,
+            &derefed,
+            "Checkout",
+            &mut root_raw_schemas,
+            &mut defs,
+        );
+
+        assert_eq!(target["required"], json!(["id", "extra_req"]));
+        assert_eq!(
+            target["properties"]["products"]["items"]["$ref"],
+            "#/$defs/FulfillmentProduct"
+        );
+        assert_eq!(target["properties"]["extra_req"]["type"], "string");
+    }
+
+    #[test]
+    fn merge_extension_redirects_ref_property_constraints_and_conditional_items_to_target_defs() {
+        let mut booking = json!({
+            "type": "object",
+            "properties": {
+                "actions": { "$ref": "#/$defs/Actions" },
+                "payment": { "$ref": "#/$defs/Payment" },
+                "policies": { "type": "array", "items": { "$ref": "#/$defs/Policy" } }
+            }
+        });
+        let mut root_raw_schemas = BTreeMap::from([
+            (
+                "Actions".to_string(),
+                json!({ "type": "object", "propertyNames": { "$ref": "#/$defs/ReverseDomainName" } }),
+            ),
+            (
+                "Payment".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "instruments": { "type": "array", "items": { "$ref": "#/$defs/SelectedPaymentInstrument" } }
+                    }
+                }),
+            ),
+            ("Policy".to_string(), json!({ "type": "object" })),
+        ]);
+        let mut defs = BTreeMap::from([(
+            "SelectedPaymentInstrument".to_string(),
+            json!({ "allOf": [{ "$ref": "#/$defs/PaymentInstrument" }] }),
+        )]);
+
+        let ext = json!({
+            "type": "object",
+            "properties": {
+                "actions": {
+                    "ucp_request": "omit",
+                    "properties": {
+                        "dev.ucp.common.payment.three_ds_challenge": { "type": "array" }
+                    }
+                },
+                "payment": {
+                    "type": "object",
+                    "properties": {
+                        "instruments": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/PaymentInstrument" },
+                            "ucp_request": { "complete": "required" }
+                        }
+                    }
+                },
+                "policies": {
+                    "type": "array",
+                    "items": {
+                        "if": { "properties": { "type": { "const": "dev.ucp.lodging.policy.cancellation" } } },
+                        "then": { "$ref": "#/$defs/CancellationItem" }
+                    }
+                }
+            }
+        });
+
+        merge_extension_into_schema(
+            &mut booking,
+            &ext,
+            "Booking",
+            &mut root_raw_schemas,
+            &mut defs,
+        );
+
+        assert!(booking["properties"]["actions"].get("properties").is_none());
+        assert_eq!(booking["properties"]["actions"]["ucp_request"], "omit");
+        assert!(root_raw_schemas["Actions"]["properties"]
+            .get("dev.ucp.common.payment.three_ds_challenge")
+            .is_some());
+
+        assert!(booking["properties"]["payment"].get("properties").is_none());
+        assert_eq!(
+            root_raw_schemas["Payment"]["properties"]["instruments"]["items"]["$ref"],
+            "#/$defs/SelectedPaymentInstrument"
+        );
+        assert_eq!(
+            root_raw_schemas["Payment"]["properties"]["instruments"]["ucp_request"]["complete"],
+            "required"
+        );
+
+        assert_eq!(
+            booking["properties"]["policies"]["items"],
+            json!({ "$ref": "#/$defs/Policy" })
+        );
+        assert_eq!(
+            root_raw_schemas["Policy"]["allOf"][0]["then"]["$ref"],
+            "#/$defs/CancellationItem"
+        );
+    }
+
+    #[test]
+    fn compose_container_capability_supports_nested_defs_and_oneof_allof_extensions() {
+        let loaded = vec![
+            LoadedSchema::from_file(
+                "/schemas/shopping/catalog_lookup.json",
+                json!({
+                    "name": "dev.ucp.shopping.catalog.lookup",
+                    "$defs": {
+                        "lookup_request": { "type": "object", "properties": { "ids": { "type": "array" } } },
+                        "lookup_response": { "type": "object", "properties": { "products": { "type": "array" } } }
+                    }
+                }),
+            ),
+            LoadedSchema::from_file(
+                "/schemas/shopping/fulfillment.json",
+                json!({
+                    "name": "dev.ucp.shopping.fulfillment",
+                    "$defs": {
+                        "req_mixin": {
+                            "type": "object",
+                            "properties": { "context": { "$ref": "types/context.json" } }
+                        },
+                        "dev.ucp.shopping.catalog.lookup": {
+                            "$defs": { "lookup_request": { "$ref": "#/$defs/req_mixin" } }
+                        }
+                    }
+                }),
+            ),
+            LoadedSchema::from_file(
+                "/schemas/common/loyalty.json",
+                json!({
+                    "name": "dev.ucp.common.loyalty",
+                    "$defs": {
+                        "dev.ucp.shopping.catalog.lookup": {
+                            "oneOf": [{
+                                "allOf": [
+                                    { "$ref": "catalog_lookup.json#/$defs/lookup_response" },
+                                    { "type": "object", "properties": { "loyalty": { "$ref": "types/loyalty.json" } } }
+                                ]
+                            }]
+                        }
+                    }
+                }),
+            ),
+        ];
+
+        let mut root_raw_schemas = BTreeMap::new();
+        let mut defs = BTreeMap::new();
+        let mut inlined_mixin_defs = BTreeSet::new();
+        let composed = compose_container_capability(
+            &loaded[0],
+            &BTreeSet::from([1, 2]),
+            &loaded,
+            &mut root_raw_schemas,
+            &mut defs,
+            &mut inlined_mixin_defs,
+        )
+        .unwrap();
+
+        assert!(inlined_mixin_defs.contains("ReqMixin"));
+        hoist_container_operations(&loaded[0], &composed, &mut defs).unwrap();
+
+        assert_eq!(
+            defs["CatalogLookupRequest"]["properties"]["context"]["$ref"],
+            "#/$defs/Context"
+        );
+        assert_eq!(
+            defs["CatalogLookupResponse"]["properties"]["loyalty"]["$ref"],
+            "#/$defs/Loyalty"
+        );
+    }
+}
