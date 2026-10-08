@@ -192,7 +192,9 @@ fn merge_single_branch_into_target(
                 if let Some(existing_prop) = target_props_map.get_mut(prop_name) {
                     merge_extension_property(existing_prop, ext_prop, root_raw_schemas, defs);
                 } else {
-                    target_props_map.insert(prop_name.clone(), ext_prop.clone());
+                    let mut relaxed_prop = ext_prop.clone();
+                    relax_extension_property_required(&mut relaxed_prop);
+                    target_props_map.insert(prop_name.clone(), relaxed_prop);
                 }
             }
         }
@@ -210,6 +212,38 @@ fn merge_single_branch_into_target(
             if !req_arr.contains(req) {
                 req_arr.push(req.clone());
             }
+        }
+    }
+}
+
+/// Downgrade `"required"` visibility in `ucp_request` / `ucp_response` to `"optional"`
+/// when flattening a new extension property onto a unified capability schema.
+///
+/// For example, `common/payment_ap2_mandate.json` marks `ap2` as `"complete": "required"`
+/// because `ap2` is mandatory when the AP2 extension is negotiated at runtime. When
+/// `generate-types` flattens optional extensions onto the unified `CheckoutCompleteRequest`
+/// model, `ap2` itself must remain optional for non-AP2 checkouts while `checkout_mandate`
+/// stays required inside `Ap2WithCheckoutMandateCompleteRequest`.
+fn relax_extension_property_required(prop: &mut Value) {
+    let Some(prop_obj) = prop.as_object_mut() else {
+        return;
+    };
+    for key in ["ucp_request", "ucp_response"] {
+        let Some(annotation) = prop_obj.get_mut(key) else {
+            continue;
+        };
+        match annotation {
+            Value::String(s) if s == "required" => {
+                *s = "optional".to_string();
+            }
+            Value::Object(map) => {
+                for val in map.values_mut() {
+                    if val.as_str() == Some("required") {
+                        *val = Value::String("optional".to_string());
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

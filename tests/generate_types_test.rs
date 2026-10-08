@@ -448,6 +448,14 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         complete_ap2_allof[0]["$ref"],
         "#/$defs/Ap2WithCheckoutMandateCompleteRequest"
     );
+    assert_eq!(
+        bundle.defs["CheckoutCompleteRequest"]["required"],
+        serde_json::json!(["payment"])
+    );
+    assert_eq!(
+        bundle.defs["Ap2WithCheckoutMandateCompleteRequest"]["required"],
+        serde_json::json!(["checkout_mandate"])
+    );
 }
 
 #[test]
