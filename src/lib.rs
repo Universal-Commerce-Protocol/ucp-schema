@@ -60,6 +60,7 @@ mod error;
 mod linter;
 mod loader;
 mod namespace;
+pub mod openapi;
 mod resolver;
 mod types;
 mod validator;
@@ -81,6 +82,7 @@ pub use loader::{
     load_schema_str, navigate_fragment,
 };
 pub use namespace::{reverse_labels, validate_binding, BindingError};
+pub use openapi::{generate_openapi, rewrite_defs_to_component_schemas, GenerateOpenApiOptions};
 pub use resolver::{resolve, strip_annotations};
 pub use types::{Direction, Requires, ResolveOptions, VersionConstraint, Visibility};
 pub use validator::{select_operation_schema, validate, validate_against_schema};

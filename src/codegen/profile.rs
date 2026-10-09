@@ -352,6 +352,76 @@ fn relocate_url_to_local_schemas(url_str: &str, local_schema_roots: &[PathBuf]) 
     None
 }
 
+/// Resolve a REST service binding's `schema` URL or relative path against `profile_source`,
+/// relocating `.../services/<rel>` URLs to a sibling `services/` directory of any local
+/// `schemas/` root discovered from the profile's capabilities when available on disk.
+pub(crate) fn resolve_service_schema_target(
+    profile_source: &str,
+    service_schema_url: &str,
+    capabilities: &[Capability],
+) -> Result<String, CodegenError> {
+    let local_schema_roots = collect_local_schema_roots(profile_source, capabilities);
+    let file_part = service_schema_url.split('#').next().unwrap_or("");
+    if is_url(file_part) {
+        if let Some(local_hit) =
+            relocate_url_to_local_services(profile_source, file_part, &local_schema_roots)
+        {
+            return Ok(local_hit);
+        }
+    }
+    resolve_schema_target(profile_source, service_schema_url, &local_schema_roots)
+}
+
+fn collect_local_schema_roots(profile_source: &str, capabilities: &[Capability]) -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    for cap in capabilities {
+        let Ok(resolved) = resolve_schema_target(profile_source, &cap.schema_url, &[]) else {
+            continue;
+        };
+        if is_url(&resolved) {
+            continue;
+        }
+        for ancestor in Path::new(&resolved).ancestors() {
+            if ancestor.file_name().and_then(|s| s.to_str()) != Some("schemas") {
+                continue;
+            }
+            let root = ancestor.to_path_buf();
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+        }
+    }
+    roots
+}
+
+fn relocate_url_to_local_services(
+    profile_source: &str,
+    url_str: &str,
+    local_schema_roots: &[PathBuf],
+) -> Option<String> {
+    let (_, rel_after_services) = url_str.split_once("/services/")?;
+    if !is_url(profile_source) {
+        for ancestor in Path::new(profile_source).ancestors().skip(1) {
+            let candidate =
+                normalize_lexical_path(&ancestor.join("services").join(rel_after_services));
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    for root in local_schema_roots {
+        let Some(source_root) = root.parent() else {
+            continue;
+        };
+        let candidate =
+            normalize_lexical_path(&source_root.join("services").join(rel_after_services));
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
