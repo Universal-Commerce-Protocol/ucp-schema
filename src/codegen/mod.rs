@@ -55,6 +55,11 @@ impl GenerateTypesOptions {
         Self::default()
     }
 
+    /// Create [`GenerateTypesOptions`] scoped to a UCP discovery profile path or URL.
+    pub fn from_profile(profile: impl Into<String>) -> Self {
+        Self::new().profile(profile)
+    }
+
     /// Set the local schema directory path.
     pub fn schema_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.schema_dir = Some(dir.into());

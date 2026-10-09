@@ -9,10 +9,10 @@ use clap::{Parser, Subcommand};
 use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, generate_types, is_url, lint, load_schema, load_schema_auto, resolve,
-    select_operation_schema, validate, CodegenError, ComposeError, DetectedDirection, Direction,
-    FileStatus, GenerateTypesOptions, ResolveError, ResolveOptions, SchemaBaseConfig,
-    ValidateError,
+    extract_jsonrpc_payload, generate_openapi, generate_types, is_url, lint, load_schema,
+    load_schema_auto, resolve, select_operation_schema, validate, CodegenError, ComposeError,
+    DetectedDirection, Direction, FileStatus, GenerateOpenApiOptions, GenerateTypesOptions,
+    ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
@@ -293,6 +293,36 @@ enum Commands {
         )]
         pretty: bool,
     },
+
+    /// Generate an OpenAPI 3.1.0 specification by binding a UCP profile's REST service schema to its compiled capability types
+    #[command(name = "generate-openapi")]
+    GenerateOpenapi {
+        /// Path or URL to a UCP discovery profile declaring a REST service binding (required)
+        #[arg(long, short = 'p')]
+        profile: String,
+
+        /// Optional service FQDN filter when a profile declares multiple REST services (e.g. dev.ucp.shopping)
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Base server URL injected into servers (overrides the profile's REST service endpoint)
+        #[arg(long)]
+        server_url: Option<String>,
+
+        /// Output file path (emits JSON to stdout if omitted)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Pretty-print JSON output (defaults to true; use --pretty=false for compact)
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        pretty: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -395,6 +425,14 @@ fn main() -> ExitCode {
             output,
             pretty,
         ),
+
+        Commands::GenerateOpenapi {
+            profile,
+            service,
+            server_url,
+            output,
+            pretty,
+        } => run_generate_openapi(profile, service, server_url, output, pretty),
     };
 
     match result {
@@ -804,6 +842,22 @@ fn run_generate_types(
     };
     let bundle = generate_types(&options).map_err(cli_err(false))?;
     write_json_output(&bundle, output, pretty)
+}
+
+fn run_generate_openapi(
+    profile: String,
+    service: Option<String>,
+    server_url: Option<String>,
+    output: Option<PathBuf>,
+    pretty: bool,
+) -> Result<(), u8> {
+    let options = GenerateOpenApiOptions {
+        profile,
+        service,
+        server_url,
+    };
+    let spec = generate_openapi(&options).map_err(cli_err(false))?;
+    write_json_output(&spec, output, pretty)
 }
 
 /// Shared helper: serialize JSON and write to output or stdout.
