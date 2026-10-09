@@ -130,6 +130,12 @@ pub enum CodegenError {
     ResolveError(#[from] ResolveError),
     #[error("schema composition error: {0}")]
     ComposeError(#[from] ComposeError),
+    #[error("profile '{profile}' does not declare any service binding with transport 'rest'")]
+    NoRestServiceBinding { profile: String },
+    #[error(
+        "REST service binding '{service}' in profile '{profile}' is missing required 'schema' URL"
+    )]
+    MissingServiceSchema { profile: String, service: String },
 }
 
 impl CodegenError {
@@ -138,6 +144,7 @@ impl CodegenError {
         match self {
             Self::ResolveError(e) => e.exit_code(),
             Self::ComposeError(e) => e.exit_code(),
+            Self::NoRestServiceBinding { .. } | Self::MissingServiceSchema { .. } => 2,
         }
     }
 }
@@ -508,5 +515,16 @@ mod tests {
         let conflict_err =
             compile_types(&opts).expect_err("combining profile and schema_dir must error");
         assert_eq!(conflict_err.exit_code(), 2);
+
+        let no_rest = CodegenError::NoRestServiceBinding {
+            profile: "p".to_string(),
+        };
+        assert_eq!(no_rest.exit_code(), 2);
+
+        let missing_svc = CodegenError::MissingServiceSchema {
+            profile: "p".to_string(),
+            service: "s".to_string(),
+        };
+        assert_eq!(missing_svc.exit_code(), 2);
     }
 }
