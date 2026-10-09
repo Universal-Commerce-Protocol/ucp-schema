@@ -507,6 +507,81 @@ fn relocate_url_to_local_schemas(
     None
 }
 
+/// Resolve a REST service binding's `schema` URL or relative path against `profile_source`,
+/// relocating `.../services/<rel>` URLs to a sibling `services/` directory of any local
+/// `schemas/` root discovered from the profile's capabilities when available on disk.
+pub(crate) fn resolve_service_schema_target(
+    profile_source: &str,
+    service_schema_url: &str,
+    capabilities: &[Capability],
+) -> Result<String, CodegenError> {
+    let local_schema_roots = collect_local_schema_roots(profile_source, capabilities);
+    let file_part = service_schema_url.split('#').next().unwrap_or("");
+    if is_url(file_part) {
+        if let Some(local_hit) =
+            relocate_url_to_local_services(profile_source, file_part, &local_schema_roots)
+        {
+            return Ok(local_hit);
+        }
+    }
+    resolve_schema_target(profile_source, service_schema_url, &local_schema_roots)
+}
+
+fn collect_local_schema_roots(
+    profile_source: &str,
+    capabilities: &[Capability],
+) -> Vec<LocalSchemaRoot> {
+    let mut crawler = ProfileCrawler::default();
+    for cap in capabilities {
+        let Ok(resolved) = resolve_schema_target(profile_source, &cap.schema_url, &[]) else {
+            continue;
+        };
+        if is_url(&resolved) {
+            continue;
+        }
+        let Ok(schema) = load_schema_auto(&resolved) else {
+            continue;
+        };
+        crawler.record_local_schema_root(&resolved, &schema, Some(&cap.name), Some(&cap.version));
+    }
+    crawler.local_schema_roots
+}
+
+fn relocate_url_to_local_services(
+    profile_source: &str,
+    url_str: &str,
+    local_schema_roots: &[LocalSchemaRoot],
+) -> Option<String> {
+    let (target_origin, target_version, rel_after_services) =
+        split_url_marker(url_str, "/services/")?;
+    for root in local_schema_roots {
+        if root.origin != target_origin {
+            continue;
+        }
+        if !versions_compatible(root.version.as_deref(), target_version.as_deref()) {
+            continue;
+        }
+        let Some(source_root) = root.path.parent() else {
+            continue;
+        };
+        let candidate =
+            normalize_lexical_path(&source_root.join("services").join(rel_after_services));
+        if candidate.exists() {
+            return Some(candidate.to_string_lossy().into_owned());
+        }
+    }
+    if !is_url(profile_source) {
+        for ancestor in Path::new(profile_source).ancestors().skip(1) {
+            let candidate =
+                normalize_lexical_path(&ancestor.join("services").join(rel_after_services));
+            if candidate.exists() {
+                return Some(candidate.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
