@@ -75,9 +75,7 @@ pub fn qualify_def_name(parent_pascal: &str, def_key: &str) -> String {
         } else {
             format!("{parent_pascal}{def_pascal}")
         }
-    } else if (def_key.ends_with("_request") || def_key.ends_with("_response"))
-        && def_key != "complete_request"
-    {
+    } else if def_key.ends_with("_request") || def_key.ends_with("_response") {
         qualify_container_op_name(parent_pascal, def_key)
     } else {
         def_pascal
@@ -146,7 +144,6 @@ pub fn strip_ucp_keywords(value: &mut Value) {
         for key in UCP_ANNOTATIONS {
             obj.remove(*key);
         }
-        obj.remove("ucp_shared_request");
         if obj
             .get("name")
             .and_then(Value::as_str)
@@ -159,7 +156,7 @@ pub fn strip_ucp_keywords(value: &mut Value) {
                 obj.remove(key);
             }
         }
-        obj.retain(|k, _| !k.starts_with("x-ucp-"));
+        obj.remove("x-ucp-schema-transition");
         if obj.contains_key("$ref") {
             obj.remove("type");
         }
@@ -223,33 +220,11 @@ pub fn has_directional_annotations(schema: &Value) -> bool {
     found
 }
 
-/// Returns `true` when `schema` supports the `"complete"` request operation via `ucp_request`
-/// annotations, `x-ucp-lifecycle`, or a `complete_request` entry in `$defs`.
+/// Returns `true` when `schema` supports the `"complete"` request operation via a `"complete"`
+/// entry in a `ucp_request` annotation object.
 pub fn schema_supports_complete(schema: &Value) -> bool {
-    if schema
-        .get("$defs")
-        .and_then(Value::as_object)
-        .is_some_and(|defs| {
-            defs.keys().any(|k| {
-                k == "complete_request"
-                    || k == "CompleteRequest"
-                    || k.ends_with(".complete_request")
-                    || k.ends_with("_complete_request")
-            })
-        })
-    {
-        return true;
-    }
-
     let mut found = false;
     for_each_schema_object(schema, &mut |obj| {
-        if obj
-            .get("x-ucp-lifecycle")
-            .and_then(Value::as_array)
-            .is_some_and(|lc| lc.iter().any(|v| v.as_str() == Some("complete")))
-        {
-            found = true;
-        }
         if obj
             .get("ucp_request")
             .and_then(Value::as_object)
@@ -305,9 +280,8 @@ pub fn slice_directional_schemas(
 
 /// Rewrite `#/$defs/<Target>` references inside a directional request schema slice
 /// (`<Name>CreateRequest`, `<Name>UpdateRequest`, `<Name>CompleteRequest`) to point to
-/// `#/$defs/<Target><suffix>` when `<Target><suffix>` is in `known_defs` (or to
-/// `#/$defs/<Target>UpdateRequest` when `suffix == "CompleteRequest"` and
-/// `<Target>UpdateRequest` is in `known_defs`).
+/// `#/$defs/<Target><suffix>` when `<Target><suffix>` is in `known_defs`, falling back to
+/// the base `#/$defs/<Target>` type otherwise.
 pub fn align_directional_refs(schema_val: &mut Value, suffix: &str, known_defs: &BTreeSet<String>) {
     for_each_schema_object_mut(schema_val, &mut |obj| {
         let Some(Value::String(ref_str)) = obj.get("$ref") else {
@@ -323,14 +297,6 @@ pub fn align_directional_refs(schema_val: &mut Value, suffix: &str, known_defs: 
                 "$ref".to_string(),
                 Value::String(format!("#/$defs/{candidate}")),
             );
-        } else if suffix == "CompleteRequest" {
-            let fallback = format!("{target}UpdateRequest");
-            if known_defs.contains(&fallback) {
-                obj.insert(
-                    "$ref".to_string(),
-                    Value::String(format!("#/$defs/{fallback}")),
-                );
-            }
         }
     });
 }
@@ -621,10 +587,6 @@ mod tests {
             qualify_def_name("OrderManage", "cancel_request"),
             "OrderCancelRequest"
         );
-        assert_eq!(
-            qualify_def_name("Checkout", "complete_request"),
-            "CompleteRequest"
-        );
     }
 
     #[test]
@@ -723,7 +685,6 @@ mod tests {
             "requires": { "protocol": { "min": "2026-01-11" } },
             "embedded": { "methods": {} },
             "type": "object",
-            "ucp_shared_request": true,
             "x-ucp-schema-transition": { "from": "optional", "to": "omit" },
             "required": ["id", "omitted_field"],
             "properties": {
@@ -760,7 +721,6 @@ mod tests {
         assert!(schema.get("version").is_none());
         assert!(schema.get("requires").is_none());
         assert!(schema.get("embedded").is_none());
-        assert!(schema.get("ucp_shared_request").is_none());
         assert!(schema.get("x-ucp-schema-transition").is_none());
         assert_eq!(schema["required"], json!(["id"]));
         assert!(schema["properties"]["id"].get("ucp_request").is_none());
@@ -1057,8 +1017,7 @@ mod tests {
                 "id": {
                     "type": "string",
                     "default": {
-                        "ucp_request": { "complete": "required" },
-                        "x-ucp-lifecycle": ["complete"]
+                        "ucp_request": { "complete": "required" }
                     }
                 }
             }
@@ -1089,21 +1048,6 @@ mod tests {
         });
         assert!(has_directional_annotations(&with_complete_req));
         assert!(schema_supports_complete(&with_complete_req));
-
-        let with_lifecycle = json!({
-            "type": "object",
-            "x-ucp-lifecycle": ["create", "update", "complete"],
-            "properties": {}
-        });
-        assert!(schema_supports_complete(&with_lifecycle));
-
-        let with_defs_complete = json!({
-            "type": "object",
-            "$defs": {
-                "checkout.complete_request": { "type": "object" }
-            }
-        });
-        assert!(schema_supports_complete(&with_defs_complete));
     }
 
     #[test]
@@ -1231,7 +1175,7 @@ mod tests {
     }
 
     #[test]
-    fn align_directional_refs_rewrites_known_targets_and_falls_back_for_complete_request() {
+    fn align_directional_refs_rewrites_known_targets_and_falls_back_to_base_type() {
         let known_defs: BTreeSet<String> = [
             "LineItem",
             "LineItemCreateRequest",
@@ -1280,10 +1224,10 @@ mod tests {
 
         let mut complete_slice = base_slice;
         align_directional_refs(&mut complete_slice, "CompleteRequest", &known_defs);
-        // LineItem has no CompleteRequest, so it falls back to LineItemUpdateRequest
+        // LineItem has no CompleteRequest, so it falls back to the base LineItem type
         assert_eq!(
             complete_slice["properties"]["line_items"]["items"]["$ref"],
-            "#/$defs/LineItemUpdateRequest"
+            "#/$defs/LineItem"
         );
         // Fulfillment has FulfillmentCompleteRequest, so it uses the direct match
         assert_eq!(
