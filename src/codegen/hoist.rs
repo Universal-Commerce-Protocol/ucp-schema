@@ -11,8 +11,10 @@ use crate::codegen::normalizer::{
 use crate::codegen::reachability::{
     compute_inactive_local_defs, is_container_op_key, normalize_lexical_path, LoadedSchema,
 };
-use crate::codegen::{has_root_schema_body, CodegenError, SchemaMap};
-use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
+use crate::codegen::{
+    collision_qualified_name, contains_ref, has_root_schema_body, CodegenError, SchemaMap,
+};
+use crate::loader::for_each_schema_object_mut;
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
 
@@ -111,7 +113,6 @@ pub(super) fn hoist_defs(
                             def_val,
                             &hoisted_name,
                             &item.stem_pascal,
-                            false,
                             defs,
                             sliced_base_names,
                         )?;
@@ -230,16 +231,7 @@ fn is_inplace_overlay(
         .and_then(Value::as_object)
         .is_some_and(|defs| {
             defs.iter()
-                .filter(|(k, _)| is_reverse_domain_name(k))
-                .any(|(_, v)| {
-                    let mut found = false;
-                    for_each_schema_object(v, &mut |sub| {
-                        if sub.get("$ref").and_then(Value::as_str) == Some(&expected_ref) {
-                            found = true;
-                        }
-                    });
-                    found
-                })
+                .any(|(k, v)| is_reverse_domain_name(k) && contains_ref(v, &expected_ref))
         })
 }
 
@@ -278,17 +270,10 @@ fn compute_collision_renames(
     let mut renames = BTreeMap::new();
     for (idx, def_key, default_name) in entries {
         let count = candidate_counts.get(&default_name).copied().unwrap_or(0);
-        if !(standalone_type_names.contains(&default_name) || count > 1) {
-            continue;
+        if standalone_type_names.contains(&default_name) || count > 1 {
+            let qualified = collision_qualified_name(&loaded[idx].stem_pascal, &def_key);
+            renames.insert((idx, def_key), qualified);
         }
-        let parent_pascal = &loaded[idx].stem_pascal;
-        let def_pascal = to_pascal_case(&def_key);
-        let qualified = if def_pascal.starts_with(parent_pascal) {
-            def_pascal
-        } else {
-            format!("{parent_pascal}{def_pascal}")
-        };
-        renames.insert((idx, def_key), qualified);
     }
     renames
 }
@@ -351,7 +336,6 @@ fn hoist_self_named_role_schemas(
             role_val,
             &hoisted_name,
             stem_pascal,
-            false,
             defs,
             sliced_base_names,
         )?;
@@ -363,11 +347,10 @@ pub(super) fn insert_sliced_or_normalized_def(
     raw_val: &Value,
     hoisted_name: &str,
     parent_pascal: &str,
-    force_slice: bool,
     defs: &mut BTreeMap<String, Value>,
     sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
-    if force_slice || has_directional_annotations(raw_val) {
+    if has_directional_annotations(raw_val) {
         sliced_base_names.insert(hoisted_name.to_string());
         let mut prepared = raw_val.clone();
         rewrite_refs_to_defs(&mut prepared, hoisted_name, Some(parent_pascal));

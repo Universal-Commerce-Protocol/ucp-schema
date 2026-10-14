@@ -6,10 +6,11 @@ use std::path::PathBuf;
 use serde_json::{Map, Value};
 
 use crate::codegen::normalizer::{
-    normalize_def_schema, qualify_container_op_name, qualify_def_name, rewrite_refs_to_defs,
+    is_reverse_domain_name, normalize_def_schema, qualify_container_op_name, qualify_def_name,
+    rewrite_refs_to_defs,
 };
 use crate::codegen::reachability::{is_container_op_key, LoadedSchema};
-use crate::codegen::{local_def_ref, CodegenError, SchemaMap};
+use crate::codegen::{collision_qualified_name, local_def_ref, CodegenError, SchemaMap};
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
 
@@ -139,9 +140,18 @@ fn deref_local_mixin_refs(
         return current;
     };
     let mut inline_one = |node: &mut Value| {
-        if let Some((k, target)) = local_def_ref(node).and_then(|k| defs_obj.get(k).map(|v| (k, v)))
-        {
-            inlined_mixin_defs.insert(qualify_def_name(parent_pascal, k));
+        let Some(ref_key) = local_def_ref(node) else {
+            return;
+        };
+        if let Some(target) = defs_obj.get(ref_key) {
+            inlined_mixin_defs.insert(qualify_def_name(parent_pascal, ref_key));
+            *node = target.clone();
+        } else if let Some(target) = defs_obj.iter().find_map(|(raw_key, val)| {
+            (!is_reverse_domain_name(raw_key)
+                && collision_qualified_name(parent_pascal, raw_key) == ref_key)
+                .then_some(val)
+        }) {
+            inlined_mixin_defs.insert(ref_key.to_string());
             *node = target.clone();
         }
     };
@@ -265,18 +275,18 @@ fn merge_extension_items(
     root_raw_schemas: &mut BTreeMap<String, Value>,
     defs: &mut BTreeMap<String, Value>,
 ) {
-    if let Some(ext_def) = local_def_ref(ext_items) {
-        let keep_base_ref = base_obj
-            .get("items")
-            .and_then(local_def_ref)
-            .is_some_and(|base_def| def_extends_target(base_def, ext_def, root_raw_schemas, defs));
+    if ext_items.get("$ref").is_some() {
+        let keep_base_ref = local_def_ref(ext_items).is_some_and(|ext_def| {
+            base_obj
+                .get("items")
+                .and_then(local_def_ref)
+                .is_some_and(|base_def| {
+                    def_extends_target(base_def, ext_def, root_raw_schemas, defs)
+                })
+        });
         if !keep_base_ref {
             base_obj.insert("items".to_string(), ext_items.clone());
         }
-        return;
-    }
-    if ext_items.get("$ref").is_some() {
-        base_obj.insert("items".to_string(), ext_items.clone());
         return;
     }
 
@@ -478,10 +488,18 @@ mod tests {
                         "extra_req": { "type": "string" }
                     }
                 },
+                "colliding_mixin": {
+                    "type": "object",
+                    "required": ["colliding_field"],
+                    "properties": {
+                        "colliding_field": { "type": "boolean" }
+                    }
+                },
                 "dev.ucp.shopping.checkout": {
                     "allOf": [
                         { "$ref": "#/$defs/Checkout" },
-                        { "$ref": "#/$defs/mixin_props" }
+                        { "$ref": "#/$defs/mixin_props" },
+                        { "$ref": "#/$defs/FulfillmentCollidingMixin" }
                     ]
                 }
             }
@@ -495,6 +513,7 @@ mod tests {
             &mut inlined_mixin_defs,
         );
         assert!(inlined_mixin_defs.contains("MixinProps"));
+        assert!(inlined_mixin_defs.contains("FulfillmentCollidingMixin"));
         let mut root_raw_schemas = BTreeMap::new();
         let mut defs = BTreeMap::new();
         merge_extension_into_schema(
@@ -505,12 +524,16 @@ mod tests {
             &mut defs,
         );
 
-        assert_eq!(target["required"], json!(["id", "extra_req"]));
+        assert_eq!(
+            target["required"],
+            json!(["id", "extra_req", "colliding_field"])
+        );
         assert_eq!(
             target["properties"]["products"]["items"]["$ref"],
             "#/$defs/FulfillmentProduct"
         );
         assert_eq!(target["properties"]["extra_req"]["type"], "string");
+        assert_eq!(target["properties"]["colliding_field"]["type"], "boolean");
     }
 
     #[test]

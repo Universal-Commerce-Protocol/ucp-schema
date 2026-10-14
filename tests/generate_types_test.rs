@@ -108,6 +108,14 @@ fn unknown_capability_or_extension_returns_invalid_capability_error() {
     let err = generate_types(&bad_ext).expect_err("unknown extension must error");
     assert!(matches!(err, CodegenError::ComposeError(_)));
     assert_eq!(err.exit_code(), 2);
+
+    let cap_as_ext = GenerateTypesOptions::new()
+        .schema_dir(fixture_schemas_dir())
+        .extensions(["dev.ucp.shopping.checkout"]);
+    let err =
+        generate_types(&cap_as_ext).expect_err("passing capability in extensions() must error");
+    assert!(matches!(err, CodegenError::ComposeError(_)));
+    assert_eq!(err.exit_code(), 2);
 }
 
 #[test]
@@ -133,18 +141,13 @@ fn fixture_composes_extensions_and_slices_directionally() {
     );
     assert_lacks_defs(&bundle.defs, &["Cart"]);
 
-    assert!(bundle.defs["Checkout"]["properties"]
-        .get("discounts")
-        .is_some());
-    assert!(bundle.defs["CheckoutCreateRequest"]["properties"]
-        .get("discounts")
-        .is_some());
-    assert!(bundle.defs["CheckoutCreateRequest"]["properties"]
-        .get("id")
-        .is_none());
-    assert!(bundle.defs["CheckoutUpdateRequest"]["properties"]
-        .get("id")
-        .is_some());
+    let c_props = &bundle.defs["Checkout"]["properties"];
+    let cr_props = &bundle.defs["CheckoutCreateRequest"]["properties"];
+    let ur_props = &bundle.defs["CheckoutUpdateRequest"]["properties"];
+    assert!(c_props.get("discounts").is_some());
+    assert!(cr_props.get("discounts").is_some());
+    assert!(cr_props.get("id").is_none());
+    assert!(ur_props.get("id").is_some());
 }
 
 #[test]
@@ -285,23 +288,18 @@ fn ucp_corpus_multi_extension_and_container_composition() {
     assert!(bundle.defs["Checkout"]["properties"]["payment"]
         .get("properties")
         .is_none());
+    let p_props = &bundle.defs["Payment"]["properties"];
+    let p_cr_props = &bundle.defs["PaymentCreateRequest"]["properties"];
+    let p_ur_props = &bundle.defs["PaymentUpdateRequest"]["properties"];
     assert_eq!(
-        bundle.defs["Payment"]["properties"]["instruments"]["items"]["$ref"],
+        p_props["instruments"]["items"]["$ref"],
         "#/$defs/SelectedPaymentInstrument"
     );
-    assert!(bundle.defs["Payment"]["properties"].get("terms").is_some());
-    assert!(bundle.defs["Payment"]["properties"]
-        .get("selected_term_id")
-        .is_some());
-    assert!(bundle.defs["PaymentCreateRequest"]["properties"]
-        .get("terms")
-        .is_none());
-    assert!(bundle.defs["PaymentCreateRequest"]["properties"]
-        .get("selected_term_id")
-        .is_none());
-    assert!(bundle.defs["PaymentUpdateRequest"]["properties"]
-        .get("selected_term_id")
-        .is_some());
+    assert!(p_props.get("terms").is_some());
+    assert!(p_props.get("selected_term_id").is_some());
+    assert!(p_cr_props.get("terms").is_none());
+    assert!(p_cr_props.get("selected_term_id").is_none());
+    assert!(p_ur_props.get("selected_term_id").is_some());
     assert_eq!(
         bundle.defs["PaymentCompleteRequest"]["required"],
         serde_json::json!(["instruments"])
@@ -319,18 +317,16 @@ fn ucp_corpus_multi_extension_and_container_composition() {
         bundle.defs["CatalogSearchResponse"]["properties"]["products"]["items"]["$ref"],
         "#/$defs/FulfillmentProduct"
     );
-    assert_eq!(
-        bundle.defs["CatalogSearchResponse"]["properties"]["loyalty"]["$ref"],
-        "#/$defs/Loyalty"
-    );
-    assert_eq!(
-        bundle.defs["CatalogLookupResponse"]["properties"]["loyalty"]["$ref"],
-        "#/$defs/Loyalty"
-    );
-    assert_eq!(
-        bundle.defs["CatalogGetProductResponse"]["properties"]["loyalty"]["$ref"],
-        "#/$defs/Loyalty"
-    );
+    for resp in [
+        "CatalogSearchResponse",
+        "CatalogLookupResponse",
+        "CatalogGetProductResponse",
+    ] {
+        assert_eq!(
+            bundle.defs[resp]["properties"]["loyalty"]["$ref"],
+            "#/$defs/Loyalty"
+        );
+    }
     assert_eq!(
         bundle.defs["CatalogGetProductResponse"]["properties"]["product"]["$ref"],
         "#/$defs/FulfillmentDetailProduct"

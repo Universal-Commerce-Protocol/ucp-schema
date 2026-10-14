@@ -13,7 +13,7 @@ use serde_json::Value;
 
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
-use crate::codegen::normalizer::align_directional_refs;
+use crate::codegen::normalizer::{align_directional_refs, to_pascal_case};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
 };
@@ -27,7 +27,6 @@ pub struct GenerateTypesOptions {
     pub capabilities: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
     pub schema_dir: Option<PathBuf>,
-    pub schema_remote_base: Option<String>,
     pub title: String,
     pub description: Option<String>,
 }
@@ -39,7 +38,6 @@ impl Default for GenerateTypesOptions {
             capabilities: None,
             extensions: None,
             schema_dir: None,
-            schema_remote_base: None,
             title: "UCP Schema Types".to_string(),
             description: None,
         }
@@ -55,12 +53,6 @@ impl GenerateTypesOptions {
     /// Set the local schema directory path.
     pub fn schema_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.schema_dir = Some(dir.into());
-        self
-    }
-
-    /// Set the remote schema URL prefix for URL-to-local mapping.
-    pub fn schema_remote_base(mut self, base: impl Into<String>) -> Self {
-        self.schema_remote_base = Some(base.into());
         self
     }
 
@@ -128,12 +120,6 @@ pub enum CodegenError {
     ResolveError(#[from] ResolveError),
     #[error("schema composition error: {0}")]
     ComposeError(#[from] ComposeError),
-    #[error("profile '{profile}' does not declare any service binding with transport 'rest'")]
-    NoRestServiceBinding { profile: String },
-    #[error(
-        "REST service binding '{service}' in profile '{profile}' is missing required 'schema' URL"
-    )]
-    MissingServiceSchema { profile: String, service: String },
 }
 
 impl CodegenError {
@@ -142,7 +128,6 @@ impl CodegenError {
         match self {
             Self::ResolveError(e) => e.exit_code(),
             Self::ComposeError(e) => e.exit_code(),
-            Self::NoRestServiceBinding { .. } | Self::MissingServiceSchema { .. } => 2,
         }
     }
 }
@@ -213,7 +198,6 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
             raw_schema,
             base_name,
             base_name,
-            capability_resources.contains_key(base_name),
             &mut defs,
             &mut sliced_base_names,
         )?;
@@ -266,6 +250,25 @@ pub(super) type SchemaMap = BTreeMap<String, Value>;
 
 pub(super) fn local_def_ref(val: &Value) -> Option<&str> {
     val.get("$ref")?.as_str()?.strip_prefix("#/$defs/")
+}
+
+pub(super) fn contains_ref(val: &Value, target_ref: &str) -> bool {
+    let mut found = false;
+    for_each_schema_object(val, &mut |obj| {
+        if obj.get("$ref").and_then(Value::as_str) == Some(target_ref) {
+            found = true;
+        }
+    });
+    found
+}
+
+pub(super) fn collision_qualified_name(parent_pascal: &str, def_key: &str) -> String {
+    let def_pascal = to_pascal_case(def_key);
+    if def_pascal.starts_with(parent_pascal) {
+        def_pascal
+    } else {
+        format!("{parent_pascal}{def_pascal}")
+    }
 }
 
 pub(super) fn has_root_schema_body(val: &Value) -> bool {
@@ -325,7 +328,7 @@ fn prune_empty_object_defs(
             let is_request_slice = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
                 .iter()
                 .any(|s| name.ends_with(s));
-            !(is_request_slice && !active_cap_root_requests.contains(name))
+            !is_request_slice || active_cap_root_requests.contains(name)
         });
         if defs.len() == before {
             break;
@@ -337,7 +340,10 @@ fn is_empty_object_schema(val: &Value) -> bool {
     let Some(obj) = val.as_object() else {
         return false;
     };
-    if !obj.get("type").is_none_or(|t| t.as_str() == Some("object")) {
+    if obj
+        .get("type")
+        .is_some_and(|t| t.as_str() != Some("object"))
+    {
         return false;
     }
     let has_props = obj
@@ -349,16 +355,15 @@ fn is_empty_object_schema(val: &Value) -> bool {
             .and_then(Value::as_array)
             .is_some_and(|a| !a.is_empty())
     });
-    let has_ref = obj.get("$ref").is_some_and(Value::is_string);
-    let has_map_schema = obj.contains_key("propertyNames")
+    let has_constraints = obj.get("$ref").is_some_and(Value::is_string)
         || obj
             .get("additionalProperties")
-            .is_some_and(Value::is_object);
-    let has_scalar_constraints = ["enum", "const", "pattern", "items"]
-        .iter()
-        .any(|k| obj.contains_key(*k));
+            .is_some_and(Value::is_object)
+        || ["propertyNames", "enum", "const", "pattern", "items"]
+            .iter()
+            .any(|k| obj.contains_key(*k));
 
-    !(has_props || has_composition || has_ref || has_map_schema || has_scalar_constraints)
+    !(has_props || has_composition || has_constraints)
 }
 
 #[cfg(test)]
@@ -439,7 +444,6 @@ mod tests {
     fn options_builders_and_error_exit_codes_behave_as_expected() {
         let opts = GenerateTypesOptions::new()
             .profile("https://example.com/profile.json")
-            .schema_remote_base("https://ucp.dev/draft")
             .capabilities(Vec::<&str>::new())
             .extensions(Vec::<&str>::new())
             .title("");
@@ -447,26 +451,11 @@ mod tests {
             opts.profile.as_deref(),
             Some("https://example.com/profile.json")
         );
-        assert_eq!(
-            opts.schema_remote_base.as_deref(),
-            Some("https://ucp.dev/draft")
-        );
         assert!(opts.capabilities.is_none());
         assert!(opts.extensions.is_none());
         assert_eq!(opts.title, "");
 
         let profile_err = compile_types(&opts).expect_err("profile guard must error before Task 5");
         assert_eq!(profile_err.exit_code(), 2);
-
-        let no_rest = CodegenError::NoRestServiceBinding {
-            profile: "p".to_string(),
-        };
-        assert_eq!(no_rest.exit_code(), 2);
-
-        let missing_svc = CodegenError::MissingServiceSchema {
-            profile: "p".to_string(),
-            service: "s".to_string(),
-        };
-        assert_eq!(missing_svc.exit_code(), 2);
     }
 }

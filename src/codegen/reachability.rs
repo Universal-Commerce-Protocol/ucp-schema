@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use serde_json::{Map, Value};
 
 use crate::codegen::normalizer::{is_reverse_domain_name, to_pascal_case};
-use crate::codegen::CodegenError;
+use crate::codegen::{contains_ref, CodegenError};
 use crate::compose::is_container_schema;
 use crate::error::ComposeError;
 use crate::loader::{collect_schema_files, for_each_schema_object, load_schema};
@@ -121,7 +121,16 @@ pub(super) fn select_active_schemas(
 
     if let Some(queries) = ext_queries {
         for query in queries {
-            active_exts.insert(resolve_query(query, "extension")?);
+            let idx = resolve_query(query, "extension")?;
+            if !loaded[idx].is_extension {
+                return Err(CodegenError::ComposeError(
+                    ComposeError::InvalidCapability {
+                        name: query.to_string(),
+                        message: "schema is a capability, not an extension".to_string(),
+                    },
+                ));
+            }
+            active_exts.insert(idx);
         }
     } else if cap_queries.is_none() {
         active_exts.extend(
@@ -271,31 +280,20 @@ fn is_unreferenced_cross_capability_overlay(
         return false;
     }
     let local_ref = format!("#/$defs/{def_key}");
-    let mut referenced = false;
-    if let Some(root_obj) = item.schema.as_object() {
-        for (k, v) in root_obj {
-            if k == "$defs" {
-                if let Some(defs) = v.as_object() {
-                    for (other_k, other_v) in defs {
-                        if other_k != def_key {
-                            for_each_schema_object(other_v, &mut |obj| {
-                                if obj.get("$ref").and_then(Value::as_str) == Some(&local_ref) {
-                                    referenced = true;
-                                }
-                            });
-                        }
-                    }
-                }
-            } else {
-                for_each_schema_object(v, &mut |obj| {
-                    if obj.get("$ref").and_then(Value::as_str) == Some(&local_ref) {
-                        referenced = true;
-                    }
-                });
-            }
+    let Some(root_obj) = item.schema.as_object() else {
+        return true;
+    };
+    !root_obj.iter().any(|(k, v)| {
+        if k == "$defs" {
+            v.as_object().is_some_and(|defs| {
+                defs.iter().any(|(other_k, other_v)| {
+                    other_k != def_key && contains_ref(other_v, &local_ref)
+                })
+            })
+        } else {
+            contains_ref(v, &local_ref)
         }
-    }
-    !referenced
+    })
 }
 
 pub(super) fn is_container_op_key(key: &str) -> bool {
@@ -465,6 +463,18 @@ mod tests {
         // 4. Short names ("checkout") are rejected with InvalidCapability
         let err = select_active_schemas(&loaded, Some(&["checkout".to_string()]), None)
             .expect_err("short capability names must be rejected");
+        assert!(matches!(
+            err,
+            CodegenError::ComposeError(ComposeError::InvalidCapability { .. })
+        ));
+
+        // 5. Passing a non-extension capability in `ext_queries` is rejected with InvalidCapability
+        let err = select_active_schemas(
+            &loaded,
+            None,
+            Some(&["dev.ucp.shopping.checkout".to_string()]),
+        )
+        .expect_err("root capabilities in ext_queries must be rejected");
         assert!(matches!(
             err,
             CodegenError::ComposeError(ComposeError::InvalidCapability { .. })
