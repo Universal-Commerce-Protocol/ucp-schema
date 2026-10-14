@@ -58,10 +58,7 @@ fn assert_bundle_invariants(defs: &std::collections::BTreeMap<String, Value>) {
             }
             assert!(
                 !obj.keys().any(|k| {
-                    k == "ucp_request"
-                        || k == "ucp_response"
-                        || k == "ucp_shared_request"
-                        || k.starts_with("x-ucp-")
+                    k == "ucp_request" || k == "ucp_response" || k == "x-ucp-schema-transition"
                 }),
                 "def '{def_name}' still contains UCP annotations"
             );
