@@ -47,8 +47,12 @@ impl LoadedSchema {
             .and_then(Value::as_str)
             .filter(|s| is_reverse_domain_name(s))
             .map(str::to_string);
-        let in_types_dir = path.components().any(|c| c.as_os_str() == "types");
-        let in_transports_dir = path.components().any(|c| c.as_os_str() == "transports");
+        let parent_dir = path
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|s| s.to_str());
+        let in_types_dir = parent_dir == Some("types");
+        let in_transports_dir = parent_dir == Some("transports");
         let is_extension = is_extension_schema(&schema);
         let is_container =
             is_container_capability(&schema, is_extension, in_types_dir || in_transports_dir);
@@ -422,18 +426,20 @@ mod tests {
     {
         let loaded = vec![
             LoadedSchema::from_file(
-                "/schemas/shopping/checkout.json",
+                "/home/user/types/transports/schemas/shopping/checkout.json",
                 json!({"name": "dev.ucp.shopping.checkout", "type": "object", "properties": {"id": {"type": "string"}}}),
             ),
             LoadedSchema::from_file(
-                "/schemas/shopping/discount.json",
+                "/home/user/types/transports/schemas/shopping/discount.json",
                 json!({"name": "dev.ucp.shopping.discount", "$defs": {"dev.ucp.shopping.checkout": {"properties": {}}}}),
             ),
             LoadedSchema::from_file(
-                "/schemas/shopping/types/discount.json",
+                "/home/user/types/transports/schemas/shopping/types/discount.json",
                 json!({"type": "object"}),
             ),
         ];
+        assert!(loaded[0].is_capability && !loaded[0].in_types_dir);
+        assert!(loaded[2].in_types_dir && !loaded[2].is_capability);
 
         // 1. Passing an extension in `cap_queries` reclassifies it into `active_exts`
         let caps = vec![

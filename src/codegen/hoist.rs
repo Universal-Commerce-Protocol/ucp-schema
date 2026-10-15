@@ -426,10 +426,12 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "detail": { "$ref": "#/$defs/shared_detail" },
+                        "prefixed": { "$ref": "#/$defs/alpha_prefixed" },
                         "item": { "$ref": "#/$defs/line_item" }
                     },
                     "$defs": {
                         "shared_detail": { "type": "object", "properties": { "a": { "type": "string" } } },
+                        "alpha_prefixed": { "type": "string", "enum": ["x", "y"] },
                         "line_item": { "$ref": "types/line_item.json" }
                     }
                 }),
@@ -461,9 +463,16 @@ mod tests {
                     "properties": { "id": { "type": "string" } }
                 }),
             ),
+            LoadedSchema::from_file(
+                "/schemas/types/alpha_prefixed.json",
+                json!({
+                    "type": "object",
+                    "properties": { "code": { "type": "string" } }
+                }),
+            ),
         ];
 
-        let reachable = BTreeSet::from([0, 1, 2]);
+        let reachable = BTreeSet::from([0, 1, 2, 3]);
         let active_caps = BTreeSet::from([0, 1]);
         let active_exts = BTreeSet::new();
         let active_names = BTreeSet::from(["alpha".to_string(), "beta".to_string()]);
@@ -483,6 +492,7 @@ mod tests {
 
         assert!(overlays.is_empty());
         assert!(defs.contains_key("AlphaSharedDetail"));
+        assert!(defs.contains_key("AlphaAlphaPrefixed"));
         assert!(defs.contains_key("BetaSharedDetail"));
         assert!(defs.contains_key("BetaPlatformSchema"));
         assert!(!defs.contains_key("LineItem"));
@@ -490,6 +500,10 @@ mod tests {
         assert_eq!(
             root_raw["Alpha"]["properties"]["detail"]["$ref"],
             "#/$defs/AlphaSharedDetail"
+        );
+        assert_eq!(
+            root_raw["Alpha"]["properties"]["prefixed"]["$ref"],
+            "#/$defs/AlphaAlphaPrefixed"
         );
         assert_eq!(
             root_raw["Beta"]["properties"]["detail"]["$ref"],

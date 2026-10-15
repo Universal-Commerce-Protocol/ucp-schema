@@ -263,12 +263,7 @@ pub(super) fn contains_ref(val: &Value, target_ref: &str) -> bool {
 }
 
 pub(super) fn collision_qualified_name(parent_pascal: &str, def_key: &str) -> String {
-    let def_pascal = to_pascal_case(def_key);
-    if def_pascal.starts_with(parent_pascal) {
-        def_pascal
-    } else {
-        format!("{parent_pascal}{def_pascal}")
-    }
+    format!("{parent_pascal}{}", to_pascal_case(def_key))
 }
 
 pub(super) fn has_root_schema_body(val: &Value) -> bool {
