@@ -14,6 +14,7 @@ use crate::codegen::reachability::{
 use crate::codegen::{
     collision_qualified_name, contains_ref, has_root_schema_body, CodegenError, SchemaMap,
 };
+use crate::error::ResolveError;
 use crate::loader::for_each_schema_object_mut;
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
@@ -36,6 +37,7 @@ pub(super) fn hoist_defs(
     defs: &mut SchemaMap,
     sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(SchemaMap, Vec<(String, Value)>), CodegenError> {
+    let file_renames = disambiguate_colliding_standalone_stems(loaded, reachable_indices)?;
     let standalone_type_names: BTreeSet<String> = reachable_indices
         .iter()
         .filter_map(|&idx| {
@@ -62,7 +64,12 @@ pub(super) fn hoist_defs(
         &standalone_type_names,
         &is_active_source,
     );
-    apply_collision_renames_to_schemas(loaded, reachable_indices, &local_def_renames);
+    apply_collision_renames_to_schemas(
+        loaded,
+        reachable_indices,
+        &local_def_renames,
+        &file_renames,
+    );
 
     let mut pending_overlays = Vec::new();
     for &idx in reachable_indices {
@@ -278,19 +285,182 @@ fn compute_collision_renames(
     renames
 }
 
+fn is_ucp_owned(item: &LoadedSchema) -> bool {
+    let has_ucp_name = item
+        .name
+        .as_deref()
+        .is_some_and(|n| n.starts_with("dev.ucp."));
+    let has_ucp_id = item
+        .schema
+        .get("$id")
+        .and_then(Value::as_str)
+        .is_some_and(|id| id.starts_with("https://ucp.dev/"));
+    has_ucp_name || has_ucp_id
+}
+
+fn derive_vendor_prefix(item: &LoadedSchema) -> Option<String> {
+    if let Some(name) = item.name.as_deref() {
+        let seg = name.split('.').nth(1).unwrap_or_default();
+        if !seg.is_empty() && seg != "ucp" {
+            return Some(to_pascal_case(seg));
+        }
+    }
+    if let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) {
+        if let Ok(parsed) = url::Url::parse(id_str) {
+            if let Some(host) = parsed.host_str() {
+                let label = host
+                    .split('.')
+                    .find(|s| !matches!(*s, "" | "www" | "api" | "schemas"))
+                    .unwrap_or_default();
+                if !label.is_empty() && label != "ucp" {
+                    return Some(to_pascal_case(label));
+                }
+            }
+        }
+    }
+    for ancestor in item.path.ancestors().skip(1) {
+        let Some(dir_name) = ancestor.file_name().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        if matches!(
+            dir_name,
+            "schemas"
+                | "types"
+                | "common"
+                | "shopping"
+                | "lodging"
+                | "transports"
+                | "src"
+                | "source"
+                | "tmp"
+        ) {
+            continue;
+        }
+        return Some(to_pascal_case(dir_name));
+    }
+    None
+}
+
+fn disambiguate_colliding_standalone_stems(
+    loaded: &mut [LoadedSchema],
+    reachable_indices: &BTreeSet<usize>,
+) -> Result<BTreeMap<usize, String>, CodegenError> {
+    let mut by_stem: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for &idx in reachable_indices {
+        let item = &loaded[idx];
+        if !item.is_container && has_root_schema_body(&item.schema) {
+            by_stem
+                .entry(item.stem_pascal.clone())
+                .or_default()
+                .push(idx);
+        }
+    }
+
+    let mut file_renames = BTreeMap::new();
+    for (stem, indices) in by_stem {
+        if indices.len() <= 1 {
+            continue;
+        }
+        let ucp_count = indices
+            .iter()
+            .filter(|&&i| is_ucp_owned(&loaded[i]))
+            .count();
+        for &idx in &indices {
+            if is_ucp_owned(&loaded[idx]) && ucp_count == 1 {
+                continue;
+            }
+            let Some(prefix) = derive_vendor_prefix(&loaded[idx]) else {
+                continue;
+            };
+            if stem.starts_with(&prefix) {
+                continue;
+            }
+            let qualified = format!("{prefix}{stem}");
+            loaded[idx].stem_pascal = qualified.clone();
+            file_renames.insert(idx, qualified);
+        }
+    }
+
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    for &idx in reachable_indices {
+        let item = &loaded[idx];
+        if item.is_container || !has_root_schema_body(&item.schema) {
+            continue;
+        }
+        if let Some(&prev_idx) = seen.get(&item.stem_pascal) {
+            return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                message: format!(
+                    "standalone schema name collision on '{}': '{}' and '{}'",
+                    item.stem_pascal,
+                    loaded[prev_idx].path.display(),
+                    item.path.display()
+                ),
+            }));
+        }
+        seen.insert(item.stem_pascal.clone(), idx);
+    }
+
+    Ok(file_renames)
+}
+
+fn url_origin_and_rel(url_str: &str) -> Option<(String, String)> {
+    let parsed = url::Url::parse(url_str).ok()?;
+    let host = parsed.host_str()?;
+    let origin = match parsed.port() {
+        Some(p) => format!("{}://{}:{}", parsed.scheme(), host, p),
+        None => format!("{}://{}", parsed.scheme(), host),
+    };
+    let (_, rel) = url_str.split_once("/schemas/")?;
+    Some((origin, rel.to_string()))
+}
+
+fn resolve_target_file_idx(
+    file_part: &str,
+    current_dir: Option<&std::path::Path>,
+    path_to_idx: &BTreeMap<std::path::PathBuf, usize>,
+    id_to_idx: &BTreeMap<String, usize>,
+    origin_rel_to_idx: &BTreeMap<(String, String), usize>,
+) -> Option<usize> {
+    if crate::loader::is_url(file_part) {
+        if let Some(&idx) = id_to_idx.get(file_part) {
+            return Some(idx);
+        }
+        if let Some(&idx) =
+            path_to_idx.get(&normalize_lexical_path(std::path::Path::new(file_part)))
+        {
+            return Some(idx);
+        }
+        let key = url_origin_and_rel(file_part)?;
+        return origin_rel_to_idx.get(&key).copied();
+    }
+    let dir = current_dir?;
+    path_to_idx
+        .get(&normalize_lexical_path(&dir.join(file_part)))
+        .copied()
+}
+
 fn apply_collision_renames_to_schemas(
     loaded: &mut [LoadedSchema],
     reachable_indices: &BTreeSet<usize>,
     local_def_renames: &BTreeMap<(usize, String), String>,
+    file_renames: &BTreeMap<usize, String>,
 ) {
-    if local_def_renames.is_empty() {
+    if local_def_renames.is_empty() && file_renames.is_empty() {
         return;
     }
-    let path_to_idx: BTreeMap<_, usize> = loaded
-        .iter()
-        .enumerate()
-        .map(|(i, item)| (item.path.clone(), i))
-        .collect();
+    let mut path_to_idx: BTreeMap<_, usize> = BTreeMap::new();
+    let mut id_to_idx: BTreeMap<String, usize> = BTreeMap::new();
+    let mut origin_rel_to_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
+    for (i, item) in loaded.iter().enumerate() {
+        path_to_idx.insert(item.path.clone(), i);
+        if let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) {
+            id_to_idx.insert(id_str.to_string(), i);
+            path_to_idx.insert(normalize_lexical_path(std::path::Path::new(id_str)), i);
+            if let Some(key) = url_origin_and_rel(id_str) {
+                origin_rel_to_idx.insert(key, i);
+            }
+        }
+    }
 
     for &idx in reachable_indices {
         let current_dir = loaded[idx].path.parent().map(std::path::Path::to_path_buf);
@@ -298,17 +468,42 @@ fn apply_collision_renames_to_schemas(
             let Some(ref_str) = obj.get("$ref").and_then(Value::as_str) else {
                 return;
             };
-            let lookup_key = if let Some(local_key) = ref_str.strip_prefix("#/$defs/") {
-                Some((idx, local_key.to_string()))
+            let rewritten = if let Some(local_key) = ref_str.strip_prefix("#/$defs/") {
+                local_def_renames
+                    .get(&(idx, local_key.to_string()))
+                    .cloned()
             } else if let Some((file_part, def_key)) = ref_str.split_once("#/$defs/") {
-                current_dir
-                    .as_ref()
-                    .and_then(|dir| path_to_idx.get(&normalize_lexical_path(&dir.join(file_part))))
-                    .map(|&target_idx| (target_idx, def_key.to_string()))
+                let target_idx = resolve_target_file_idx(
+                    file_part,
+                    current_dir.as_deref(),
+                    &path_to_idx,
+                    &id_to_idx,
+                    &origin_rel_to_idx,
+                );
+                target_idx.and_then(|t_idx| {
+                    local_def_renames
+                        .get(&(t_idx, def_key.to_string()))
+                        .cloned()
+                        .or_else(|| {
+                            file_renames
+                                .get(&t_idx)
+                                .map(|stem| qualify_def_name(stem, def_key))
+                        })
+                })
+            } else if !ref_str.starts_with('#') {
+                let file_part = ref_str.split('#').next().unwrap_or(ref_str);
+                let target_idx = resolve_target_file_idx(
+                    file_part,
+                    current_dir.as_deref(),
+                    &path_to_idx,
+                    &id_to_idx,
+                    &origin_rel_to_idx,
+                );
+                target_idx.and_then(|t_idx| file_renames.get(&t_idx).cloned())
             } else {
                 None
             };
-            if let Some(qualified) = lookup_key.and_then(|k| local_def_renames.get(&k)) {
+            if let Some(qualified) = rewritten {
                 obj.insert(
                     "$ref".to_string(),
                     Value::String(format!("#/$defs/{qualified}")),

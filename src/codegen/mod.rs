@@ -3,6 +3,7 @@
 mod compose;
 mod hoist;
 pub mod normalizer;
+pub mod profile;
 mod reachability;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,6 +15,7 @@ use serde_json::Value;
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
 use crate::codegen::normalizer::{align_directional_refs, to_pascal_case};
+pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
 };
@@ -48,6 +50,11 @@ impl GenerateTypesOptions {
     /// Create default [`GenerateTypesOptions`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create [`GenerateTypesOptions`] scoped to a UCP discovery profile path or URL.
+    pub fn from_profile(profile: impl Into<String>) -> Self {
+        Self::new().profile(profile)
     }
 
     /// Set the local schema directory path.
@@ -134,36 +141,59 @@ impl CodegenError {
 
 /// Compile UCP schemas into a self-contained `$defs` type table and intermediate metadata.
 pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, CodegenError> {
-    if options.profile.is_some() {
-        return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
-            message: "--profile mode is not yet implemented (deferred to Task 5)".to_string(),
-        }));
-    }
-    let Some(schema_dir) = options.schema_dir.as_deref() else {
-        return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
-            message: "--schema-dir is required when --profile is not provided".to_string(),
-        }));
-    };
-    if !schema_dir.exists() {
-        return Err(CodegenError::ResolveError(ResolveError::FileNotFound {
-            path: schema_dir.to_path_buf(),
-        }));
-    };
-
     // Stage 1: Entrypoint & Transitive $ref Reachability Crawl
-    let mut loaded = load_all_schemas(schema_dir)?;
-    let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
-    let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
-    let (active_cap_indices, active_ext_indices, active_capabilities) =
-        select_active_schemas(&loaded, cap_queries, ext_queries)?;
-    let include_all = cap_queries.is_none() && ext_queries.is_none();
-    let reachable_indices = compute_reachable_closure(
-        &loaded,
-        &active_cap_indices,
-        &active_ext_indices,
-        &active_capabilities,
-        include_all,
-    );
+    let (
+        mut loaded,
+        reachable_indices,
+        active_cap_indices,
+        active_ext_indices,
+        active_capabilities,
+    ) = if let Some(profile_source) = options.profile.as_deref() {
+        let has_caps = options
+            .capabilities
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let has_exts = options.extensions.as_deref().is_some_and(|s| !s.is_empty());
+        if options.schema_dir.is_some() || has_caps || has_exts {
+            return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                message:
+                    "--profile cannot be combined with --schema-dir, --capability, or --extension"
+                        .to_string(),
+            }));
+        }
+        profile::load_and_compute_profile_closure(profile_source)?
+    } else {
+        let Some(schema_dir) = options.schema_dir.as_deref() else {
+            return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                message: "--schema-dir is required when --profile is not provided".to_string(),
+            }));
+        };
+        if !schema_dir.exists() {
+            return Err(CodegenError::ResolveError(ResolveError::FileNotFound {
+                path: schema_dir.to_path_buf(),
+            }));
+        }
+        let loaded = load_all_schemas(schema_dir)?;
+        let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
+        let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
+        let (active_cap_indices, active_ext_indices, active_capabilities) =
+            select_active_schemas(&loaded, cap_queries, ext_queries)?;
+        let include_all = cap_queries.is_none() && ext_queries.is_none();
+        let reachable_indices = compute_reachable_closure(
+            &loaded,
+            &active_cap_indices,
+            &active_ext_indices,
+            &active_capabilities,
+            include_all,
+        );
+        (
+            loaded,
+            reachable_indices,
+            active_cap_indices,
+            active_ext_indices,
+            active_capabilities,
+        )
+    };
 
     // Stage 2: Upfront $defs Hoisting & Collision Qualification
     let mut defs = BTreeMap::new();
@@ -439,6 +469,7 @@ mod tests {
     fn options_builders_and_error_exit_codes_behave_as_expected() {
         let opts = GenerateTypesOptions::new()
             .profile("https://example.com/profile.json")
+            .schema_dir("/some/dir")
             .capabilities(Vec::<&str>::new())
             .extensions(Vec::<&str>::new())
             .title("");
@@ -450,7 +481,8 @@ mod tests {
         assert!(opts.extensions.is_none());
         assert_eq!(opts.title, "");
 
-        let profile_err = compile_types(&opts).expect_err("profile guard must error before Task 5");
-        assert_eq!(profile_err.exit_code(), 2);
+        let conflict_err =
+            compile_types(&opts).expect_err("combining profile and schema_dir must error");
+        assert_eq!(conflict_err.exit_code(), 2);
     }
 }

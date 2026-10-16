@@ -58,6 +58,11 @@ pub fn load_schema_str(content: &str) -> Result<Value, ResolveError> {
 pub fn load_schema_url(url: &str) -> Result<Value, ResolveError> {
     let client = reqwest::blocking::Client::builder()
         .timeout(HTTP_TIMEOUT)
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
         .build()
         .map_err(|source| ResolveError::NetworkError {
             url: url.to_string(),
