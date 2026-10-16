@@ -340,7 +340,25 @@ fn check_refs(
                     continue;
                 }
                 let child_path = pointer_path(path, key);
-                check_refs(val, file, file_dir, &child_path, root, diagnostics);
+                if matches!(
+                    key.as_str(),
+                    "properties"
+                        | "patternProperties"
+                        | "$defs"
+                        | "definitions"
+                        | "dependentSchemas"
+                ) {
+                    // Values in schema maps are always schemas, even when their
+                    // property names collide with instance-data keywords above.
+                    if let Value::Object(schemas) = val {
+                        for (name, schema) in schemas {
+                            let schema_path = pointer_path(&child_path, name);
+                            check_refs(schema, file, file_dir, &schema_path, root, diagnostics);
+                        }
+                    }
+                } else {
+                    check_refs(val, file, file_dir, &child_path, root, diagnostics);
+                }
             }
         }
         Value::Array(arr) => {
@@ -463,7 +481,25 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
                 continue;
             }
             let child_path = pointer_path(path, key);
-            check_annotations(val, file, &child_path, diagnostics);
+            if matches!(
+                key.as_str(),
+                "properties"
+                    | "patternProperties"
+                    | "$defs"
+                    | "definitions"
+                    | "dependentSchemas"
+            ) {
+                // Values in schema maps are always schemas, even when their
+                // property names collide with instance-data keywords above.
+                if let Value::Object(schemas) = val {
+                    for (name, schema) in schemas {
+                        let schema_path = pointer_path(&child_path, name);
+                        check_annotations(schema, file, &schema_path, diagnostics);
+                    }
+                }
+            } else {
+                check_annotations(val, file, &child_path, diagnostics);
+            }
         }
     } else if let Value::Array(arr) = value {
         for (i, item) in arr.iter().enumerate() {
@@ -1220,6 +1256,67 @@ mod tests {
                 "/properties/enum/examples/0",
                 "/dependentSchemas/default/examples/0",
             ]
+        );
+    }
+
+    #[test]
+    fn lint_property_names_that_collide_with_instance_keywords_checks_refs_and_annotations() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "properties": {{
+                "default": {{
+                    "$ref": "nonexistent_ref_target.json",
+                    "ucp_unknown_prop_annotation": true
+                }},
+                "const": {{
+                    "$ref": "#/missing_anchor",
+                    "ucp_request": "invalid_operation_value"
+                }}
+            }},
+            "$defs": {{
+                "enum": {{
+                    "$ref": "missing_defs_target.json"
+                }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let codes_and_paths: Vec<_> = result
+            .diagnostics
+            .iter()
+            .map(|d| (d.code.as_str(), d.path.as_str()))
+            .collect();
+
+        assert!(
+            codes_and_paths.contains(&("E002", "/properties/default")),
+            "missing E002 for properties/default: {:?}",
+            codes_and_paths
+        );
+        assert!(
+            codes_and_paths.contains(&("W007", "/properties/default/ucp_unknown_prop_annotation")),
+            "missing W007 for properties/default/ucp_unknown_prop_annotation: {:?}",
+            codes_and_paths
+        );
+        assert!(
+            codes_and_paths.contains(&("E003", "/properties/const")),
+            "missing E003 for properties/const: {:?}",
+            codes_and_paths
+        );
+        assert!(
+            codes_and_paths.contains(&("E004", "/properties/const/ucp_request")),
+            "missing E004 for properties/const/ucp_request: {:?}",
+            codes_and_paths
+        );
+        assert!(
+            codes_and_paths.contains(&("E002", "/$defs/enum")),
+            "missing E002 for $defs/enum: {:?}",
+            codes_and_paths
         );
     }
 
