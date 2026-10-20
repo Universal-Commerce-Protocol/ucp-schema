@@ -314,6 +314,33 @@ mod transformation {
     }
 
     #[test]
+    fn instance_data_preserves_annotation_like_field_names() {
+        let schema = json!({
+            "type": "object",
+            "ucp_request": "required",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "required" }
+            },
+            "default": { "ucp_request": "business-value" },
+            "const": { "ucp_response": "business-value" },
+            "examples": [{ "ucp_request": "business-value" }],
+            "enum": [{ "ucp_response": "business-value" }]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert!(result.get("ucp_request").is_none());
+        assert!(result["properties"]["id"].get("ucp_request").is_none());
+        assert_eq!(result["default"]["ucp_request"], json!("business-value"));
+        assert_eq!(result["const"]["ucp_response"], json!("business-value"));
+        assert_eq!(
+            result["examples"][0]["ucp_request"],
+            json!("business-value")
+        );
+        assert_eq!(result["enum"][0]["ucp_response"], json!("business-value"));
+    }
+
+    #[test]
     fn annotations_stripped_from_output() {
         let schema = json!({
             "type": "object",
@@ -1053,6 +1080,26 @@ mod allof_propagation {
     }
 
     #[test]
+    fn array_form_types_use_json_schema_intersection_semantics() {
+        let resolve_types = |base_type: Value, ext_type: Value| {
+            let schema = json!({
+                "allOf": [
+                    { "properties": { "value": { "type": base_type } } },
+                    { "properties": { "value": { "type": ext_type } } }
+                ]
+            });
+            resolve(&schema, &ResolveOptions::new(Direction::Response, "search"))
+        };
+
+        assert!(matches!(
+            resolve_types(json!(["string", "null"]), json!("number")),
+            Err(ResolveError::TypeConflict { .. })
+        ));
+        assert!(resolve_types(json!(["string", "null"]), json!("string")).is_ok());
+        assert!(resolve_types(json!("number"), json!("integer")).is_ok());
+    }
+
+    #[test]
     fn same_type_no_conflict() {
         let schema = json!({
             "allOf": [
@@ -1656,6 +1703,80 @@ mod strict_mode {
         // Branches should NOT have additionalProperties injected
         assert!(result["allOf"][0].get("additionalProperties").is_none());
         assert!(result["allOf"][1].get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn removes_explicit_true_from_allof_branches() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["unevaluatedProperties"], json!(false));
+        assert!(result["allOf"][0].get("additionalProperties").is_none());
+        assert!(result["allOf"][1].get("additionalProperties").is_none());
+
+        let validator = jsonschema::validator_for(&result).unwrap();
+        assert!(validator.is_valid(&json!({ "id": "id_1", "name": "Ada" })));
+        assert!(!validator.is_valid(&json!({
+            "id": "id_1",
+            "name": "Ada",
+            "unexpected": true
+        })));
+    }
+
+    #[test]
+    fn removes_explicit_true_from_composition_parent() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": true,
+            "allOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["unevaluatedProperties"], json!(false));
+        assert!(result.get("additionalProperties").is_none());
+        assert!(result["allOf"][0].get("additionalProperties").is_none());
+        assert!(result["allOf"][1].get("additionalProperties").is_none());
+
+        let validator = jsonschema::validator_for(&result).unwrap();
+        assert!(validator.is_valid(&json!({ "id": "id_1", "name": "Ada" })));
+        assert!(!validator.is_valid(&json!({
+            "id": "id_1",
+            "name": "Ada",
+            "unexpected": true
+        })));
     }
 
     #[test]
