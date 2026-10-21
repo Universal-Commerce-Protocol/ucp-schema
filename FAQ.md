@@ -57,7 +57,7 @@ This means you can develop and test third-party extensions locally before publis
 | `meta.profile`     | Request                                          |
 | Neither            | Error (must specify `--request` or `--response`) |
 
-This applies to both `validate` and `resolve` when the input is a self-describing payload. When resolving a plain schema file, explicit `--request` or `--response` is required.
+This applies to both `validate` and `resolve` when the input is a self-describing payload. When `validate` uses an explicit `--schema`, payload metadata is not required: if neither direction flag is set, the validator still infers direction from `ucp.capabilities` or `meta.profile` when present, and defaults to request direction otherwise. Pass `--response` when validating a payload without `ucp.capabilities` against a response schema. When resolving a plain schema file, explicit `--request` or `--response` is required.
 
 ---
 
