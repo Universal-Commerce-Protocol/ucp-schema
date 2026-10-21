@@ -1,5 +1,39 @@
 # Changelog
 
+## [2.0.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.1...v2.0.0) (2026-10-21)
+
+
+### ⚠ BREAKING CHANGES
+
+* ComposeError::UnknownParent is removed. Match arms naming it must be deleted; the equivalent condition now surfaces as ComposeError::OrphanExtension.
+
+### Features
+
+* **codegen:** add AST shape normalizers and inline conditional variant hoisting ([#86](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/86)) ([ab949f2](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/ab949f230824c82e27f71b328c19b33061760ccf))
+* **codegen:** add capability reachability, composition, and generate_types() API ([#83](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/83)) ([2155380](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/2155380a5871df35e71b6032e69f134eaa788992))
+* **codegen:** add directional schema slicing and $ref alignment ([#82](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/82)) ([b8433ff](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/b8433ff990d8122892102a9734352e85c886b9f0))
+* **codegen:** add identifier naming, UCP keyword stripping, and $defs ref rewriting ([#81](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/81)) ([26a92a5](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/26a92a5494c39df92885318f9c87f7b60f435d42))
+* **codegen:** add self-contained .well-known/ucp profile scoping for generate-types ([#85](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/85)) ([56a3138](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/56a3138d4ec399bfd2aefb6c3bb854d31a571022))
+* **codegen:** lower open string discriminator unions into ordered anyOf with &lt;Union&gt;Base ([#87](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/87)) ([27e360c](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/27e360c204744702d0a38f290278535f4502a0c7))
+
+
+### Bug Fixes
+
+* close explicitly open composition branches in strict mode ([#77](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/77)) ([f8f5f38](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/f8f5f3808ee75d9d90f4cde4572a6b745aba448b))
+* compose extensions when any parent is active ([#39](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/39)) ([613ee80](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/613ee804c4bad1efa0d98cd60b582a9c8a4599e6))
+* detect nullable allOf type conflicts ([#58](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/58)) ([c37f695](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/c37f695d0acac5f84ca83f2f13dd38aa201c24d4))
+* escape lint diagnostic pointers ([#65](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/65)) ([5fef349](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/5fef349f5c46a72d1c371a94b72bdffda05c052e))
+* **linter:** skip the $id check for OpenAPI and OpenRPC service definitions ([#49](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/49)) ([ccaa20b](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/ccaa20bee61044ce1d177ebc14beb5c36e69db46))
+* preserve instance annotation fields ([#62](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/62)) ([5e87062](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/5e87062a886bd8b47a161c79480fb82cad57c352))
+* preserve schema resource identity in bundling, composition, and selection ([#66](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/66)) ([9f91c3d](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/9f91c3d497d8f9d7f4051fbfb49b2262536acfd7))
+* reject unsupported lint output formats ([#54](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/54)) ([16de190](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/16de190a80f48340e49e0af852c3916092d44247))
+* skip example checks in instance data ([#64](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/64)) ([dd4f7c7](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/dd4f7c7af80d0a70d5170b8a20279112ffddcb10))
+* skip ref checks in instance data ([#63](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/63)) ([a0fc4fc](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/a0fc4fc189add7da533c981bdb3d8a36950e0602))
+* stop crawl external refs and the local base retriever from doubling a path segment ([#72](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/72)) ([6a11b45](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/6a11b450ce2f639ac3c8833e7b05c8646fc5b5f7))
+* stop rewriting a required that is not an array of strings ([#78](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/78)) ([c3f4181](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/c3f41819c7e240cd0561b654d9dc24d5549ef042))
+* validate capability version dates ([#50](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/50)) ([04d2217](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/04d2217e3c22ffc39e7427d5f601ca2201cc441f))
+* validate examples through internal refs ([#59](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/59)) ([a4e53bd](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/a4e53bd46b1c60f5d191f2e49021fbc38138759c))
+
 ## [1.4.1](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.0...v1.4.1) (2026-07-24)
 
 
