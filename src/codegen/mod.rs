@@ -244,10 +244,10 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
     // Stage 6: Directional $ref Alignment & Single-Object/Array allOf Flattening
     align_all_directional_refs(&mut defs, &sliced_base_names);
     flatten_object_allof(&mut defs);
-    qualify_inline_object_titles(&mut defs);
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration
     reify::lower_conditional_unions(&mut defs);
+    qualify_inline_object_titles(&mut defs);
 
     // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning
     let active_cap_root_requests: BTreeSet<String> = active_cap_indices

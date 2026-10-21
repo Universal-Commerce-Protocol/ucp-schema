@@ -211,8 +211,14 @@ fn build_hoisted_variant_schema(
                 _ => {}
             }
         }
+        disc_map.remove("not");
+        disc_map.remove("default");
         disc_map.remove("enum");
         disc_map.remove("$ref");
+        disc_map.remove("pattern");
+        disc_map.remove("minLength");
+        disc_map.remove("maxLength");
+        disc_map.remove("format");
         disc_map.insert("type".to_string(), Value::String("string".to_string()));
         disc_map.insert("const".to_string(), Value::String(tag_val.to_string()));
     }
@@ -234,12 +240,26 @@ fn build_hoisted_variant_schema(
         req_arr.push(disc_val);
     }
 
-    let req_set: BTreeSet<String> = req_arr
-        .iter()
-        .filter_map(Value::as_str)
-        .map(String::from)
-        .collect();
-    if let Some(Value::Object(dep_req)) = variant_obj.get_mut("dependentRequired") {
+    prune_satisfied_dependent_required(variant_obj);
+
+    variant_schema
+}
+
+fn prune_satisfied_dependent_required(schema_obj: &mut Map<String, Value>) {
+    let req_set: BTreeSet<String> = schema_obj
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if req_set.is_empty() {
+        return;
+    }
+    if let Some(Value::Object(dep_req)) = schema_obj.get_mut("dependentRequired") {
         dep_req.retain(|_, deps_val| {
             let Some(deps_arr) = deps_val.as_array_mut() else {
                 return false;
@@ -248,11 +268,9 @@ fn build_hoisted_variant_schema(
             !deps_arr.is_empty()
         });
         if dep_req.is_empty() {
-            variant_obj.remove("dependentRequired");
+            schema_obj.remove("dependentRequired");
         }
     }
-
-    variant_schema
 }
 
 pub(crate) fn extract_if_discriminator(if_obj: &Map<String, Value>) -> Option<(String, String)> {
@@ -305,12 +323,27 @@ fn split_pascal_words(s: &str) -> Vec<String> {
     words
 }
 
+enum UnionBaseKind {
+    OpenString {
+        inlined_ref_target: Option<Map<String, Value>>,
+    },
+    PartialEnum {
+        inlined_ref_target: Option<Map<String, Value>>,
+        remaining_tags: Vec<Value>,
+    },
+}
+
+type ConditionalUnionBranches = (String, Vec<(String, String)>, Vec<Value>);
+
 /// Lower conditional `allOf` `if`/`then.$ref` unions in `defs` into ordered `anyOf` unions.
 ///
 /// - For open string discriminators (`type == "string"` without `const` or `enum`, or a `$ref`
 ///   to such a string schema), synthesizes `<ParentName>Base` with `not: { enum: [<known_tags>] }`
 ///   on the discriminator property and appends `{"$ref": "#/$defs/<ParentName>Base"}` last in `anyOf`.
-/// - For closed discriminators, emits `anyOf` of the variant `$ref`s without `<ParentName>Base`.
+/// - For closed `enum` discriminators where `if`/`then.$ref` variants only cover a subset of the
+///   allowed `enum` values, synthesizes `<ParentName>Base` with `enum: [<remaining_tags>]` on the
+///   discriminator property and appends `{"$ref": "#/$defs/<ParentName>Base"}` last in `anyOf`.
+/// - For fully-covered closed discriminators, emits `anyOf` of the variant `$ref`s without `<ParentName>Base`.
 /// - Strips `"default"` from the discriminator property on both variants and `<ParentName>Base`
 ///   (invariant `OU-4`) and never emits the OpenAPI `"discriminator"` keyword (invariant `OU-3`).
 pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
@@ -319,7 +352,9 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
         let Some(parent_schema) = defs.get(&parent_name).cloned() else {
             continue;
         };
-        let Some((disc_prop, variants)) = extract_conditional_union_branches(&parent_schema) else {
+        let Some((disc_prop, variants, non_variant_branches)) =
+            extract_conditional_union_branches(&parent_schema)
+        else {
             continue;
         };
 
@@ -333,10 +368,13 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
                 &parent_name,
                 &disc_prop,
                 tag_val,
+                &non_variant_branches,
             );
         }
 
-        let open_disc_target = is_open_string_discriminator(&parent_schema, &disc_prop, defs);
+        let sorted_tags: BTreeSet<String> = variants.iter().map(|(tag, _)| tag.clone()).collect();
+        let base_kind =
+            classify_union_discriminator(&parent_schema, &disc_prop, &sorted_tags, defs);
         let sorted_variant_names: BTreeSet<String> = variants
             .iter()
             .map(|(_, variant_name)| variant_name.clone())
@@ -346,17 +384,16 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
             .map(|variant_name| json!({ "$ref": format!("#/$defs/{variant_name}") }))
             .collect();
 
-        if let Some(inlined_ref_target) = open_disc_target {
+        if let Some(kind) = base_kind {
             let base_def_name = format!("{parent_name}Base");
-            let sorted_tags: BTreeSet<String> =
-                variants.iter().map(|(tag, _)| tag.clone()).collect();
             let known_tags: Vec<Value> = sorted_tags.into_iter().map(Value::String).collect();
             let base_schema = build_union_base_schema(
                 &parent_schema,
                 &base_def_name,
                 &disc_prop,
-                inlined_ref_target,
+                kind,
                 known_tags,
+                &non_variant_branches,
             );
             defs.insert(base_def_name.clone(), base_schema);
             any_of_refs.push(json!({ "$ref": format!("#/$defs/{base_def_name}") }));
@@ -372,6 +409,9 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
             "type",
             "additionalProperties",
             "dependentRequired",
+            "minProperties",
+            "maxProperties",
+            "propertyNames",
             "discriminator",
             "if",
             "then",
@@ -383,19 +423,35 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
     }
 }
 
-fn extract_conditional_union_branches(
-    parent_schema: &Value,
-) -> Option<(String, Vec<(String, String)>)> {
+fn extract_conditional_union_branches(parent_schema: &Value) -> Option<ConditionalUnionBranches> {
     let all_of = parent_schema.get("allOf")?.as_array()?;
     if all_of.is_empty() {
         return None;
     }
     let mut disc_prop_name: Option<String> = None;
     let mut variants = Vec::new();
+    let mut non_variant_branches = Vec::new();
     for branch in all_of {
-        let branch_obj = branch.as_object()?;
-        if branch_obj.contains_key("else") {
-            return None;
+        let Some(branch_obj) = branch.as_object() else {
+            non_variant_branches.push(branch.clone());
+            continue;
+        };
+        let is_ref_variant = !branch_obj.contains_key("else")
+            && branch_obj.keys().all(|k| {
+                matches!(
+                    k.as_str(),
+                    "if" | "then" | "title" | "description" | "$comment"
+                )
+            })
+            && branch_obj.get("then").and_then(local_def_ref).is_some()
+            && branch_obj
+                .get("if")
+                .and_then(Value::as_object)
+                .and_then(extract_if_discriminator)
+                .is_some();
+        if !is_ref_variant {
+            non_variant_branches.push(branch.clone());
+            continue;
         }
         let if_obj = branch_obj.get("if")?.as_object()?;
         let then_val = branch_obj.get("then")?;
@@ -410,7 +466,10 @@ fn extract_conditional_union_branches(
         }
         variants.push((tag_val, variant_name));
     }
-    Some((disc_prop_name?, variants))
+    if variants.is_empty() {
+        return None;
+    }
+    Some((disc_prop_name?, variants, non_variant_branches))
 }
 
 fn inherit_parent_into_union_variant(
@@ -419,6 +478,7 @@ fn inherit_parent_into_union_variant(
     parent_name: &str,
     disc_prop: &str,
     tag_val: &str,
+    non_variant_branches: &[Value],
 ) {
     let Some(variant_obj) = variant_schema.as_object_mut() else {
         return;
@@ -427,6 +487,18 @@ fn inherit_parent_into_union_variant(
         all_of.retain(|branch| local_def_ref(branch) != Some(parent_name));
         if all_of.is_empty() {
             variant_obj.remove("allOf");
+        }
+    }
+    if !non_variant_branches.is_empty() {
+        let all_of = variant_obj
+            .entry("allOf".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("allOf is an array");
+        for branch in non_variant_branches {
+            if !all_of.contains(branch) {
+                all_of.push(branch.clone());
+            }
         }
     }
 
@@ -453,6 +525,10 @@ fn inherit_parent_into_union_variant(
         disc_map.remove("default");
         disc_map.remove("enum");
         disc_map.remove("$ref");
+        disc_map.remove("pattern");
+        disc_map.remove("minLength");
+        disc_map.remove("maxLength");
+        disc_map.remove("format");
         disc_map.insert("type".to_string(), Value::String("string".to_string()));
         disc_map.insert("const".to_string(), Value::String(tag_val.to_string()));
     }
@@ -464,44 +540,88 @@ fn inherit_parent_into_union_variant(
         .entry("additionalProperties".to_string())
         .or_insert(Value::Bool(true));
 
-    let Some(Value::Array(parent_reqs)) = parent_schema.get("required") else {
-        return;
-    };
-    let req_arr = variant_obj
-        .entry("required".to_string())
-        .or_insert_with(|| Value::Array(Vec::new()))
-        .as_array_mut()
-        .expect("required is an array");
-    for req in parent_reqs {
-        if !req_arr.contains(req) {
-            req_arr.push(req.clone());
+    if let Some(Value::Array(parent_reqs)) = parent_schema.get("required") {
+        let req_arr = variant_obj
+            .entry("required".to_string())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("required is an array");
+        for req in parent_reqs {
+            if !req_arr.contains(req) {
+                req_arr.push(req.clone());
+            }
+        }
+    }
+
+    if let Some(Value::Object(parent_dep_req)) = parent_schema.get("dependentRequired") {
+        let dep_req = variant_obj
+            .entry("dependentRequired".to_string())
+            .or_insert_with(|| Value::Object(Map::new()))
+            .as_object_mut()
+            .expect("dependentRequired is an object");
+        for (prop, parent_deps) in parent_dep_req {
+            let Some(parent_deps_arr) = parent_deps.as_array() else {
+                continue;
+            };
+            let target_arr = dep_req
+                .entry(prop.clone())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .expect("dependentRequired entry is an array");
+            for dep in parent_deps_arr {
+                if !target_arr.contains(dep) {
+                    target_arr.push(dep.clone());
+                }
+            }
+        }
+    }
+    prune_satisfied_dependent_required(variant_obj);
+
+    for key in ["minProperties", "maxProperties", "propertyNames"] {
+        if let Some(val) = parent_schema.get(key) {
+            variant_obj
+                .entry(key.to_string())
+                .or_insert_with(|| val.clone());
         }
     }
 }
 
-fn is_open_string_discriminator(
+fn classify_union_discriminator(
     parent_schema: &Value,
     disc_prop: &str,
+    known_tags: &BTreeSet<String>,
     defs: &BTreeMap<String, Value>,
-) -> Option<Option<Map<String, Value>>> {
-    let disc_obj = parent_schema
-        .get("properties")?
-        .get(disc_prop)?
-        .as_object()?;
-    if disc_obj.get("type").and_then(Value::as_str) == Some("string")
-        && !disc_obj.contains_key("const")
-        && !disc_obj.contains_key("enum")
+) -> Option<UnionBaseKind> {
+    let disc_val = parent_schema.get("properties")?.get(disc_prop)?;
+    let disc_obj = disc_val.as_object()?;
+    let (effective_obj, inlined_ref_target) = if let Some(ref_target) = local_def_ref(disc_val) {
+        let target_obj = defs.get(ref_target)?.as_object()?;
+        (target_obj, Some(target_obj.clone()))
+    } else {
+        (disc_obj, None)
+    };
+
+    if effective_obj.get("type").and_then(Value::as_str) == Some("string")
+        && !effective_obj.contains_key("const")
+        && !effective_obj.contains_key("enum")
     {
-        return Some(None);
+        return Some(UnionBaseKind::OpenString { inlined_ref_target });
     }
-    let ref_target = local_def_ref(parent_schema.get("properties")?.get(disc_prop)?)?;
-    let target_obj = defs.get(ref_target)?.as_object()?;
-    if target_obj.get("type").and_then(Value::as_str) == Some("string")
-        && !target_obj.contains_key("const")
-        && !target_obj.contains_key("enum")
-    {
-        return Some(Some(target_obj.clone()));
+
+    if let Some(enum_arr) = effective_obj.get("enum").and_then(Value::as_array) {
+        let remaining_tags: Vec<Value> = enum_arr
+            .iter()
+            .filter(|v| v.as_str().is_some_and(|s| !known_tags.contains(s)))
+            .cloned()
+            .collect();
+        if !remaining_tags.is_empty() {
+            return Some(UnionBaseKind::PartialEnum {
+                inlined_ref_target,
+                remaining_tags,
+            });
+        }
     }
+
     None
 }
 
@@ -509,8 +629,9 @@ fn build_union_base_schema(
     parent_schema: &Value,
     base_def_name: &str,
     disc_prop: &str,
-    inlined_ref_target: Option<Map<String, Value>>,
+    kind: UnionBaseKind,
     known_tags: Vec<Value>,
+    non_variant_branches: &[Value],
 ) -> Value {
     let mut base_schema = parent_schema.clone();
     let Some(base_obj) = base_schema.as_object_mut() else {
@@ -527,12 +648,26 @@ fn build_union_base_schema(
     ] {
         base_obj.remove(key);
     }
+    if !non_variant_branches.is_empty() {
+        base_obj.insert(
+            "allOf".to_string(),
+            Value::Array(non_variant_branches.to_vec()),
+        );
+    }
     base_obj.insert(
         "title".to_string(),
         Value::String(base_def_name.to_string()),
     );
     base_obj.insert("type".to_string(), Value::String("object".to_string()));
     base_obj.insert("additionalProperties".to_string(), Value::Bool(true));
+
+    let (inlined_ref_target, is_open_string, remaining_enum_tags) = match kind {
+        UnionBaseKind::OpenString { inlined_ref_target } => (inlined_ref_target, true, Vec::new()),
+        UnionBaseKind::PartialEnum {
+            inlined_ref_target,
+            remaining_tags,
+        } => (inlined_ref_target, false, remaining_tags),
+    };
 
     let props = base_obj
         .entry("properties".to_string())
@@ -558,8 +693,13 @@ fn build_union_base_schema(
         disc_map.remove("default");
         disc_map.remove("const");
         disc_map.remove("enum");
+        disc_map.remove("not");
         disc_map.insert("type".to_string(), Value::String("string".to_string()));
-        disc_map.insert("not".to_string(), json!({ "enum": known_tags }));
+        if is_open_string {
+            disc_map.insert("not".to_string(), json!({ "enum": known_tags }));
+        } else {
+            disc_map.insert("enum".to_string(), Value::Array(remaining_enum_tags));
+        }
     }
 
     base_schema
@@ -875,5 +1015,90 @@ mod tests {
         assert_eq!(closed_anyof[1]["$ref"], "#/$defs/VariantB");
         assert_eq!(defs["VariantB"]["type"], "object");
         assert_eq!(defs["VariantB"]["additionalProperties"], true);
+    }
+
+    #[test]
+    fn lower_conditional_unions_handles_partial_enums_dependent_required_and_non_variant_allof() {
+        let scalar_constraint = json!({
+            "if": { "properties": { "amount": { "type": "number" } } },
+            "then": { "properties": { "amount": { "minimum": 0 } } }
+        });
+        let mut defs = BTreeMap::from([
+            (
+                "PartialEnumUnion".to_string(),
+                json!({
+                    "title": "PartialEnumUnion",
+                    "type": "object",
+                    "required": ["kind"],
+                    "dependentRequired": {
+                        "extra": ["kind", "token"],
+                        "already_satisfied": ["kind"]
+                    },
+                    "minProperties": 1,
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["alpha", "beta", "gamma"] },
+                        "token": { "type": "string" },
+                        "extra": { "type": "string" },
+                        "amount": { "type": "number" }
+                    },
+                    "allOf": [
+                        {
+                            "if": { "properties": { "kind": { "const": "alpha" } } },
+                            "then": { "$ref": "#/$defs/AlphaVariant" }
+                        },
+                        scalar_constraint.clone()
+                    ]
+                }),
+            ),
+            (
+                "AlphaVariant".to_string(),
+                json!({
+                    "title": "AlphaVariant",
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "const": "alpha" },
+                        "alpha_field": { "type": "string" }
+                    }
+                }),
+            ),
+        ]);
+
+        lower_conditional_unions(&mut defs);
+
+        let union_anyof = defs["PartialEnumUnion"]["anyOf"].as_array().unwrap();
+        assert_eq!(union_anyof.len(), 2);
+        assert_eq!(union_anyof[0]["$ref"], "#/$defs/AlphaVariant");
+        assert_eq!(union_anyof[1]["$ref"], "#/$defs/PartialEnumUnionBase");
+
+        // Partial enum Base keeps only uncovered enum tags ["beta", "gamma"]
+        assert_eq!(
+            defs["PartialEnumUnionBase"]["properties"]["kind"]["enum"],
+            json!(["beta", "gamma"])
+        );
+        assert!(defs["PartialEnumUnionBase"]["properties"]["kind"]
+            .get("not")
+            .is_none());
+
+        // dependentRequired on variant prunes already-required "kind" while preserving "token"
+        assert_eq!(
+            defs["AlphaVariant"]["dependentRequired"],
+            json!({ "extra": ["token"] })
+        );
+        assert_eq!(
+            defs["PartialEnumUnionBase"]["dependentRequired"],
+            json!({ "extra": ["kind", "token"], "already_satisfied": ["kind"] })
+        );
+        assert_eq!(defs["AlphaVariant"]["minProperties"], 1);
+
+        // Non-variant allOf constraint branch is preserved on both variant and Base
+        assert_eq!(
+            defs["AlphaVariant"]["allOf"],
+            json!([scalar_constraint.clone()])
+        );
+        assert_eq!(
+            defs["PartialEnumUnionBase"]["allOf"],
+            json!([scalar_constraint])
+        );
     }
 }

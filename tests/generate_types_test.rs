@@ -55,6 +55,12 @@ fn assert_bundle_invariants(defs: &std::collections::BTreeMap<String, Value>) {
                     all_of.iter().all(|b| b.get("title").is_none()),
                     "def '{def_name}' contains inline allOf branch title"
                 );
+                assert!(
+                    !all_of
+                        .iter()
+                        .any(|b| b.get("then").and_then(|t| t.get("$ref")).is_some()),
+                    "def '{def_name}' retains an un-lowered if/then.$ref branch in allOf"
+                );
             }
             assert!(
                 !obj.keys().any(|k| {
@@ -1752,6 +1758,13 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         bundle.defs["FulfillmentMethodUpdateRequestBase"]["dependentRequired"],
         serde_json::json!({ "destinations": ["type"] })
     );
+    assert_eq!(
+        bundle.defs["FulfillmentMethodBase"]["dependentRequired"],
+        serde_json::json!({ "destinations": ["type"] })
+    );
+    assert!(bundle.defs["ShippingMethod"]
+        .get("dependentRequired")
+        .is_none());
 
     // 3. Totals strips top-level contains allOf, flattens items.allOf, and qualifies inline object titles
     assert!(bundle.defs["Totals"].get("allOf").is_none());
