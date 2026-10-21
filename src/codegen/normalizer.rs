@@ -526,7 +526,7 @@ fn is_non_empty_request_slice(val: &Value) -> bool {
     has_props || has_composition || has_ref
 }
 
-fn update_request_slice_metadata(
+pub(crate) fn update_request_slice_metadata(
     slice_val: &mut Value,
     slice_name: &str,
     base_name: &str,
