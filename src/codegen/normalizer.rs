@@ -297,6 +297,7 @@ fn attach_default_if_const(obj: &mut Map<String, Value>) {
     };
     let ty = match &val {
         Value::String(_) => "string",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
         Value::Number(_) => "number",
         Value::Bool(_) => "boolean",
         _ => return,
@@ -512,9 +513,6 @@ fn is_non_empty_request_slice(val: &Value) -> bool {
     let Some(obj) = val.as_object() else {
         return false;
     };
-    if obj.contains_key("if") || obj.contains_key("contains") {
-        return false;
-    }
     let has_props = obj
         .get("properties")
         .and_then(Value::as_object)
@@ -1034,10 +1032,23 @@ fn flatten_single_object_allof(
 
         let is_inline_flattenable = branch.as_object().is_some_and(|b| {
             ![
-                "$ref", "if", "then", "else", "anyOf", "oneOf", "allOf", "contains",
+                "$ref",
+                "if",
+                "then",
+                "else",
+                "anyOf",
+                "oneOf",
+                "allOf",
+                "contains",
+                "not",
+                "dependentSchemas",
+                "patternProperties",
+                "unevaluatedProperties",
             ]
             .iter()
             .any(|k| b.contains_key(*k))
+                && b.get("additionalProperties")
+                    .is_none_or(|v| v == &Value::Bool(true))
         });
         if is_inline_flattenable {
             if let Some(branch_obj) = branch.as_object() {
@@ -1121,9 +1132,20 @@ fn is_flattenable_base_object(base_obj: &Map<String, Value>) -> bool {
     if !is_obj {
         return false;
     }
-    if ["anyOf", "oneOf", "$ref"]
-        .iter()
-        .any(|k| base_obj.contains_key(*k))
+    if [
+        "anyOf",
+        "oneOf",
+        "$ref",
+        "not",
+        "dependentSchemas",
+        "patternProperties",
+        "unevaluatedProperties",
+    ]
+    .iter()
+    .any(|k| base_obj.contains_key(*k))
+        || base_obj
+            .get("additionalProperties")
+            .is_some_and(|v| v != &Value::Bool(true))
     {
         return false;
     }
@@ -1337,8 +1359,8 @@ fn qualify_schema_node(
                 qualify_schema_node(branch, parent_title, false, used_titles);
                 continue;
             }
-            let suffix = derive_branch_suffix(branch, &common_req, idx);
-            let branch_title = append_pascal_suffix(parent_title, &suffix);
+            let branch_title =
+                derive_branch_title(parent_title, branch, &common_req, idx, used_titles);
             stamp_inline_object_title_and_defaults(branch, &branch_title);
             used_titles.insert(branch_title.clone());
             qualify_schema_node(branch, &branch_title, false, used_titles);
@@ -1413,7 +1435,14 @@ fn common_required_across_branches(branches: &[Value]) -> BTreeSet<String> {
         .collect()
 }
 
-fn derive_branch_suffix(branch: &Value, common_req: &BTreeSet<String>, idx: usize) -> String {
+fn derive_branch_title(
+    parent_title: &str,
+    branch: &Value,
+    common_req: &BTreeSet<String>,
+    idx: usize,
+    used_titles: &BTreeSet<String>,
+) -> String {
+    let mut candidates = Vec::new();
     if let Some(props) = branch.get("properties").and_then(Value::as_object) {
         for preferred in ["transport", "type", "kind", "role", "method"] {
             if let Some(tag) = props
@@ -1421,7 +1450,7 @@ fn derive_branch_suffix(branch: &Value, common_req: &BTreeSet<String>, idx: usiz
                 .and_then(|v| v.get("const"))
                 .and_then(Value::as_str)
             {
-                return to_pascal_case(tag);
+                candidates.push(to_pascal_case(tag));
             }
         }
         for (k, v) in props {
@@ -1429,23 +1458,29 @@ fn derive_branch_suffix(branch: &Value, common_req: &BTreeSet<String>, idx: usiz
                 continue;
             }
             if let Some(tag) = v.get("const").and_then(Value::as_str) {
-                return to_pascal_case(tag);
+                candidates.push(to_pascal_case(tag));
             }
         }
     }
     if let Some(reqs) = branch.get("required").and_then(Value::as_array) {
-        if let Some(distinguishing) = reqs
-            .iter()
-            .filter_map(Value::as_str)
-            .find(|r| !common_req.contains(*r))
-        {
-            return to_pascal_case(distinguishing);
+        for r in reqs.iter().filter_map(Value::as_str) {
+            if !common_req.contains(r) {
+                candidates.push(to_pascal_case(r));
+            }
         }
-        if let Some(first_req) = reqs.iter().filter_map(Value::as_str).next() {
-            return to_pascal_case(first_req);
+        for r in reqs.iter().filter_map(Value::as_str) {
+            if common_req.contains(r) {
+                candidates.push(to_pascal_case(r));
+            }
         }
     }
-    format!("Variant{}", idx + 1)
+    for suffix in candidates {
+        let title = append_pascal_suffix(parent_title, &suffix);
+        if !used_titles.contains(&title) {
+            return title;
+        }
+    }
+    append_pascal_suffix(parent_title, &format!("Variant{}", idx + 1))
 }
 
 fn singularize_pascal(s: &str) -> String {
@@ -1499,7 +1534,9 @@ fn singularize_pascal(s: &str) -> String {
     if s.ends_with("ies") && s.len() > 3 {
         return format!("{}y", &s[..s.len() - 3]);
     }
-    for suffix in ["ses", "xes", "zes", "ches", "shes"] {
+    for suffix in [
+        "sses", "uses", "iases", "yses", "xes", "zes", "ches", "shes",
+    ] {
         if s.ends_with(suffix) && s.len() > suffix.len() {
             return s[..s.len() - 2].to_string();
         }
@@ -2410,6 +2447,8 @@ mod tests {
                     "description": "Parent capabilities."
                 },
                 "status": { "const": "success" },
+                "retry_count": { "const": 3 },
+                "ratio": { "const": 1.5 },
                 "const": {},
                 "enum": { "type": "array" },
                 "open_type": {
@@ -2444,6 +2483,14 @@ mod tests {
         assert_eq!(
             schema["properties"]["status"],
             json!({ "type": "string", "const": "success", "default": "success" })
+        );
+        assert_eq!(
+            schema["properties"]["retry_count"],
+            json!({ "type": "integer", "const": 3, "default": 3 })
+        );
+        assert_eq!(
+            schema["properties"]["ratio"],
+            json!({ "type": "number", "const": 1.5, "default": 1.5 })
         );
         assert_eq!(schema["properties"]["const"], json!({}));
         assert!(schema["properties"]["open_type"]["not"]
@@ -2600,12 +2647,89 @@ mod tests {
             })
         );
 
-        // Verify singularize_pascal exclusions
+        // Verify singularize_pascal exclusions and silent-'e' -ses plurals
         assert_eq!(singularize_pascal("Series"), "Series");
         assert_eq!(singularize_pascal("TimeSeries"), "TimeSeries");
         assert_eq!(singularize_pascal("Species"), "Species");
         assert_eq!(singularize_pascal("Address"), "Address");
+        assert_eq!(singularize_pascal("Addresses"), "Address");
+        assert_eq!(singularize_pascal("Statuses"), "Status");
+        assert_eq!(singularize_pascal("Purchases"), "Purchase");
+        assert_eq!(singularize_pascal("Releases"), "Release");
+        assert_eq!(singularize_pascal("Licenses"), "License");
+        assert_eq!(singularize_pascal("Cases"), "Case");
         assert_eq!(singularize_pascal("Categories"), "Category");
         assert_eq!(singularize_pascal("LineItems"), "LineItem");
+
+        // Verify root-level `if` with properties/ref is kept by `is_non_empty_request_slice`,
+        // while pure `if`/`then` or `contains` constraints return false
+        assert!(is_non_empty_request_slice(&json!({
+            "allOf": [{ "$ref": "#/$defs/LocationSummaryCreateRequest" }],
+            "if": { "required": ["hours"] },
+            "then": { "required": ["timezone"] }
+        })));
+        assert!(!is_non_empty_request_slice(&json!({
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "discount" } } },
+                    "then": { "properties": { "amount": { "exclusiveMaximum": 0 } } }
+                }
+            ]
+        })));
+
+        // Verify inline `not` branch in `allOf` is preserved by `flatten_object_allof`
+        let mut with_not = BTreeMap::from([(
+            "MutuallyExclusive".to_string(),
+            json!({
+                "title": "MutuallyExclusive",
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": { "a": { "type": "string" }, "b": { "type": "string" } }
+                    },
+                    { "not": { "required": ["a", "b"] } }
+                ]
+            }),
+        )]);
+        flatten_object_allof(&mut with_not);
+        assert_eq!(
+            with_not["MutuallyExclusive"]["allOf"],
+            json!([{ "not": { "required": ["a", "b"] } }])
+        );
+
+        // Verify `qualify_inline_object_titles` avoids duplicate branch titles using `used_titles`
+        let mut multi_branch = BTreeMap::from([(
+            "Selector".to_string(),
+            json!({
+                "title": "Selector",
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["id", "alpha"],
+                        "properties": { "id": { "type": "string" }, "alpha": { "type": "string" } }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["id", "beta"],
+                        "properties": { "id": { "type": "string" }, "beta": { "type": "string" } }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["code"],
+                        "properties": { "code": { "type": "string" } }
+                    }
+                ]
+            }),
+        )]);
+        qualify_inline_object_titles(&mut multi_branch);
+        assert_eq!(multi_branch["Selector"]["anyOf"][0]["title"], "SelectorId");
+        assert_eq!(
+            multi_branch["Selector"]["anyOf"][1]["title"],
+            "SelectorBeta"
+        );
+        assert_eq!(
+            multi_branch["Selector"]["anyOf"][2]["title"],
+            "SelectorCode"
+        );
     }
 }
