@@ -123,6 +123,7 @@ fn extract_rest_services(profile_val: &Value) -> Vec<RestServiceBinding> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct LocalSchemaRoot {
     origin: String,
+    version: Option<String>,
     path: PathBuf,
 }
 
@@ -130,63 +131,108 @@ struct LocalSchemaRoot {
 struct ProfileCrawler {
     items: Vec<LoadedSchema>,
     sources: Vec<String>,
+    versions: Vec<Option<String>>,
     source_to_idx: BTreeMap<String, usize>,
     local_schema_roots: Vec<LocalSchemaRoot>,
     queue: VecDeque<usize>,
 }
 
 impl ProfileCrawler {
-    fn load_or_get(&mut self, raw_source: &str) -> Result<usize, CodegenError> {
+    fn load_or_get(
+        &mut self,
+        raw_source: &str,
+        owner_namespace: Option<&str>,
+        version: Option<&str>,
+    ) -> Result<usize, CodegenError> {
         let canonical = canonicalize_source(raw_source);
         if let Some(&existing_idx) = self.source_to_idx.get(&canonical) {
+            if self.items[existing_idx].owner_namespace.is_none() {
+                self.items[existing_idx].owner_namespace = owner_namespace.map(str::to_string);
+            }
             return Ok(existing_idx);
         }
 
         let schema = load_schema_auto(&canonical)?;
-        self.record_local_schema_root(&canonical, &schema);
+        let resolved_owner = owner_namespace
+            .map(str::to_string)
+            .or_else(|| namespace_from_url_host(&canonical));
+        self.record_local_schema_root(&canonical, &schema, resolved_owner.as_deref(), version);
         let idx = self.items.len();
-        self.items.push(LoadedSchema::from_file(&canonical, schema));
+        let mut item = LoadedSchema::from_file(&canonical, schema);
+        item.owner_namespace = resolved_owner;
+        self.items.push(item);
         self.sources.push(canonical.clone());
+        self.versions.push(
+            version
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+        );
         self.source_to_idx.insert(canonical, idx);
         self.queue.push_back(idx);
         Ok(idx)
     }
 
-    fn record_local_schema_root(&mut self, canonical_source: &str, schema: &Value) {
+    fn record_local_schema_root(
+        &mut self,
+        canonical_source: &str,
+        schema: &Value,
+        owner_namespace: Option<&str>,
+        version: Option<&str>,
+    ) {
         if is_url(canonical_source) {
             return;
         }
         let Some(schema_id) = schema.get("$id").and_then(Value::as_str) else {
             return;
         };
+        if !schema_id_matches_owner(schema_id, owner_namespace) {
+            return;
+        }
         let Some(origin) = url_origin(schema_id) else {
             return;
         };
+        let (id_version, rel_after_schemas) = match split_url_marker(schema_id, "/schemas/") {
+            Some((_, ver, rel)) => (ver, Some(rel)),
+            None => (None, None),
+        };
+        let effective_version = id_version.or_else(|| {
+            version
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+        });
         let source_path = Path::new(canonical_source);
-        if let Some((_, rel_after_schemas)) = schema_id.split_once("/schemas/") {
-            let depth = rel_after_schemas
-                .split('/')
-                .filter(|s| !s.is_empty())
-                .count();
+        if let Some(rel_after) = rel_after_schemas {
+            let depth = rel_after.split('/').filter(|s| !s.is_empty()).count();
             if let Some(root) = source_path
                 .ancestors()
                 .nth(depth)
                 .filter(|p| !p.as_os_str().is_empty())
             {
-                self.push_local_schema_root(&origin, root.to_path_buf());
+                self.push_local_schema_root(
+                    &origin,
+                    effective_version.as_deref(),
+                    root.to_path_buf(),
+                );
             }
         }
         for ancestor in source_path.ancestors() {
             if ancestor.file_name().and_then(|s| s.to_str()) != Some("schemas") {
                 continue;
             }
-            self.push_local_schema_root(&origin, ancestor.to_path_buf());
+            self.push_local_schema_root(
+                &origin,
+                effective_version.as_deref(),
+                ancestor.to_path_buf(),
+            );
         }
     }
 
-    fn push_local_schema_root(&mut self, origin: &str, path: PathBuf) {
+    fn push_local_schema_root(&mut self, origin: &str, version: Option<&str>, path: PathBuf) {
         let entry = LocalSchemaRoot {
             origin: origin.to_string(),
+            version: version.map(str::to_string),
             path,
         };
         if !self.local_schema_roots.contains(&entry) {
@@ -222,9 +268,20 @@ pub(crate) fn load_and_compute_profile_closure(
     let mut raw_active_exts = BTreeSet::new();
     let mut active_capabilities = BTreeSet::new();
 
-    for cap in &parsed.capabilities {
+    let ordered_caps = parsed
+        .capabilities
+        .iter()
+        .filter(|c| c.extends.is_none())
+        .chain(parsed.capabilities.iter().filter(|c| c.extends.is_some()));
+
+    for cap in ordered_caps {
         let resolved_source = crawler.resolve_target(profile_source, &cap.schema_url)?;
-        let idx = crawler.load_or_get(&resolved_source)?;
+        let idx = crawler.load_or_get(&resolved_source, Some(&cap.name), Some(&cap.version))?;
+        if is_url(&cap.schema_url) {
+            crawler.items[idx]
+                .resolved_urls
+                .insert(canonicalize_source(&cap.schema_url));
+        }
         if crawler.items[idx].name.is_none() {
             crawler.items[idx].name = Some(cap.name.clone());
         }
@@ -250,13 +307,19 @@ pub(crate) fn load_and_compute_profile_closure(
     let mut seeded_ucp_indices = BTreeSet::new();
     while let Some(idx) = crawler.queue.pop_front() {
         let base_source = crawler.sources[idx].clone();
+        let parent_owner = crawler.items[idx].owner_namespace.clone();
+        let parent_version = crawler.versions[idx].clone();
         if crawler.items[idx].stem == "ucp" && seeded_ucp_indices.insert(idx) {
             for rel_ambient in AMBIENT_UCP_REL_ROOTS {
                 let ambient_target = crawler.resolve_target(&base_source, rel_ambient)?;
                 if !is_url(&ambient_target) && !Path::new(&ambient_target).exists() {
                     continue;
                 }
-                crawler.load_or_get(&ambient_target)?;
+                crawler.load_or_get(
+                    &ambient_target,
+                    parent_owner.as_deref(),
+                    parent_version.as_deref(),
+                )?;
             }
         }
 
@@ -268,8 +331,29 @@ pub(crate) fn load_and_compute_profile_closure(
             if file_part.is_empty() {
                 continue;
             }
+            let target_owner = if is_url(file_part) {
+                namespace_from_url_host(file_part)
+            } else {
+                parent_owner.clone()
+            };
+            let target_version = if is_url(file_part) {
+                split_url_marker(file_part, "/schemas/")
+                    .and_then(|(_, ver, _)| ver)
+                    .or_else(|| parent_version.clone())
+            } else {
+                parent_version.clone()
+            };
             let target_source = crawler.resolve_target(&base_source, file_part)?;
-            crawler.load_or_get(&target_source)?;
+            let target_idx = crawler.load_or_get(
+                &target_source,
+                target_owner.as_deref(),
+                target_version.as_deref(),
+            )?;
+            if is_url(file_part) {
+                crawler.items[target_idx]
+                    .resolved_urls
+                    .insert(canonicalize_source(file_part));
+            }
         }
     }
 
@@ -327,6 +411,46 @@ fn url_origin(url_str: &str) -> Option<String> {
     }
 }
 
+fn namespace_from_url_host(url_str: &str) -> Option<String> {
+    if !is_url(url_str) {
+        return None;
+    }
+    let parsed = Url::parse(url_str).ok()?;
+    let host = parsed.host_str()?;
+    host.contains('.')
+        .then(|| crate::namespace::reverse_labels(host))
+}
+
+fn schema_id_matches_owner(schema_id: &str, owner_namespace: Option<&str>) -> bool {
+    let Some(ns) = owner_namespace else {
+        return true;
+    };
+    let Some(id_ns) = namespace_from_url_host(schema_id) else {
+        return false;
+    };
+    ns == id_ns || ns.starts_with(&format!("{id_ns}."))
+}
+
+fn split_url_marker<'a>(
+    url_str: &'a str,
+    marker: &str,
+) -> Option<(String, Option<String>, &'a str)> {
+    let origin = url_origin(url_str)?;
+    let after_origin = url_str.strip_prefix(&origin)?;
+    let (before_marker, rel_after) = after_origin.split_once(marker)?;
+    let ver_trimmed = before_marker.trim_matches('/');
+    let version = (!ver_trimmed.is_empty()).then(|| ver_trimmed.to_string());
+    Some((origin, version, rel_after))
+}
+
+fn versions_compatible(root_version: Option<&str>, target_version: Option<&str>) -> bool {
+    match (root_version, target_version) {
+        (Some(rv), Some(tv)) => rv == tv,
+        (_, None) => true,
+        (None, Some(_)) => false,
+    }
+}
+
 fn resolve_schema_target(
     base_source: &str,
     target_ref: &str,
@@ -366,10 +490,13 @@ fn relocate_url_to_local_schemas(
     url_str: &str,
     local_schema_roots: &[LocalSchemaRoot],
 ) -> Option<String> {
-    let target_origin = url_origin(url_str)?;
-    let (_, rel_after_schemas) = url_str.split_once("/schemas/")?;
+    let (target_origin, target_version, rel_after_schemas) =
+        split_url_marker(url_str, "/schemas/")?;
     for root in local_schema_roots {
         if root.origin != target_origin {
+            continue;
+        }
+        if !versions_compatible(root.version.as_deref(), target_version.as_deref()) {
             continue;
         }
         let candidate = normalize_lexical_path(&root.path.join(rel_after_schemas));
@@ -533,18 +660,30 @@ mod tests {
         crawler.record_local_schema_root(
             "/tmp/custom_root/shopping/checkout.json",
             &json!({ "$id": "https://ucp.dev/schemas/shopping/checkout.json" }),
+            Some("dev.ucp.shopping.checkout"),
+            Some("2026-08-25"),
         );
         assert_eq!(
             crawler.local_schema_roots,
             vec![LocalSchemaRoot {
                 origin: "https://ucp.dev".to_string(),
+                version: Some("2026-08-25".to_string()),
                 path: PathBuf::from("/tmp/custom_root"),
             }]
         );
+
+        // Vendor schema with copy-pasted/spoofed ucp.dev $id must NOT register as a ucp.dev root
+        crawler.record_local_schema_root(
+            "/tmp/acme_root/schemas/shopping/checkout.json",
+            &json!({ "$id": "https://ucp.dev/schemas/shopping/checkout.json" }),
+            Some("com.acme.loyalty"),
+            Some("2026-08-25"),
+        );
+        assert_eq!(crawler.local_schema_roots.len(), 1);
     }
 
     #[test]
-    fn relocate_url_to_local_schemas_checks_url_origin() {
+    fn relocate_url_to_local_schemas_checks_url_origin_and_version() {
         let tmp = tempfile::tempdir().unwrap();
         let ucp_root = tmp.path().join("ucp_schemas");
         let shopping_dir = ucp_root.join("shopping");
@@ -554,10 +693,11 @@ mod tests {
 
         let roots = vec![LocalSchemaRoot {
             origin: "https://ucp.dev".to_string(),
+            version: Some("2026-08-25".to_string()),
             path: ucp_root,
         }];
 
-        // Matching origin relocates to local file on disk
+        // Matching origin and version relocates to local file on disk
         let hit = resolve_schema_target(
             "https://shopify.dev/ucp/schemas/2026-08-25/shopify_catalog.json",
             "https://ucp.dev/2026-08-25/schemas/shopping/checkout.json",
@@ -565,6 +705,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(Path::new(&hit), normalize_lexical_path(&checkout_path));
+
+        // Unversioned URL on matching origin also relocates to local root
+        let unversioned_hit = resolve_schema_target(
+            "https://shopify.dev/ucp/schemas/2026-08-25/shopify_catalog.json",
+            "https://ucp.dev/schemas/shopping/checkout.json",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            Path::new(&unversioned_hit),
+            normalize_lexical_path(&checkout_path)
+        );
+
+        // Mismatched version on same origin is NOT relocated to the 2026-08-25 local root
+        let wrong_version = resolve_schema_target(
+            "https://shopify.dev/ucp/schemas/2026-08-25/shopify_catalog.json",
+            "https://ucp.dev/2026-04-08/schemas/shopping/checkout.json",
+            &roots,
+        )
+        .unwrap();
+        assert_eq!(
+            wrong_version,
+            "https://ucp.dev/2026-04-08/schemas/shopping/checkout.json"
+        );
 
         // Different origin is NOT relocated to the local ucp.dev root
         let foreign = resolve_schema_target(

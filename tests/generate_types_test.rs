@@ -1271,7 +1271,7 @@ fn profile_mode_multi_origin_relocates_only_matching_authority() {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": "https://ucp.dev/schemas/shopping/checkout.json",
             "name": "dev.ucp.shopping.checkout",
-            "version": "2026-01-11",
+            "version": "2026-08-25",
             "title": "Checkout",
             "type": "object",
             "properties": { "id": { "type": "string" } }
@@ -1327,7 +1327,7 @@ fn profile_mode_multi_origin_relocates_only_matching_authority() {
             "$schema": "https://json-schema.org/draft/2020-12/schema",
             "$id": "https://vendor.example.com/schemas/shopping/loyalty.json",
             "name": "com.example.vendor.loyalty",
-            "version": "2026-01-11",
+            "version": "2026-08-25",
             "title": "Vendor Loyalty",
             "$defs": {
                 "dev.ucp.shopping.checkout": {
@@ -1350,11 +1350,11 @@ fn profile_mode_multi_origin_relocates_only_matching_authority() {
             "ucp": {
                 "capabilities": {
                     "dev.ucp.shopping.checkout": [{
-                        "version": "2026-01-11",
+                        "version": "2026-08-25",
                         "schema": ucp_checkout_path.to_str().unwrap()
                     }],
                     "com.example.vendor.loyalty": [{
-                        "version": "2026-01-11",
+                        "version": "2026-08-25",
                         "schema": vendor_loyalty_path.to_str().unwrap(),
                         "extends": "dev.ucp.shopping.checkout"
                     }]
@@ -1515,5 +1515,167 @@ fn profile_mode_disambiguates_vendor_local_file_stem_colliding_with_ucp_type() {
     assert_eq!(
         bundle.defs["Checkout"]["properties"]["loyalty_price"]["$ref"],
         "#/$defs/AcmePrice"
+    );
+}
+
+#[test]
+fn profile_mode_disambiguates_spoofed_ucp_id_and_prefix_starting_stems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ucp_shopping = tmp.path().join("ucp/schemas/shopping");
+    let ucp_common_types = tmp.path().join("ucp/schemas/common/types");
+    let vendor_shopping = tmp.path().join("acme/schemas/shopping");
+    let vendor_types = tmp.path().join("acme/schemas/types");
+    std::fs::create_dir_all(&ucp_shopping).unwrap();
+    std::fs::create_dir_all(&ucp_common_types).unwrap();
+    std::fs::create_dir_all(&vendor_shopping).unwrap();
+    std::fs::create_dir_all(&vendor_types).unwrap();
+
+    std::fs::write(
+        ucp_common_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/price.json",
+            "title": "Price",
+            "type": "object",
+            "properties": { "amount": { "type": "integer" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    std::fs::write(
+        ucp_common_types.join("acme_item.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/acme_item.json",
+            "title": "Acme Item",
+            "type": "object",
+            "properties": { "sku": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let ucp_checkout_path = ucp_shopping.join("checkout.json");
+    std::fs::write(
+        &ucp_checkout_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+            "name": "dev.ucp.shopping.checkout",
+            "version": "2026-01-11",
+            "title": "Checkout",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "total_price": { "$ref": "../common/types/price.json" },
+                "base_item": { "$ref": "../common/types/acme_item.json" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Vendor price.json with copy-pasted/spoofed https://ucp.dev/ $id
+    std::fs::write(
+        vendor_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/price.json",
+            "title": "Vendor Loyalty Price",
+            "type": "object",
+            "properties": { "points_cost": { "type": "integer" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Vendor acme_item.json whose PascalCase stem ("AcmeItem") already starts with vendor prefix ("Acme")
+    std::fs::write(
+        vendor_types.join("acme_item.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.com/schemas/types/acme_item.json",
+            "title": "Vendor Acme Item",
+            "type": "object",
+            "properties": { "reward_code": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let vendor_loyalty_path = vendor_shopping.join("loyalty.json");
+    std::fs::write(
+        &vendor_loyalty_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.com/schemas/shopping/loyalty.json",
+            "name": "com.acme.loyalty",
+            "version": "2026-01-11",
+            "title": "Acme Loyalty",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "properties": {
+                        "loyalty_price": { "$ref": "../types/price.json" },
+                        "loyalty_url_price": { "$ref": "https://acme.com/2026-01-11/schemas/types/price.json" },
+                        "loyalty_item": { "$ref": "../types/acme_item.json" }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let profile_path = tmp.path().join("profile.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::json!({
+            "ucp": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-01-11",
+                        "schema": ucp_checkout_path.to_str().unwrap()
+                    }],
+                    "com.acme.loyalty": [{
+                        "version": "2026-01-11",
+                        "schema": vendor_loyalty_path.to_str().unwrap(),
+                        "extends": "dev.ucp.shopping.checkout"
+                    }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+    assert_has_defs(
+        &bundle.defs,
+        &["Checkout", "Price", "AcmePrice", "AcmeItem", "AcmeAcmeItem"],
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["total_price"]["$ref"],
+        "#/$defs/Price"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_price"]["$ref"],
+        "#/$defs/AcmePrice"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_url_price"]["$ref"],
+        "#/$defs/AcmePrice"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["base_item"]["$ref"],
+        "#/$defs/AcmeItem"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_item"]["$ref"],
+        "#/$defs/AcmeAcmeItem"
     );
 }

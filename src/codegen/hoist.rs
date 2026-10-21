@@ -286,6 +286,9 @@ fn compute_collision_renames(
 }
 
 fn is_ucp_owned(item: &LoadedSchema) -> bool {
+    if let Some(ns) = item.owner_namespace.as_deref() {
+        return ns == "dev.ucp" || ns.starts_with("dev.ucp.");
+    }
     let has_ucp_name = item
         .name
         .as_deref()
@@ -298,24 +301,48 @@ fn is_ucp_owned(item: &LoadedSchema) -> bool {
     has_ucp_name || has_ucp_id
 }
 
+fn item_id_matches_owner(item: &LoadedSchema, id_str: &str) -> bool {
+    let Some(ns) = item.owner_namespace.as_deref() else {
+        return true;
+    };
+    let Ok(parsed) = url::Url::parse(id_str) else {
+        return false;
+    };
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let rev = crate::namespace::reverse_labels(host);
+    ns == rev || ns.starts_with(&format!("{rev}."))
+}
+
+fn vendor_prefix_from_id(id_str: &str) -> Option<String> {
+    let parsed = url::Url::parse(id_str).ok()?;
+    let host = parsed.host_str()?;
+    let label = host
+        .split('.')
+        .find(|s| !matches!(*s, "" | "www" | "api" | "schemas"))
+        .unwrap_or_default();
+    (!label.is_empty() && label != "ucp").then(|| to_pascal_case(label))
+}
+
 fn derive_vendor_prefix(item: &LoadedSchema) -> Option<String> {
-    if let Some(name) = item.name.as_deref() {
-        let seg = name.split('.').nth(1).unwrap_or_default();
+    for ns in [item.owner_namespace.as_deref(), item.name.as_deref()]
+        .into_iter()
+        .flatten()
+    {
+        let seg = ns.split('.').nth(1).unwrap_or_default();
         if !seg.is_empty() && seg != "ucp" {
             return Some(to_pascal_case(seg));
         }
     }
-    if let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) {
-        if let Ok(parsed) = url::Url::parse(id_str) {
-            if let Some(host) = parsed.host_str() {
-                let label = host
-                    .split('.')
-                    .find(|s| !matches!(*s, "" | "www" | "api" | "schemas"))
-                    .unwrap_or_default();
-                if !label.is_empty() && label != "ucp" {
-                    return Some(to_pascal_case(label));
-                }
-            }
+    if item.owner_namespace.is_none() {
+        if let Some(prefix) = item
+            .schema
+            .get("$id")
+            .and_then(Value::as_str)
+            .and_then(vendor_prefix_from_id)
+        {
+            return Some(prefix);
         }
     }
     for ancestor in item.path.ancestors().skip(1) {
@@ -372,9 +399,6 @@ fn disambiguate_colliding_standalone_stems(
             let Some(prefix) = derive_vendor_prefix(&loaded[idx]) else {
                 continue;
             };
-            if stem.starts_with(&prefix) {
-                continue;
-            }
             let qualified = format!("{prefix}{stem}");
             loaded[idx].stem_pascal = qualified.clone();
             file_renames.insert(idx, qualified);
@@ -453,12 +477,22 @@ fn apply_collision_renames_to_schemas(
     let mut origin_rel_to_idx: BTreeMap<(String, String), usize> = BTreeMap::new();
     for (i, item) in loaded.iter().enumerate() {
         path_to_idx.insert(item.path.clone(), i);
-        if let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) {
-            id_to_idx.insert(id_str.to_string(), i);
-            path_to_idx.insert(normalize_lexical_path(std::path::Path::new(id_str)), i);
-            if let Some(key) = url_origin_and_rel(id_str) {
+        for url_str in &item.resolved_urls {
+            id_to_idx.insert(url_str.clone(), i);
+            if let Some(key) = url_origin_and_rel(url_str) {
                 origin_rel_to_idx.insert(key, i);
             }
+        }
+        let Some(id_str) = item.schema.get("$id").and_then(Value::as_str) else {
+            continue;
+        };
+        if !item_id_matches_owner(item, id_str) {
+            continue;
+        }
+        id_to_idx.insert(id_str.to_string(), i);
+        path_to_idx.insert(normalize_lexical_path(std::path::Path::new(id_str)), i);
+        if let Some(key) = url_origin_and_rel(id_str) {
+            origin_rel_to_idx.insert(key, i);
         }
     }
 
