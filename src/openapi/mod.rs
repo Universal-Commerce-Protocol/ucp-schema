@@ -209,9 +209,14 @@ fn load_and_merge_templates(
     selected_services: &[&RestServiceBinding],
     parsed: &crate::codegen::ParsedProfile,
 ) -> Result<MergedTemplates, CodegenError> {
+    let default_version = selected_services
+        .first()
+        .map(|b| b.version.trim())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("1.0.0");
     let mut merged = MergedTemplates {
         openapi_version: "3.1.0".to_string(),
-        info: json!({ "title": "UCP REST Service", "version": "1.0.0" }),
+        info: json!({ "title": "UCP REST Service", "version": default_version }),
         ..MergedTemplates::default()
     };
 
@@ -232,8 +237,12 @@ fn load_and_merge_templates(
             if let Some(ver) = root_obj.get("openapi").and_then(Value::as_str) {
                 merged.openapi_version = ver.to_string();
             }
-            if let Some(info) = root_obj.get("info") {
-                merged.info = info.clone();
+            if let Some(info_obj) = root_obj.get("info").and_then(Value::as_object) {
+                if let Some(merged_info) = merged.info.as_object_mut() {
+                    for (k, v) in info_obj {
+                        merged_info.insert(k.clone(), v.clone());
+                    }
+                }
             }
             merged.fallback_servers = root_obj.get("servers").cloned();
         }

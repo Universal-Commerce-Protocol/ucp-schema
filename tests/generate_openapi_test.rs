@@ -26,6 +26,18 @@ fn visit_json_objects(val: &Value, f: &mut impl FnMut(&serde_json::Map<String, V
 
 fn assert_openapi_invariants(spec: &Value) {
     assert_eq!(spec["openapi"], "3.1.0");
+    assert!(
+        spec["info"]["title"]
+            .as_str()
+            .is_some_and(|t| !t.is_empty()),
+        "info.title is required by OpenAPI 3.1"
+    );
+    assert!(
+        spec["info"]["version"]
+            .as_str()
+            .is_some_and(|v| !v.is_empty()),
+        "info.version is required by OpenAPI 3.1"
+    );
     assert_eq!(
         spec["jsonSchemaDialect"],
         "https://spec.openapis.org/oas/3.1/dialect/base"
@@ -150,6 +162,7 @@ fn shopping_checkout_discount_fulfillment_prunes_routes_and_binds_directional_sc
     let opts = GenerateOpenApiOptions::new(profile_path.to_str().unwrap());
     let spec = generate_openapi(&opts).unwrap();
     assert_openapi_invariants(&spec);
+    assert_eq!(spec["info"]["version"], "2026-08-25");
 
     assert_eq!(
         spec["servers"],
