@@ -4,9 +4,21 @@ use std::path::{Path, PathBuf};
 use serde_json::{json, Value};
 use ucp_schema::{generate_openapi, CodegenError, GenerateOpenApiOptions};
 
+fn fixture_compose_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compose")
+}
+
 fn ucp_source_dir() -> Option<PathBuf> {
     let candidate = Path::new(env!("CARGO_MANIFEST_DIR")).join("../ucp/source");
     candidate.exists().then_some(candidate)
+}
+
+fn require_ucp_source_dir(test_name: &str) -> Option<PathBuf> {
+    let dir = ucp_source_dir();
+    if dir.is_none() {
+        eprintln!("skipping {test_name}: sibling ../ucp/source checkout not found");
+    }
+    dir
 }
 
 fn visit_json_objects(val: &Value, f: &mut impl FnMut(&serde_json::Map<String, Value>)) {
@@ -24,8 +36,85 @@ fn visit_json_objects(val: &Value, f: &mut impl FnMut(&serde_json::Map<String, V
     }
 }
 
+fn validate_parameter_invariants(param: &Value) {
+    let Some(param_obj) = param.as_object() else {
+        return;
+    };
+    let Some(in_str) = param_obj.get("in").and_then(Value::as_str) else {
+        return;
+    };
+    assert!(
+        param_obj
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|n| !n.is_empty()),
+        "parameter missing required non-empty 'name': {param:?}"
+    );
+    assert!(
+        ["query", "header", "path", "cookie"].contains(&in_str),
+        "invalid parameter 'in' value '{in_str}': {param:?}"
+    );
+    if in_str == "path" {
+        assert_eq!(
+            param_obj.get("required"),
+            Some(&json!(true)),
+            "path parameter must have required: true: {param:?}"
+        );
+    }
+}
+
+fn validate_operation_invariants(method: &str, path: &str, op_val: &Value) {
+    let op_obj = op_val
+        .as_object()
+        .unwrap_or_else(|| panic!("operation {method} {path} must be an object"));
+    let responses = op_obj
+        .get("responses")
+        .and_then(Value::as_object)
+        .unwrap_or_else(|| panic!("operation {method} {path} missing required 'responses'"));
+    assert!(
+        !responses.is_empty(),
+        "operation {method} {path} 'responses' must not be empty"
+    );
+    for (status, resp_val) in responses {
+        let resp_obj = resp_val
+            .as_object()
+            .unwrap_or_else(|| panic!("response {status} on {method} {path} must be an object"));
+        assert!(
+            resp_obj
+                .get("description")
+                .and_then(Value::as_str)
+                .is_some_and(|d| !d.is_empty()),
+            "response {status} on {method} {path} missing required 'description'"
+        );
+        if let Some(content) = resp_obj.get("content") {
+            assert!(
+                content.is_object(),
+                "response {status} content on {method} {path} must be an object"
+            );
+        }
+    }
+
+    if let Some(rb) = op_obj.get("requestBody") {
+        let content = rb
+            .get("content")
+            .and_then(Value::as_object)
+            .unwrap_or_else(|| panic!("requestBody on {method} {path} missing required 'content'"));
+        assert!(
+            !content.is_empty(),
+            "requestBody content on {method} {path} must not be empty"
+        );
+    }
+
+    if let Some(params) = op_obj.get("parameters").and_then(Value::as_array) {
+        for param in params {
+            validate_parameter_invariants(param);
+        }
+    }
+}
+
 fn assert_openapi_invariants(spec: &Value) {
     assert_eq!(spec["openapi"], "3.1.0");
+    assert!(spec["info"].is_object(), "info must be an object");
     assert!(
         spec["info"]["title"]
             .as_str()
@@ -42,7 +131,43 @@ fn assert_openapi_invariants(spec: &Value) {
         spec["jsonSchemaDialect"],
         "https://spec.openapis.org/oas/3.1/dialect/base"
     );
-    assert!(spec["paths"].is_object(), "paths must be an object");
+    let paths = spec["paths"].as_object().expect("paths must be an object");
+    for (path, item) in paths {
+        assert!(
+            path.starts_with('/'),
+            "OpenAPI path '{path}' must begin with '/'"
+        );
+        let item_obj = item
+            .as_object()
+            .unwrap_or_else(|| panic!("path item for '{path}' must be an object"));
+        for method in [
+            "get", "put", "post", "delete", "options", "head", "patch", "trace",
+        ] {
+            if let Some(op) = item_obj.get(method) {
+                validate_operation_invariants(method, path, op);
+            }
+        }
+        if let Some(params) = item_obj.get("parameters").and_then(Value::as_array) {
+            for param in params {
+                validate_parameter_invariants(param);
+            }
+        }
+    }
+
+    if let Some(webhooks) = spec.get("webhooks").and_then(Value::as_object) {
+        for (hook_name, item) in webhooks {
+            let item_obj = item
+                .as_object()
+                .unwrap_or_else(|| panic!("webhook item for '{hook_name}' must be an object"));
+            for method in [
+                "get", "put", "post", "delete", "options", "head", "patch", "trace",
+            ] {
+                if let Some(op) = item_obj.get(method) {
+                    validate_operation_invariants(method, &format!("webhook:{hook_name}"), op);
+                }
+            }
+        }
+    }
 
     let components = spec["components"]
         .as_object()
@@ -56,6 +181,11 @@ fn assert_openapi_invariants(spec: &Value) {
         .and_then(Value::as_object)
         .map(|m| m.keys().map(String::as_str).collect())
         .unwrap_or_default();
+    if let Some(params) = components.get("parameters").and_then(Value::as_object) {
+        for param in params.values() {
+            validate_parameter_invariants(param);
+        }
+    }
     let known_headers: BTreeSet<&str> = components
         .get("headers")
         .and_then(Value::as_object)
@@ -114,8 +244,82 @@ fn assert_openapi_invariants(spec: &Value) {
 }
 
 #[test]
+fn generate_openapi_fixture_closure_and_template_merge() {
+    let compose_dir = fixture_compose_dir();
+    let schema_dir = compose_dir.join("schemas");
+    let template_path = compose_dir.join("shopping_rest.openapi.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("profile.json");
+    let profile = json!({
+        "ucp": {
+            "version": "2026-01-11",
+            "services": {
+                "dev.ucp.shopping": [{
+                    "version": "2026-01-11",
+                    "transport": "rest",
+                    "endpoint": "https://merchant.example.com/ucp",
+                    "schema": template_path.to_str().unwrap()
+                }]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/checkout.json")
+                }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/discount.json"),
+                    "extends": "dev.ucp.shopping.checkout"
+                }]
+            }
+        }
+    });
+    std::fs::write(&profile_path, profile.to_string()).unwrap();
+
+    let opts = GenerateOpenApiOptions::new(profile_path.to_str().unwrap());
+    let spec = generate_openapi(&opts).unwrap();
+
+    // 1. Enforce OAS 3.1 structural invariants unconditionally in CI
+    assert_openapi_invariants(&spec);
+
+    // 2. Info version preservation from profile binding when template omits info.version
+    assert_eq!(spec["info"]["title"], "UCP Shopping Service");
+    assert_eq!(spec["info"]["version"], "2026-01-11");
+
+    // 3. Route pruning: /checkout-sessions retained, /carts pruned (inactive capability)
+    let paths = spec["paths"].as_object().unwrap();
+    let retained_paths: Vec<&str> = paths.keys().map(String::as_str).collect();
+    assert_eq!(
+        retained_paths,
+        vec!["/checkout-sessions", "/checkout-sessions/{id}"]
+    );
+
+    // 4. Directional schema bindings: CreateRequest and UpdateRequest
+    assert_eq!(
+        paths["/checkout-sessions"]["post"]["requestBody"]["content"]["application/json"]["schema"]
+            ["$ref"],
+        "#/components/schemas/CheckoutCreateRequest"
+    );
+    assert_eq!(
+        paths["/checkout-sessions/{id}"]["put"]["requestBody"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/CheckoutUpdateRequest"
+    );
+
+    // 5. Component parameter pruning: idempotency_key & session_id retained, unused_query pruned
+    let params = spec["components"]["parameters"].as_object().unwrap();
+    assert!(params.contains_key("idempotency_key"));
+    assert!(params.contains_key("session_id"));
+    assert!(!params.contains_key("unused_query"));
+}
+
+#[test]
 fn shopping_checkout_discount_fulfillment_prunes_routes_and_binds_directional_schemas() {
-    let Some(source_dir) = ucp_source_dir() else {
+    let Some(source_dir) = require_ucp_source_dir(
+        "shopping_checkout_discount_fulfillment_prunes_routes_and_binds_directional_schemas",
+    ) else {
         return;
     };
     let schema_dir = source_dir.join("schemas");
@@ -295,7 +499,9 @@ fn shopping_checkout_discount_fulfillment_prunes_routes_and_binds_directional_sc
 
 #[test]
 fn shopping_order_retains_orders_route_and_order_event_webhook() {
-    let Some(source_dir) = ucp_source_dir() else {
+    let Some(source_dir) =
+        require_ucp_source_dir("shopping_order_retains_orders_route_and_order_event_webhook")
+    else {
         return;
     };
     let schema_dir = source_dir.join("schemas");
@@ -372,7 +578,9 @@ fn shopping_order_retains_orders_route_and_order_event_webhook() {
 
 #[test]
 fn container_capabilities_and_lodging_booking_bind_canonical_schemas() {
-    let Some(source_dir) = ucp_source_dir() else {
+    let Some(source_dir) =
+        require_ucp_source_dir("container_capabilities_and_lodging_booking_bind_canonical_schemas")
+    else {
         return;
     };
     let schema_dir = source_dir.join("schemas");
@@ -565,7 +773,9 @@ fn container_capabilities_and_lodging_booking_bind_canonical_schemas() {
 
 #[test]
 fn error_handling_and_cli_exit_codes_for_missing_rest_binding_and_schema() {
-    let Some(source_dir) = ucp_source_dir() else {
+    let Some(source_dir) = require_ucp_source_dir(
+        "error_handling_and_cli_exit_codes_for_missing_rest_binding_and_schema",
+    ) else {
         return;
     };
     let schema_dir = source_dir.join("schemas");
@@ -717,7 +927,9 @@ fn error_handling_and_cli_exit_codes_for_missing_rest_binding_and_schema() {
 
 #[test]
 fn shopping_cart_retains_cart_routes_and_binds_directional_cart_schemas() {
-    let Some(source_dir) = ucp_source_dir() else {
+    let Some(source_dir) = require_ucp_source_dir(
+        "shopping_cart_retains_cart_routes_and_binds_directional_cart_schemas",
+    ) else {
         return;
     };
     let schema_dir = source_dir.join("schemas");

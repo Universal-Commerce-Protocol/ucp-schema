@@ -1,0 +1,137 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "UCP Shopping Service",
+    "description": "Canonical REST interface for UCP Shopping service."
+  },
+  "servers": [
+    {
+      "url": "https://merchant.example.com/ucp"
+    }
+  ],
+  "paths": {
+    "/checkout-sessions": {
+      "post": {
+        "operationId": "create_checkout",
+        "summary": "Create Checkout",
+        "description": "Create a new checkout session.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/idempotency_key"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/checkout"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Checkout session created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/checkout"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/checkout-sessions/{id}": {
+      "put": {
+        "operationId": "update_checkout",
+        "summary": "Update Checkout",
+        "description": "Update an existing checkout session.",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/session_id"
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/checkout"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Checkout session updated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/checkout"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/carts": {
+      "post": {
+        "operationId": "create_cart",
+        "summary": "Create Cart",
+        "description": "Create a cart.",
+        "responses": {
+          "201": {
+            "description": "Cart created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/cart"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "parameters": {
+      "idempotency_key": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "session_id": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "schema": {
+          "type": "string"
+        }
+      },
+      "unused_query": {
+        "name": "filter",
+        "in": "query",
+        "required": false,
+        "schema": {
+          "type": "string"
+        }
+      }
+    },
+    "schemas": {
+      "checkout": {
+        "$ref": "schemas/shopping/checkout.json"
+      },
+      "cart": {
+        "$ref": "schemas/shopping/cart.json"
+      }
+    }
+  }
+}
