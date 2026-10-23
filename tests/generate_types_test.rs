@@ -2216,3 +2216,96 @@ fn extended_subtypes_discovery_and_registration() {
         );
     }
 }
+
+#[test]
+fn extended_subtypes_preserves_non_variant_branches_on_closed_unions() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("closed_variant_a.json"),
+        &serde_json::json!({
+            "title": "Closed Variant A",
+            "type": "object",
+            "required": ["type", "a_field"],
+            "properties": {
+                "type": { "type": "string", "const": "a" },
+                "a_field": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("closed_union.json"),
+        &serde_json::json!({
+            "title": "Closed Union",
+            "type": "object",
+            "required": ["type", "shared_field"],
+            "properties": {
+                "type": { "type": "string", "enum": ["a", "b"] },
+                "shared_field": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "a" } } },
+                    "then": { "$ref": "closed_variant_a.json" }
+                },
+                {
+                    "description": "non-variant validation branch",
+                    "not": { "required": ["forbidden_key"] }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("extended_b.json"),
+        &serde_json::json!({
+            "title": "Extended B",
+            "allOf": [
+                { "$ref": "closed_union.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "b_field"],
+                    "properties": {
+                        "type": { "type": "string", "const": "b" },
+                        "b_field": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("service.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.service",
+            "title": "Service",
+            "type": "object",
+            "properties": {
+                "item": { "$ref": "types/closed_union.json" },
+                "b_item": { "$ref": "types/extended_b.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    let ext_b = &bundle.defs["ExtendedB"];
+    assert_eq!(ext_b["properties"]["shared_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["b_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["type"]["const"], "b");
+
+    // Verify non-variant validation branch was preserved on ExtendedB
+    let all_of = ext_b["allOf"].as_array().expect("ExtendedB has allOf");
+    assert!(
+        all_of
+            .iter()
+            .any(|branch| branch.get("description").and_then(Value::as_str)
+                == Some("non-variant validation branch")),
+        "ExtendedB must preserve non-variant allOf branches from ClosedUnion"
+    );
+}

@@ -247,7 +247,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
 
     // Stage 7: Ordered anyOf Union Lowering & Subtype Registration
     let lowered_unions = reify::lower_conditional_unions(&mut defs);
-    reify::register_extended_subtypes(&mut defs, &lowered_unions);
+    reify::register_extended_subtypes(&mut defs, &lowered_unions, &sliced_base_names);
     qualify_inline_object_titles(&mut defs);
 
     // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning

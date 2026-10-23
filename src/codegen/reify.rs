@@ -350,7 +350,7 @@ type ConditionalUnionBranches = (String, Vec<(String, String)>, Vec<Value>);
 ///   (invariant `OU-4`) and never emits the OpenAPI `"discriminator"` keyword (invariant `OU-3`).
 pub fn lower_conditional_unions(
     defs: &mut BTreeMap<String, Value>,
-) -> BTreeMap<String, (String, Value)> {
+) -> BTreeMap<String, (String, Value, Vec<Value>)> {
     let mut lowered_unions = BTreeMap::new();
     let parent_names: Vec<String> = defs.keys().cloned().collect();
     for parent_name in parent_names {
@@ -364,7 +364,11 @@ pub fn lower_conditional_unions(
         };
         lowered_unions.insert(
             parent_name.clone(),
-            (disc_prop.clone(), parent_schema.clone()),
+            (
+                disc_prop.clone(),
+                parent_schema.clone(),
+                non_variant_branches.clone(),
+            ),
         );
 
         for (tag_val, variant_name) in &variants {
@@ -730,17 +734,18 @@ fn build_union_base_schema(
 ///   any trailing `{"$ref": "#/$defs/<ParentUnion>Base"}` entry.
 pub fn register_extended_subtypes(
     defs: &mut BTreeMap<String, Value>,
-    lowered_unions: &BTreeMap<String, (String, Value)>,
+    lowered_unions: &BTreeMap<String, (String, Value, Vec<Value>)>,
+    sliced_base_names: &BTreeSet<String>,
 ) {
     let mut union_discriminators = collect_lowered_union_discriminators(defs);
-    for (name, (disc, _)) in lowered_unions {
+    for (name, (disc, _, _)) in lowered_unions {
         union_discriminators.insert(name.clone(), disc.clone());
     }
     if union_discriminators.is_empty() {
         return;
     }
 
-    synthesize_directional_subtype_slices(defs, &union_discriminators);
+    synthesize_directional_subtype_slices(defs, &union_discriminators, sliced_base_names);
 
     let def_names: Vec<String> = defs.keys().cloned().collect();
     for subtype_name in def_names {
@@ -763,7 +768,7 @@ pub fn register_extended_subtypes(
             .or_else(|| {
                 lowered_unions
                     .get(&parent_union)
-                    .map(|(_, schema)| schema.clone())
+                    .map(|(_, schema, _)| schema.clone())
             })
             .or_else(|| defs.get(&parent_union).cloned())
         else {
@@ -774,6 +779,14 @@ pub fn register_extended_subtypes(
             .and_then(|b| b.get("allOf"))
             .and_then(Value::as_array)
             .cloned()
+            .or_else(|| {
+                lowered_unions
+                    .get(&parent_union)
+                    .map(|(_, _, branches)| branches.clone())
+            })
+            .or_else(|| {
+                extract_conditional_union_branches(&base_template).map(|(_, _, branches)| branches)
+            })
             .unwrap_or_default();
 
         if let Some(subtype_schema) = defs.get_mut(&subtype_name) {
@@ -828,6 +841,7 @@ pub fn register_extended_subtypes(
 fn synthesize_directional_subtype_slices(
     defs: &mut BTreeMap<String, Value>,
     union_discriminators: &BTreeMap<String, String>,
+    sliced_base_names: &BTreeSet<String>,
 ) {
     const DIRECTIONAL_OPS: [(&str, &str); 3] = [
         ("create", "CreateRequest"),
@@ -843,12 +857,10 @@ fn synthesize_directional_subtype_slices(
             || DIRECTIONAL_OPS
                 .iter()
                 .any(|(_, s)| subtype_name.ends_with(s))
-        {
-            continue;
-        }
-        if defs
-            .get(&format!("{subtype_name}CreateRequest"))
-            .is_some_and(|cr| find_extended_union_parent(cr, union_discriminators).is_none())
+            || sliced_base_names.contains(subtype_name)
+            || DIRECTIONAL_OPS
+                .iter()
+                .any(|(_, s)| defs.contains_key(&format!("{subtype_name}{s}")))
         {
             continue;
         }
@@ -955,9 +967,27 @@ fn collect_lowered_union_discriminators(
             .and_then(|b| b.get("properties"))
             .and_then(Value::as_object)
         {
-            if let Some((disc_key, _)) = base_props.iter().find(|(_, v)| {
-                v.get("not").and_then(|n| n.get("enum")).is_some() || v.get("enum").is_some()
-            }) {
+            // Prioritize `not.enum` for open string union discriminators over ordinary enum properties
+            // that sort alphabetically before the discriminator (e.g. `currency` or `status` before `type`).
+            let disc_entry = base_props
+                .iter()
+                .find(|(_, v)| v.get("not").and_then(|n| n.get("enum")).is_some())
+                .or_else(|| {
+                    // Fall back to matching an enum property across branch definitions for partial enum unions.
+                    base_props.iter().find(|(k, v)| {
+                        v.get("enum").is_some()
+                            && branches.iter().any(|b| {
+                                local_def_ref(b)
+                                    .and_then(|r| defs.get(r))
+                                    .and_then(|s| s.get("properties"))
+                                    .and_then(|p| p.get(k.as_str()))
+                                    .and_then(extract_const_or_single_enum_str)
+                                    .is_some()
+                            })
+                    })
+                })
+                .or_else(|| base_props.iter().find(|(_, v)| v.get("enum").is_some()));
+            if let Some((disc_key, _)) = disc_entry {
                 out.insert(name.clone(), disc_key.clone());
                 continue;
             }
@@ -1756,9 +1786,13 @@ mod tests {
                         "shared_id": { "type": "string" }
                     }
                 }),
+                vec![json!({
+                    "description": "non-variant closed union validation",
+                    "not": { "required": ["forbidden_field"] }
+                })],
             ),
         )]);
-        register_extended_subtypes(&mut defs, &lowered_unions);
+        register_extended_subtypes(&mut defs, &lowered_unions, &BTreeSet::new());
 
         // LockerDestination flattened properties, kept anyOf branch, and stripped inlined pattern
         assert_eq!(
@@ -1807,8 +1841,15 @@ mod tests {
             json!(["business_location", "shipping_address", "locker"])
         );
 
-        // ClosedC inherited shared_id from pre-lowered ClosedUnion template
+        // ClosedC inherited shared_id and non-variant allOf branches from pre-lowered ClosedUnion template
         assert_eq!(defs["ClosedC"]["properties"]["shared_id"]["type"], "string");
+        assert_eq!(
+            defs["ClosedC"]["allOf"],
+            json!([{
+                "description": "non-variant closed union validation",
+                "not": { "required": ["forbidden_field"] }
+            }])
+        );
         assert_eq!(defs["ClosedUnion"]["anyOf"].as_array().unwrap().len(), 3);
         assert_eq!(
             collect_lowered_union_discriminators(&defs).get("ClosedUnion"),
@@ -1843,5 +1884,136 @@ mod tests {
         // Non-union PaymentInstrument is untouched
         assert!(defs["PaymentInstrument"].get("anyOf").is_none());
         assert!(!defs.contains_key("PaymentInstrumentBase"));
+    }
+
+    #[test]
+    fn collect_lowered_union_discriminators_prioritizes_not_enum_over_alphabetical_enums() {
+        let defs = BTreeMap::from([
+            (
+                "PaymentMethod".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/CardPayment" },
+                        { "$ref": "#/$defs/PaymentMethodBase" }
+                    ]
+                }),
+            ),
+            (
+                "PaymentMethodBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // "currency" sorts before "type" alphabetically and has an enum
+                        "currency": { "type": "string", "enum": ["USD", "EUR", "GBP"] },
+                        // "status" sorts before "type" alphabetically and has an enum
+                        "status": { "type": "string", "enum": ["active", "suspended"] },
+                        // "type" is the actual open union discriminator with not.enum
+                        "type": { "type": "string", "not": { "enum": ["card"] } }
+                    }
+                }),
+            ),
+            (
+                "CardPayment".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "card" },
+                        "currency": { "type": "string" },
+                        "status": { "type": "string" }
+                    }
+                }),
+            ),
+        ]);
+
+        let discriminators = collect_lowered_union_discriminators(&defs);
+        assert_eq!(
+            discriminators.get("PaymentMethod"),
+            Some(&"type".to_string()),
+            "Discriminator detection must select 'type' (not.enum) rather than preceding 'currency' or 'status' enums"
+        );
+    }
+
+    #[test]
+    fn synthesize_directional_subtype_slices_respects_sliced_base_names() {
+        let mut defs = BTreeMap::from([
+            (
+                "ParentUnion".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantA" },
+                        { "$ref": "#/$defs/ParentUnionBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionCreateRequest".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantACreateRequest" },
+                        { "$ref": "#/$defs/ParentUnionCreateRequestBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionCompleteRequest".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantACompleteRequest" },
+                        { "$ref": "#/$defs/ParentUnionCompleteRequestBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "ParentUnionCreateRequestBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "ParentUnionCompleteRequestBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "AnnotatedSubtype".to_string(),
+                json!({
+                    "allOf": [{ "$ref": "#/$defs/ParentUnion" }],
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "annotated" },
+                        "response_only_id": { "type": "string" }
+                    }
+                }),
+            ),
+            (
+                "AnnotatedSubtypeCreateRequest".to_string(),
+                json!({
+                    "allOf": [{ "$ref": "#/$defs/ParentUnionCreateRequest" }],
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "annotated" }
+                    }
+                }),
+            ),
+        ]);
+
+        let sliced_base_names = BTreeSet::from(["AnnotatedSubtype".to_string()]);
+        let lowered_unions = BTreeMap::new();
+        register_extended_subtypes(&mut defs, &lowered_unions, &sliced_base_names);
+
+        assert!(
+            !defs.contains_key("AnnotatedSubtypeCompleteRequest"),
+            "Subtype in sliced_base_names must not synthesize missing CompleteRequest from response schema"
+        );
     }
 }
