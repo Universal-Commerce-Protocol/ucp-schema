@@ -447,6 +447,14 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         complete_ap2_allof[0]["$ref"],
         "#/$defs/Ap2WithCheckoutMandateCompleteRequest"
     );
+    assert_eq!(
+        bundle.defs["CheckoutCompleteRequest"]["required"],
+        serde_json::json!(["payment"])
+    );
+    assert_eq!(
+        bundle.defs["Ap2WithCheckoutMandateCompleteRequest"]["required"],
+        serde_json::json!(["checkout_mandate"])
+    );
 }
 
 #[test]
@@ -1870,12 +1878,13 @@ fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
         })
     );
 
-    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument
+    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument, LookupLocation
     for def_name in [
         "ShippingDestination",
         "ShippingDestinationCreateRequest",
         "LocationDestination",
         "CardPaymentInstrument",
+        "LookupLocation",
         "UcpPlatformSchema",
     ] {
         assert!(
@@ -2028,4 +2037,275 @@ fn open_union_lowering_on_ucp_corpus_enforces_ou1_through_ou4() {
     assert!(bundle.defs["PolicyBase"]["properties"]["type"]
         .get("pattern")
         .is_some());
+}
+
+#[test]
+fn extended_subtypes_discovery_and_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("shipping_destination.json"),
+        &serde_json::json!({
+            "title": "Shipping Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string", "const": "shipping_address" },
+                "street_address": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("location_destination.json"),
+        &serde_json::json!({
+            "title": "Location Destination",
+            "type": "object",
+            "required": ["id", "type", "name"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string", "const": "business_location" },
+                "name": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("fulfillment_destination.json"),
+        &serde_json::json!({
+            "title": "Fulfillment Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "shipping_address" } } },
+                    "then": { "$ref": "shipping_destination.json" }
+                },
+                {
+                    "if": { "properties": { "type": { "const": "business_location" } } },
+                    "then": { "$ref": "location_destination.json" }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("locker_destination.json"),
+        &serde_json::json!({
+            "title": "Locker Destination",
+            "allOf": [
+                { "$ref": "fulfillment_destination.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "locker_code"],
+                    "properties": {
+                        "type": { "type": "string", "const": "locker" },
+                        "locker_code": { "type": "string" },
+                        "compartment": {
+                            "type": "object",
+                            "properties": {
+                                "size": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("checkout.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.checkout",
+            "title": "Checkout",
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "destination": { "$ref": "types/fulfillment_destination.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    assert!(bundle.defs["LockerDestination"].get("allOf").is_none());
+    assert_eq!(bundle.defs["LockerDestination"]["type"], "object");
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["id"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["locker_code"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["compartment"]["title"],
+        "LockerDestinationCompartment"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["type"]["const"],
+        "locker"
+    );
+    assert!(bundle.defs["LockerDestination"]["properties"]["type"]
+        .get("default")
+        .is_none());
+
+    let dest_anyof = bundle.defs["FulfillmentDestination"]["anyOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(dest_anyof.len(), 4);
+    assert_eq!(dest_anyof[0]["$ref"], "#/$defs/LocationDestination");
+    assert_eq!(dest_anyof[1]["$ref"], "#/$defs/ShippingDestination");
+    assert_eq!(dest_anyof[2]["$ref"], "#/$defs/LockerDestination");
+    assert_eq!(dest_anyof[3]["$ref"], "#/$defs/FulfillmentDestinationBase");
+
+    assert_eq!(
+        bundle.defs["FulfillmentDestinationBase"]["properties"]["type"]["not"]["enum"],
+        serde_json::json!(["business_location", "shipping_address", "locker"])
+    );
+
+    // Directional request slice synthesized for LockerDestination (which has no local ucp_request keys)
+    assert!(bundle.defs.contains_key("LockerDestinationCreateRequest"));
+    assert!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]
+            .get("id")
+            .is_none(),
+        "LockerDestinationCreateRequest must inherit parent slice where id is omitted"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]["locker_code"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]["compartment"]["title"],
+        "LockerDestinationCreateRequestCompartment"
+    );
+    let create_dest_anyof = bundle.defs["FulfillmentDestinationCreateRequest"]["anyOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(create_dest_anyof.len(), 4);
+    assert_eq!(
+        create_dest_anyof[2]["$ref"],
+        "#/$defs/LockerDestinationCreateRequest"
+    );
+    assert_eq!(
+        bundle.defs["FulfillmentDestinationCreateRequestBase"]["properties"]["type"]["not"]["enum"],
+        serde_json::json!(["business_location", "shipping_address", "locker"])
+    );
+
+    if let Some(schema_dir) = ucp_schemas_dir() {
+        let corpus_bundle =
+            generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+        assert_bundle_invariants(&corpus_bundle.defs);
+        let policy_anyof = corpus_bundle.defs["Policy"]["anyOf"].as_array().unwrap();
+        assert_eq!(policy_anyof.len(), 2);
+        assert_eq!(policy_anyof[0]["$ref"], "#/$defs/CancellationItem");
+        assert_eq!(policy_anyof[1]["$ref"], "#/$defs/PolicyBase");
+        assert_eq!(
+            corpus_bundle.defs["PolicyBase"]["properties"]["type"]["not"]["enum"],
+            serde_json::json!(["dev.ucp.lodging.policy.cancellation"])
+        );
+    }
+}
+
+#[test]
+fn extended_subtypes_preserves_non_variant_branches_on_closed_unions() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("closed_variant_a.json"),
+        &serde_json::json!({
+            "title": "Closed Variant A",
+            "type": "object",
+            "required": ["type", "a_field"],
+            "properties": {
+                "type": { "type": "string", "const": "a" },
+                "a_field": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("closed_union.json"),
+        &serde_json::json!({
+            "title": "Closed Union",
+            "type": "object",
+            "required": ["type", "shared_field"],
+            "properties": {
+                "type": { "type": "string", "enum": ["a", "b"] },
+                "shared_field": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "a" } } },
+                    "then": { "$ref": "closed_variant_a.json" }
+                },
+                {
+                    "description": "non-variant validation branch",
+                    "not": { "required": ["forbidden_key"] }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("extended_b.json"),
+        &serde_json::json!({
+            "title": "Extended B",
+            "allOf": [
+                { "$ref": "closed_union.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "b_field"],
+                    "properties": {
+                        "type": { "type": "string", "const": "b" },
+                        "b_field": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("service.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.service",
+            "title": "Service",
+            "type": "object",
+            "properties": {
+                "item": { "$ref": "types/closed_union.json" },
+                "b_item": { "$ref": "types/extended_b.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    let ext_b = &bundle.defs["ExtendedB"];
+    assert_eq!(ext_b["properties"]["shared_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["b_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["type"]["const"], "b");
+
+    // Verify non-variant validation branch was preserved on ExtendedB
+    let all_of = ext_b["allOf"].as_array().expect("ExtendedB has allOf");
+    assert!(
+        all_of
+            .iter()
+            .any(|branch| branch.get("description").and_then(Value::as_str)
+                == Some("non-variant validation branch")),
+        "ExtendedB must preserve non-variant allOf branches from ClosedUnion"
+    );
 }

@@ -7,7 +7,9 @@ use serde_json::{json, Map, Value};
 
 use crate::codegen::hoist::insert_sliced_or_normalized_def;
 use crate::codegen::local_def_ref;
-use crate::codegen::normalizer::{merge_schema_property, to_pascal_case};
+use crate::codegen::normalizer::{
+    align_directional_refs, merge_schema_property, to_pascal_case, update_request_slice_metadata,
+};
 use crate::codegen::CodegenError;
 use crate::types::UCP_ANNOTATIONS;
 
@@ -346,7 +348,10 @@ type ConditionalUnionBranches = (String, Vec<(String, String)>, Vec<Value>);
 /// - For fully-covered closed discriminators, emits `anyOf` of the variant `$ref`s without `<ParentName>Base`.
 /// - Strips `"default"` from the discriminator property on both variants and `<ParentName>Base`
 ///   (invariant `OU-4`) and never emits the OpenAPI `"discriminator"` keyword (invariant `OU-3`).
-pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
+pub fn lower_conditional_unions(
+    defs: &mut BTreeMap<String, Value>,
+) -> BTreeMap<String, (String, Value, Vec<Value>)> {
+    let mut lowered_unions = BTreeMap::new();
     let parent_names: Vec<String> = defs.keys().cloned().collect();
     for parent_name in parent_names {
         let Some(parent_schema) = defs.get(&parent_name).cloned() else {
@@ -357,6 +362,14 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
         else {
             continue;
         };
+        lowered_unions.insert(
+            parent_name.clone(),
+            (
+                disc_prop.clone(),
+                parent_schema.clone(),
+                non_variant_branches.clone(),
+            ),
+        );
 
         for (tag_val, variant_name) in &variants {
             let Some(variant_schema) = defs.get_mut(variant_name) else {
@@ -421,6 +434,7 @@ pub fn lower_conditional_unions(defs: &mut BTreeMap<String, Value>) {
         }
         parent_obj.insert("anyOf".to_string(), Value::Array(any_of_refs));
     }
+    lowered_unions
 }
 
 fn extract_conditional_union_branches(parent_schema: &Value) -> Option<ConditionalUnionBranches> {
@@ -703,6 +717,414 @@ fn build_union_base_schema(
     }
 
     base_schema
+}
+
+/// Discover decentralized subtype schemas in `defs` whose `allOf` references a lowered union
+/// `<ParentUnion>` and defines a `const` (or single-value `enum`) tag on its discriminator property.
+///
+/// - When an unsuffixed decentralized subtype without local directional annotations extends a
+///   directionally-sliced union (`<ParentUnion>CreateRequest`, `<ParentUnion>UpdateRequest`,
+///   `<ParentUnion>CompleteRequest`), synthesizes corresponding directional subtype slices.
+/// - Merges `<ParentUnion>Base` (or `<ParentUnion>`) properties, `required`, `dependentRequired`,
+///   and object constraints into the subtype, removes `{"$ref": "#/$defs/<ParentUnion>"}` from `allOf`,
+///   and strips `"default"` from the subtype's discriminator property.
+/// - Updates `<ParentUnion>Base.properties.<disc>` (`not.enum` for open string unions, or `enum`
+///   for partially-covered enum unions, removing `<ParentUnion>Base` if all enum tags become covered),
+///   and inserts `{"$ref": "#/$defs/<Subtype>"}` into `<ParentUnion>.anyOf` immediately before
+///   any trailing `{"$ref": "#/$defs/<ParentUnion>Base"}` entry.
+pub fn register_extended_subtypes(
+    defs: &mut BTreeMap<String, Value>,
+    lowered_unions: &BTreeMap<String, (String, Value, Vec<Value>)>,
+    sliced_base_names: &BTreeSet<String>,
+) {
+    let mut union_discriminators = collect_lowered_union_discriminators(defs);
+    for (name, (disc, _, _)) in lowered_unions {
+        union_discriminators.insert(name.clone(), disc.clone());
+    }
+    if union_discriminators.is_empty() {
+        return;
+    }
+
+    synthesize_directional_subtype_slices(defs, &union_discriminators, sliced_base_names);
+
+    let def_names: Vec<String> = defs.keys().cloned().collect();
+    for subtype_name in def_names {
+        if union_discriminators.contains_key(&subtype_name) || subtype_name.ends_with("Base") {
+            continue;
+        }
+        let Some(subtype_snapshot) = defs.get(&subtype_name).cloned() else {
+            continue;
+        };
+        let Some((parent_union, disc_prop, tag_val)) =
+            find_extended_union_parent(&subtype_snapshot, &union_discriminators)
+        else {
+            continue;
+        };
+
+        let base_def_name = format!("{parent_union}Base");
+        let base_from_union_base = defs.get(&base_def_name).cloned();
+        let Some(base_template) = base_from_union_base
+            .clone()
+            .or_else(|| {
+                lowered_unions
+                    .get(&parent_union)
+                    .map(|(_, schema, _)| schema.clone())
+            })
+            .or_else(|| defs.get(&parent_union).cloned())
+        else {
+            continue;
+        };
+        let non_variant_branches: Vec<Value> = base_from_union_base
+            .as_ref()
+            .and_then(|b| b.get("allOf"))
+            .and_then(Value::as_array)
+            .cloned()
+            .or_else(|| {
+                lowered_unions
+                    .get(&parent_union)
+                    .map(|(_, _, branches)| branches.clone())
+            })
+            .or_else(|| {
+                extract_conditional_union_branches(&base_template).map(|(_, _, branches)| branches)
+            })
+            .unwrap_or_default();
+
+        if let Some(subtype_schema) = defs.get_mut(&subtype_name) {
+            fold_inline_allof_branches_into_subtype(subtype_schema);
+            inherit_parent_into_union_variant(
+                subtype_schema,
+                &base_template,
+                &parent_union,
+                &disc_prop,
+                &tag_val,
+                &non_variant_branches,
+            );
+        }
+
+        let remove_exhausted_base =
+            update_union_base_discriminator(defs, &base_def_name, &disc_prop, &tag_val);
+        if remove_exhausted_base {
+            defs.remove(&base_def_name);
+        }
+
+        let Some(union_obj) = defs.get_mut(&parent_union).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        let union_key = if union_obj.contains_key("anyOf") {
+            "anyOf"
+        } else {
+            "oneOf"
+        };
+        let Some(branches) = union_obj.get_mut(union_key).and_then(Value::as_array_mut) else {
+            continue;
+        };
+        let base_ref_str = format!("#/$defs/{base_def_name}");
+        if remove_exhausted_base {
+            branches
+                .retain(|entry| entry.get("$ref").and_then(Value::as_str) != Some(&base_ref_str));
+        }
+        let subtype_ref = json!({ "$ref": format!("#/$defs/{subtype_name}") });
+        if branches.contains(&subtype_ref) {
+            continue;
+        }
+        if let Some(base_pos) = branches
+            .iter()
+            .position(|entry| entry.get("$ref").and_then(Value::as_str) == Some(&base_ref_str))
+        {
+            branches.insert(base_pos, subtype_ref);
+        } else {
+            branches.push(subtype_ref);
+        }
+    }
+}
+
+fn synthesize_directional_subtype_slices(
+    defs: &mut BTreeMap<String, Value>,
+    union_discriminators: &BTreeMap<String, String>,
+    sliced_base_names: &BTreeSet<String>,
+) {
+    const DIRECTIONAL_OPS: [(&str, &str); 3] = [
+        ("create", "CreateRequest"),
+        ("update", "UpdateRequest"),
+        ("complete", "CompleteRequest"),
+    ];
+    let mut known_defs: BTreeSet<String> = defs.keys().cloned().collect();
+    let mut pending = Vec::new();
+
+    for (subtype_name, subtype_schema) in defs.iter() {
+        if union_discriminators.contains_key(subtype_name)
+            || subtype_name.ends_with("Base")
+            || DIRECTIONAL_OPS
+                .iter()
+                .any(|(_, s)| subtype_name.ends_with(s))
+            || sliced_base_names.contains(subtype_name)
+            || DIRECTIONAL_OPS
+                .iter()
+                .any(|(_, s)| defs.contains_key(&format!("{subtype_name}{s}")))
+        {
+            continue;
+        }
+        let Some((parent_union, _, _)) =
+            find_extended_union_parent(subtype_schema, union_discriminators)
+        else {
+            continue;
+        };
+        if DIRECTIONAL_OPS
+            .iter()
+            .any(|(_, s)| parent_union.ends_with(s))
+        {
+            continue;
+        }
+        for (op, suffix) in DIRECTIONAL_OPS {
+            let sliced_parent = format!("{parent_union}{suffix}");
+            let sliced_subtype = format!("{subtype_name}{suffix}");
+            if !union_discriminators.contains_key(&sliced_parent)
+                || defs.contains_key(&sliced_subtype)
+            {
+                continue;
+            }
+            known_defs.insert(sliced_subtype.clone());
+            pending.push((
+                sliced_subtype,
+                subtype_name.clone(),
+                parent_union.clone(),
+                sliced_parent,
+                op,
+                suffix,
+                subtype_schema.clone(),
+            ));
+        }
+    }
+
+    for (sliced_subtype, subtype_name, parent_union, sliced_parent, op, suffix, mut slice_schema) in
+        pending
+    {
+        update_request_slice_metadata(&mut slice_schema, &sliced_subtype, &subtype_name, op);
+        if let Some(Value::Array(all_of)) = slice_schema
+            .as_object_mut()
+            .and_then(|o| o.get_mut("allOf"))
+        {
+            for branch in all_of {
+                if local_def_ref(branch) == Some(parent_union.as_str()) {
+                    *branch = json!({ "$ref": format!("#/$defs/{sliced_parent}") });
+                }
+            }
+        }
+        align_directional_refs(&mut slice_schema, suffix, &known_defs);
+        defs.insert(sliced_subtype, slice_schema);
+    }
+}
+
+fn update_union_base_discriminator(
+    defs: &mut BTreeMap<String, Value>,
+    base_def_name: &str,
+    disc_prop: &str,
+    tag_val: &str,
+) -> bool {
+    let Some(disc_obj) = defs
+        .get_mut(base_def_name)
+        .and_then(|b| b.get_mut("properties"))
+        .and_then(|p| p.get_mut(disc_prop))
+        .and_then(Value::as_object_mut)
+    else {
+        return false;
+    };
+    let tag_json = Value::String(tag_val.to_string());
+    if let Some(not_enum_arr) = disc_obj
+        .get_mut("not")
+        .and_then(|n| n.get_mut("enum"))
+        .and_then(Value::as_array_mut)
+    {
+        if !not_enum_arr.contains(&tag_json) {
+            not_enum_arr.push(tag_json);
+        }
+        return false;
+    }
+    if let Some(enum_arr) = disc_obj.get_mut("enum").and_then(Value::as_array_mut) {
+        enum_arr.retain(|v| v != &tag_json);
+        return enum_arr.is_empty();
+    }
+    false
+}
+
+fn collect_lowered_union_discriminators(
+    defs: &BTreeMap<String, Value>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for (name, schema) in defs {
+        let Some(branches) = schema
+            .get("anyOf")
+            .or_else(|| schema.get("oneOf"))
+            .and_then(Value::as_array)
+        else {
+            continue;
+        };
+        if branches.is_empty() {
+            continue;
+        }
+        if let Some(base_props) = defs
+            .get(&format!("{name}Base"))
+            .and_then(|b| b.get("properties"))
+            .and_then(Value::as_object)
+        {
+            // Prioritize `not.enum` for open string union discriminators over ordinary enum properties
+            // that sort alphabetically before the discriminator (e.g. `currency` or `status` before `type`).
+            let disc_entry = base_props
+                .iter()
+                .find(|(_, v)| v.get("not").and_then(|n| n.get("enum")).is_some())
+                .or_else(|| {
+                    // Fall back to matching an enum property across branch definitions for partial enum unions.
+                    base_props.iter().find(|(k, v)| {
+                        v.get("enum").is_some()
+                            && branches.iter().any(|b| {
+                                local_def_ref(b)
+                                    .and_then(|r| defs.get(r))
+                                    .and_then(|s| s.get("properties"))
+                                    .and_then(|p| p.get(k.as_str()))
+                                    .and_then(extract_const_or_single_enum_str)
+                                    .is_some()
+                            })
+                    })
+                })
+                .or_else(|| base_props.iter().find(|(_, v)| v.get("enum").is_some()));
+            if let Some((disc_key, _)) = disc_entry {
+                out.insert(name.clone(), disc_key.clone());
+                continue;
+            }
+        }
+        let ref_targets: Vec<&Map<String, Value>> = branches
+            .iter()
+            .filter_map(local_def_ref)
+            .filter_map(|v| defs.get(v)?.get("properties")?.as_object())
+            .collect();
+        if ref_targets.len() != branches.len() {
+            continue;
+        }
+        let mut shared = ref_targets[0]
+            .iter()
+            .filter(|(_, v)| extract_const_or_single_enum_str(v).is_some())
+            .map(|(k, _)| k)
+            .filter(|&k| {
+                ref_targets[1..].iter().all(|props| {
+                    props
+                        .get(k)
+                        .and_then(extract_const_or_single_enum_str)
+                        .is_some()
+                })
+            });
+        if let (Some(disc_key), None) = (shared.next(), shared.next()) {
+            out.insert(name.clone(), disc_key.clone());
+        }
+    }
+    out
+}
+
+fn find_extended_union_parent(
+    subtype_schema: &Value,
+    union_discriminators: &BTreeMap<String, String>,
+) -> Option<(String, String, String)> {
+    let all_of = subtype_schema.get("allOf")?.as_array()?;
+    let parent_union = all_of
+        .iter()
+        .filter_map(local_def_ref)
+        .find(|target| union_discriminators.contains_key(*target))?;
+    let disc_prop = union_discriminators.get(parent_union)?.clone();
+
+    let top_tag = subtype_schema
+        .get("properties")
+        .and_then(|p| p.get(&disc_prop))
+        .and_then(extract_const_or_single_enum_str);
+    let inline_tag = all_of.iter().find_map(|branch| {
+        branch
+            .get("properties")
+            .and_then(|p| p.get(&disc_prop))
+            .and_then(extract_const_or_single_enum_str)
+    });
+    let tag_val = top_tag.or(inline_tag)?;
+    Some((parent_union.to_string(), disc_prop, tag_val))
+}
+
+fn fold_inline_allof_branches_into_subtype(subtype_schema: &mut Value) {
+    let Some(obj) = subtype_schema.as_object_mut() else {
+        return;
+    };
+    let Some(all_of) = obj.get("allOf").and_then(Value::as_array).cloned() else {
+        return;
+    };
+    let mut kept = Vec::new();
+    for branch in all_of {
+        let Some(branch_obj) = branch.as_object() else {
+            kept.push(branch);
+            continue;
+        };
+        if [
+            "$ref", "if", "then", "else", "anyOf", "oneOf", "allOf", "not", "contains",
+        ]
+        .iter()
+        .any(|k| branch_obj.contains_key(*k))
+        {
+            kept.push(branch);
+            continue;
+        }
+        if let Some(Value::Object(branch_props)) = branch_obj.get("properties") {
+            let props_map = obj
+                .entry("properties".to_string())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("properties is an object");
+            for (k, v) in branch_props {
+                let Some(existing) = props_map.get_mut(k) else {
+                    props_map.insert(k.clone(), v.clone());
+                    continue;
+                };
+                merge_schema_property(existing, v);
+            }
+        }
+        if let Some(Value::Array(branch_reqs)) = branch_obj.get("required") {
+            let req_arr = obj
+                .entry("required".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()))
+                .as_array_mut()
+                .expect("required is an array");
+            for req in branch_reqs {
+                if !req_arr.contains(req) {
+                    req_arr.push(req.clone());
+                }
+            }
+        }
+        if let Some(Value::Object(branch_dep)) = branch_obj.get("dependentRequired") {
+            let dep_map = obj
+                .entry("dependentRequired".to_string())
+                .or_insert_with(|| Value::Object(Map::new()))
+                .as_object_mut()
+                .expect("dependentRequired is an object");
+            for (trigger, deps_val) in branch_dep {
+                let Some(deps_arr) = deps_val.as_array() else {
+                    continue;
+                };
+                let target_arr = dep_map
+                    .entry(trigger.clone())
+                    .or_insert_with(|| Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .expect("dependentRequired value is an array");
+                for dep in deps_arr {
+                    if !target_arr.contains(dep) {
+                        target_arr.push(dep.clone());
+                    }
+                }
+            }
+        }
+        for key in ["minProperties", "maxProperties", "propertyNames"] {
+            if let Some(val) = branch_obj.get(key) {
+                obj.insert(key.to_string(), val.clone());
+            }
+        }
+    }
+    if kept.is_empty() {
+        obj.remove("allOf");
+    } else {
+        obj.insert("allOf".to_string(), Value::Array(kept));
+    }
 }
 
 #[cfg(test)]
@@ -1099,6 +1521,499 @@ mod tests {
         assert_eq!(
             defs["PartialEnumUnionBase"]["allOf"],
             json!([scalar_constraint])
+        );
+    }
+
+    #[test]
+    fn register_extended_subtypes_discovers_and_registers_decentralized_variants() {
+        let mut defs = BTreeMap::from([
+            (
+                "FulfillmentDestination".to_string(),
+                json!({
+                    "title": "FulfillmentDestination",
+                    "anyOf": [
+                        { "$ref": "#/$defs/LocationDestination" },
+                        { "$ref": "#/$defs/ShippingDestination" },
+                        { "$ref": "#/$defs/FulfillmentDestinationBase" }
+                    ]
+                }),
+            ),
+            (
+                "FulfillmentDestinationBase".to_string(),
+                json!({
+                    "title": "FulfillmentDestinationBase",
+                    "type": "object",
+                    "required": ["type", "id"],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "pattern": "^[a-z0-9._-]+$",
+                            "not": { "enum": ["business_location", "shipping_address"] }
+                        },
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "FulfillmentDestinationCreateRequest".to_string(),
+                json!({
+                    "title": "FulfillmentDestinationCreateRequest",
+                    "anyOf": [
+                        { "$ref": "#/$defs/LocationDestinationCreateRequest" },
+                        { "$ref": "#/$defs/ShippingDestinationCreateRequest" },
+                        { "$ref": "#/$defs/FulfillmentDestinationCreateRequestBase" }
+                    ]
+                }),
+            ),
+            (
+                "FulfillmentDestinationCreateRequestBase".to_string(),
+                json!({
+                    "title": "FulfillmentDestinationCreateRequestBase",
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": {
+                            "type": "string",
+                            "not": { "enum": ["business_location", "shipping_address"] }
+                        }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "ShippingDestination".to_string(),
+                json!({
+                    "title": "ShippingDestination",
+                    "type": "object",
+                    "required": ["type", "id"],
+                    "properties": {
+                        "type": { "type": "string", "const": "shipping_address" },
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "ShippingDestinationCreateRequest".to_string(),
+                json!({
+                    "title": "ShippingDestinationCreateRequest",
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "shipping_address" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "LocationDestination".to_string(),
+                json!({
+                    "title": "LocationDestination",
+                    "type": "object",
+                    "required": ["type", "id", "name"],
+                    "properties": {
+                        "type": { "type": "string", "const": "business_location" },
+                        "id": { "type": "string" },
+                        "name": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "LocationDestinationCreateRequest".to_string(),
+                json!({
+                    "title": "LocationDestinationCreateRequest",
+                    "type": "object",
+                    "required": ["type", "name"],
+                    "properties": {
+                        "type": { "type": "string", "const": "business_location" },
+                        "name": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "LockerDestination".to_string(),
+                json!({
+                    "title": "LockerDestination",
+                    "description": "Locker pickup destination.",
+                    "allOf": [
+                        { "$ref": "#/$defs/FulfillmentDestination" },
+                        {
+                            "type": "object",
+                            "required": ["type", "locker_code"],
+                            "dependentRequired": { "locker_code": ["pin"] },
+                            "properties": {
+                                "type": {
+                                    "type": "string",
+                                    "const": "locker",
+                                    "default": "locker"
+                                },
+                                "locker_code": { "type": "string" },
+                                "pin": { "type": "string" }
+                            }
+                        },
+                        {
+                            "anyOf": [
+                                { "required": ["locker_code"] },
+                                { "required": ["pin"] }
+                            ]
+                        }
+                    ]
+                }),
+            ),
+            (
+                "ClosedUnion".to_string(),
+                json!({
+                    "title": "ClosedUnion",
+                    "anyOf": [
+                        { "$ref": "#/$defs/ClosedA" },
+                        { "$ref": "#/$defs/ClosedB" }
+                    ]
+                }),
+            ),
+            (
+                "ClosedA".to_string(),
+                json!({
+                    "title": "ClosedA",
+                    "type": "object",
+                    "properties": {
+                        "api_version": { "type": "string", "const": "1.0" },
+                        "kind": { "type": "string", "const": "a" }
+                    }
+                }),
+            ),
+            (
+                "ClosedB".to_string(),
+                json!({
+                    "title": "ClosedB",
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "b" }
+                    }
+                }),
+            ),
+            (
+                "ClosedC".to_string(),
+                json!({
+                    "title": "ClosedC",
+                    "allOf": [{ "$ref": "#/$defs/ClosedUnion" }],
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "c" }
+                    }
+                }),
+            ),
+            (
+                "PartialEnumUnion".to_string(),
+                json!({
+                    "title": "PartialEnumUnion",
+                    "anyOf": [
+                        { "$ref": "#/$defs/PartialA" },
+                        { "$ref": "#/$defs/PartialEnumUnionBase" }
+                    ]
+                }),
+            ),
+            (
+                "PartialEnumUnionBase".to_string(),
+                json!({
+                    "title": "PartialEnumUnionBase",
+                    "type": "object",
+                    "required": ["kind"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["b"] },
+                        "shared": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "PartialA".to_string(),
+                json!({
+                    "title": "PartialA",
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "a" }
+                    }
+                }),
+            ),
+            (
+                "PartialB".to_string(),
+                json!({
+                    "title": "PartialB",
+                    "allOf": [{ "$ref": "#/$defs/PartialEnumUnion" }],
+                    "type": "object",
+                    "properties": {
+                        "kind": { "type": "string", "const": "b" }
+                    }
+                }),
+            ),
+            (
+                "PaymentInstrument".to_string(),
+                json!({
+                    "title": "PaymentInstrument",
+                    "type": "object",
+                    "required": ["id", "type"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "type": { "type": "string" }
+                    }
+                }),
+            ),
+            (
+                "CardPaymentInstrument".to_string(),
+                json!({
+                    "title": "CardPaymentInstrument",
+                    "allOf": [{ "$ref": "#/$defs/PaymentInstrument" }],
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "card" }
+                    }
+                }),
+            ),
+        ]);
+
+        let lowered_unions = BTreeMap::from([(
+            "ClosedUnion".to_string(),
+            (
+                "kind".to_string(),
+                json!({
+                    "type": "object",
+                    "required": ["kind", "shared_id"],
+                    "properties": {
+                        "kind": { "type": "string", "enum": ["a", "b", "c"] },
+                        "shared_id": { "type": "string" }
+                    }
+                }),
+                vec![json!({
+                    "description": "non-variant closed union validation",
+                    "not": { "required": ["forbidden_field"] }
+                })],
+            ),
+        )]);
+        register_extended_subtypes(&mut defs, &lowered_unions, &BTreeSet::new());
+
+        // LockerDestination flattened properties, kept anyOf branch, and stripped inlined pattern
+        assert_eq!(
+            defs["LockerDestination"]["allOf"].as_array().unwrap().len(),
+            1
+        );
+        assert!(defs["LockerDestination"]["allOf"][0].get("anyOf").is_some());
+        assert_eq!(
+            defs["LockerDestination"]["dependentRequired"]["locker_code"],
+            json!(["pin"])
+        );
+        assert_eq!(defs["LockerDestination"]["type"], "object");
+        assert_eq!(
+            defs["LockerDestination"]["properties"]["id"]["type"],
+            "string"
+        );
+        assert_eq!(
+            defs["LockerDestination"]["properties"]["locker_code"]["type"],
+            "string"
+        );
+        assert_eq!(
+            defs["LockerDestination"]["properties"]["type"]["const"],
+            "locker"
+        );
+        assert!(defs["LockerDestination"]["properties"]["type"]
+            .get("default")
+            .is_none());
+        assert!(defs["LockerDestination"]["properties"]["type"]
+            .get("not")
+            .is_none());
+        assert!(defs["LockerDestination"]["properties"]["type"]
+            .get("pattern")
+            .is_none());
+
+        // Directional subtype slice synthesized and registered into FulfillmentDestinationCreateRequest
+        assert!(defs.contains_key("LockerDestinationCreateRequest"));
+        assert!(defs["LockerDestinationCreateRequest"]["properties"]
+            .get("id")
+            .is_none());
+        assert_eq!(
+            defs["LockerDestinationCreateRequest"]["properties"]["locker_code"]["type"],
+            "string"
+        );
+        assert_eq!(
+            defs["FulfillmentDestinationCreateRequestBase"]["properties"]["type"]["not"]["enum"],
+            json!(["business_location", "shipping_address", "locker"])
+        );
+
+        // ClosedC inherited shared_id and non-variant allOf branches from pre-lowered ClosedUnion template
+        assert_eq!(defs["ClosedC"]["properties"]["shared_id"]["type"], "string");
+        assert_eq!(
+            defs["ClosedC"]["allOf"],
+            json!([{
+                "description": "non-variant closed union validation",
+                "not": { "required": ["forbidden_field"] }
+            }])
+        );
+        assert_eq!(defs["ClosedUnion"]["anyOf"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            collect_lowered_union_discriminators(&defs).get("ClosedUnion"),
+            Some(&"kind".to_string())
+        );
+
+        // PartialB covered the final remaining enum value on PartialEnumUnionBase, removing Base
+        assert_eq!(defs["PartialB"]["properties"]["shared"]["type"], "string");
+        assert!(!defs.contains_key("PartialEnumUnionBase"));
+        assert_eq!(
+            defs["PartialEnumUnion"]["anyOf"],
+            json!([
+                { "$ref": "#/$defs/PartialA" },
+                { "$ref": "#/$defs/PartialB" }
+            ])
+        );
+
+        // Registered into FulfillmentDestination.anyOf immediately before FulfillmentDestinationBase
+        let any_of = defs["FulfillmentDestination"]["anyOf"].as_array().unwrap();
+        assert_eq!(any_of.len(), 4);
+        assert_eq!(any_of[0]["$ref"], "#/$defs/LocationDestination");
+        assert_eq!(any_of[1]["$ref"], "#/$defs/ShippingDestination");
+        assert_eq!(any_of[2]["$ref"], "#/$defs/LockerDestination");
+        assert_eq!(any_of[3]["$ref"], "#/$defs/FulfillmentDestinationBase");
+
+        // Tag added to FulfillmentDestinationBase.properties.type.not.enum
+        assert_eq!(
+            defs["FulfillmentDestinationBase"]["properties"]["type"]["not"]["enum"],
+            json!(["business_location", "shipping_address", "locker"])
+        );
+
+        // Non-union PaymentInstrument is untouched
+        assert!(defs["PaymentInstrument"].get("anyOf").is_none());
+        assert!(!defs.contains_key("PaymentInstrumentBase"));
+    }
+
+    #[test]
+    fn collect_lowered_union_discriminators_prioritizes_not_enum_over_alphabetical_enums() {
+        let defs = BTreeMap::from([
+            (
+                "PaymentMethod".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/CardPayment" },
+                        { "$ref": "#/$defs/PaymentMethodBase" }
+                    ]
+                }),
+            ),
+            (
+                "PaymentMethodBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        // "currency" sorts before "type" alphabetically and has an enum
+                        "currency": { "type": "string", "enum": ["USD", "EUR", "GBP"] },
+                        // "status" sorts before "type" alphabetically and has an enum
+                        "status": { "type": "string", "enum": ["active", "suspended"] },
+                        // "type" is the actual open union discriminator with not.enum
+                        "type": { "type": "string", "not": { "enum": ["card"] } }
+                    }
+                }),
+            ),
+            (
+                "CardPayment".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "card" },
+                        "currency": { "type": "string" },
+                        "status": { "type": "string" }
+                    }
+                }),
+            ),
+        ]);
+
+        let discriminators = collect_lowered_union_discriminators(&defs);
+        assert_eq!(
+            discriminators.get("PaymentMethod"),
+            Some(&"type".to_string()),
+            "Discriminator detection must select 'type' (not.enum) rather than preceding 'currency' or 'status' enums"
+        );
+    }
+
+    #[test]
+    fn synthesize_directional_subtype_slices_respects_sliced_base_names() {
+        let mut defs = BTreeMap::from([
+            (
+                "ParentUnion".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantA" },
+                        { "$ref": "#/$defs/ParentUnionBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionCreateRequest".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantACreateRequest" },
+                        { "$ref": "#/$defs/ParentUnionCreateRequestBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionCompleteRequest".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/VariantACompleteRequest" },
+                        { "$ref": "#/$defs/ParentUnionCompleteRequestBase" }
+                    ]
+                }),
+            ),
+            (
+                "ParentUnionBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "ParentUnionCreateRequestBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "ParentUnionCompleteRequestBase".to_string(),
+                json!({
+                    "type": "object",
+                    "properties": { "type": { "type": "string", "not": { "enum": ["a"] } } }
+                }),
+            ),
+            (
+                "AnnotatedSubtype".to_string(),
+                json!({
+                    "allOf": [{ "$ref": "#/$defs/ParentUnion" }],
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "annotated" },
+                        "response_only_id": { "type": "string" }
+                    }
+                }),
+            ),
+            (
+                "AnnotatedSubtypeCreateRequest".to_string(),
+                json!({
+                    "allOf": [{ "$ref": "#/$defs/ParentUnionCreateRequest" }],
+                    "type": "object",
+                    "properties": {
+                        "type": { "type": "string", "const": "annotated" }
+                    }
+                }),
+            ),
+        ]);
+
+        let sliced_base_names = BTreeSet::from(["AnnotatedSubtype".to_string()]);
+        let lowered_unions = BTreeMap::new();
+        register_extended_subtypes(&mut defs, &lowered_unions, &sliced_base_names);
+
+        assert!(
+            !defs.contains_key("AnnotatedSubtypeCompleteRequest"),
+            "Subtype in sliced_base_names must not synthesize missing CompleteRequest from response schema"
         );
     }
 }
