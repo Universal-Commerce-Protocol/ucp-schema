@@ -336,7 +336,7 @@ fn check_refs(
             for (key, val) in map {
                 // These keywords hold JSON instance data, not child schemas.
                 // A business payload field named `$ref` should not be resolved.
-                if matches!(key.as_str(), "default" | "const" | "examples" | "enum") {
+                if INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
                     continue;
                 }
                 let child_path = pointer_path(path, key);
@@ -494,6 +494,19 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
                 if let Value::Object(schemas) = val {
                     for (name, schema) in schemas {
                         let schema_path = pointer_path(&child_path, name);
+                        if name.starts_with("ucp_") && !UCP_ANNOTATIONS.contains(&name.as_str()) {
+                            diagnostics.push(Diagnostic {
+                                severity: Severity::Warning,
+                                code: "W007".to_string(),
+                                file: file.to_path_buf(),
+                                path: schema_path.clone(),
+                                message: format!(
+                                    "{} is not a UCP annotation and has no effect; the ucp_ prefix is reserved (known: {})",
+                                    name,
+                                    UCP_ANNOTATIONS.join(", ")
+                                ),
+                            });
+                        }
                         check_annotations(schema, file, &schema_path, diagnostics);
                     }
                 }
@@ -1264,7 +1277,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(
             file,
-            r#"{{
+            r##"{{
             "$id": "https://example.com/test.json",
             "type": "object",
             "properties": {{
@@ -1282,7 +1295,7 @@ mod tests {
                     "$ref": "missing_defs_target.json"
                 }}
             }}
-        }}"#
+        }}"##
         )
         .unwrap();
 
