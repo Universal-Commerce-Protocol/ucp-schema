@@ -136,6 +136,14 @@ pub enum CodegenError {
         "REST service binding '{service}' in profile '{profile}' is missing required 'schema' URL"
     )]
     MissingServiceSchema { profile: String, service: String },
+    #[error(
+        "conflicting active OpenAPI route '{path}' declared by both '{first_service}' and '{second_service}' (use --service to scope to a single service)"
+    )]
+    ConflictingServicePath {
+        path: String,
+        first_service: String,
+        second_service: String,
+    },
 }
 
 impl CodegenError {
@@ -144,7 +152,9 @@ impl CodegenError {
         match self {
             Self::ResolveError(e) => e.exit_code(),
             Self::ComposeError(e) => e.exit_code(),
-            Self::NoRestServiceBinding { .. } | Self::MissingServiceSchema { .. } => 2,
+            Self::NoRestServiceBinding { .. }
+            | Self::MissingServiceSchema { .. }
+            | Self::ConflictingServicePath { .. } => 2,
         }
     }
 }
@@ -529,5 +539,12 @@ mod tests {
             service: "s".to_string(),
         };
         assert_eq!(missing_svc.exit_code(), 2);
+
+        let conflicting_path = CodegenError::ConflictingServicePath {
+            path: "/orders".to_string(),
+            first_service: "dev.ucp.shopping".to_string(),
+            second_service: "dev.vendor.orders".to_string(),
+        };
+        assert_eq!(conflicting_path.exit_code(), 2);
     }
 }

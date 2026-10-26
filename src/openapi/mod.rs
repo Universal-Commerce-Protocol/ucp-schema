@@ -75,12 +75,12 @@ struct TemplateSchemaBinding {
 struct MergedTemplates {
     openapi_version: String,
     info: Value,
-    fallback_servers: Option<Value>,
+    default_servers: Vec<Value>,
     paths: Map<String, Value>,
+    path_servers: BTreeMap<String, Vec<Value>>,
     webhooks: Map<String, Value>,
     parameters: Map<String, Value>,
     headers: Map<String, Value>,
-    template_schemas: Map<String, Value>,
 }
 
 /// Rewrite all local `#/$defs/<Name>` references in a JSON Schema or OpenAPI AST
@@ -120,23 +120,15 @@ pub fn rewrite_defs_to_component_schemas(value: &mut Value) {
 pub fn generate_openapi(options: &GenerateOpenApiOptions) -> Result<Value, CodegenError> {
     let parsed = parse_profile_source(&options.profile)?;
     let selected_services = select_rest_services(&options.profile, &parsed.rest_services, options)?;
-
-    let mut merged = load_and_merge_templates(&options.profile, &selected_services, &parsed)?;
     let compiled = compile_types(&GenerateTypesOptions::new().profile(&options.profile))?;
-    let bindings = parse_template_bindings(&merged.template_schemas);
 
-    prune_and_bind_route_map(
-        &mut merged.paths,
-        &bindings,
-        &compiled.active_capabilities,
-        &compiled.defs,
-    );
-    prune_and_bind_route_map(
-        &mut merged.webhooks,
-        &bindings,
-        &compiled.active_capabilities,
-        &compiled.defs,
-    );
+    let mut merged = load_bind_and_merge_templates(
+        &options.profile,
+        &selected_services,
+        &parsed,
+        &compiled,
+        options,
+    )?;
 
     let mut components_schemas = BTreeMap::new();
     for (name, mut schema_val) in compiled.defs {
@@ -158,7 +150,12 @@ pub fn generate_openapi(options: &GenerateOpenApiOptions) -> Result<Value, Codeg
         &mut components_schemas,
     );
 
-    let servers = build_servers_array(&selected_services, options, merged.fallback_servers);
+    let servers = resolve_root_and_path_servers(
+        &mut merged.paths,
+        &merged.path_servers,
+        merged.default_servers,
+        options,
+    );
     Ok(assemble_openapi_document(
         merged.openapi_version,
         merged.info,
@@ -204,21 +201,21 @@ fn select_rest_services<'a>(
     Ok(selected)
 }
 
-fn load_and_merge_templates(
+fn load_bind_and_merge_templates(
     profile_source: &str,
     selected_services: &[&RestServiceBinding],
     parsed: &crate::codegen::ParsedProfile,
+    compiled: &crate::codegen::CompiledTypes,
+    options: &GenerateOpenApiOptions,
 ) -> Result<MergedTemplates, CodegenError> {
-    let default_version = selected_services
-        .first()
-        .map(|b| b.version.trim())
-        .filter(|v| !v.is_empty())
-        .unwrap_or("1.0.0");
     let mut merged = MergedTemplates {
         openapi_version: "3.1.0".to_string(),
-        info: json!({ "title": "UCP REST Service", "version": default_version }),
+        info: json!({ "title": "UCP REST Service", "version": "1.0.0" }),
         ..MergedTemplates::default()
     };
+    let mut first_active_service: Option<String> = None;
+    let mut fallback_metadata: Option<(String, Value, Vec<Value>)> = None;
+    let mut path_owners: BTreeMap<String, String> = BTreeMap::new();
 
     for (idx, binding) in selected_services.iter().enumerate() {
         let target = resolve_service_schema_target(
@@ -233,32 +230,164 @@ fn load_and_merge_templates(
             }));
         };
 
+        let template_ver = root_obj
+            .get("openapi")
+            .and_then(Value::as_str)
+            .unwrap_or("3.1.0")
+            .to_string();
+        let service_info = build_service_info(binding, root_obj);
+        let binding_servers = resolve_binding_servers(binding, root_obj, options);
         if idx == 0 {
-            if let Some(ver) = root_obj.get("openapi").and_then(Value::as_str) {
-                merged.openapi_version = ver.to_string();
-            }
-            if let Some(info_obj) = root_obj.get("info").and_then(Value::as_object) {
-                if let Some(merged_info) = merged.info.as_object_mut() {
-                    for (k, v) in info_obj {
-                        merged_info.insert(k.clone(), v.clone());
-                    }
-                }
-            }
-            merged.fallback_servers = root_obj.get("servers").cloned();
+            fallback_metadata = Some((
+                template_ver.clone(),
+                service_info.clone(),
+                binding_servers.clone(),
+            ));
         }
 
-        extend_object_map(&mut merged.paths, root_obj.get("paths"));
-        extend_object_map(&mut merged.webhooks, root_obj.get("webhooks"));
+        let empty_map = Map::new();
+        let components = root_obj.get("components").and_then(Value::as_object);
+        let template_schemas = components
+            .and_then(|c| c.get("schemas"))
+            .and_then(Value::as_object)
+            .unwrap_or(&empty_map);
+        let schema_bindings = parse_template_bindings(template_schemas);
 
-        let Some(components) = root_obj.get("components").and_then(Value::as_object) else {
+        let mut svc_paths = root_obj
+            .get("paths")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let mut svc_webhooks = root_obj
+            .get("webhooks")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+
+        prune_and_bind_route_map(
+            &mut svc_paths,
+            &schema_bindings,
+            &compiled.active_capabilities,
+            &compiled.defs,
+        );
+        prune_and_bind_route_map(
+            &mut svc_webhooks,
+            &schema_bindings,
+            &compiled.active_capabilities,
+            &compiled.defs,
+        );
+
+        if svc_paths.is_empty() && svc_webhooks.is_empty() {
             continue;
-        };
-        extend_object_map(&mut merged.parameters, components.get("parameters"));
-        extend_object_map(&mut merged.headers, components.get("headers"));
-        extend_object_map(&mut merged.template_schemas, components.get("schemas"));
+        }
+
+        if first_active_service.is_none() {
+            merged.openapi_version = template_ver;
+            merged.info = service_info;
+            merged.default_servers = binding_servers.clone();
+            first_active_service = Some(binding.service_name.clone());
+        } else if first_active_service.as_deref() == Some(binding.service_name.as_str()) {
+            append_unique_servers(&mut merged.default_servers, &binding_servers);
+        }
+
+        for (path_key, path_item) in svc_paths {
+            let Some(existing_owner) = path_owners.get(&path_key) else {
+                path_owners.insert(path_key.clone(), binding.service_name.clone());
+                merged
+                    .path_servers
+                    .insert(path_key.clone(), binding_servers.clone());
+                merged.paths.insert(path_key, path_item);
+                continue;
+            };
+            if existing_owner != &binding.service_name {
+                return Err(CodegenError::ConflictingServicePath {
+                    path: path_key,
+                    first_service: existing_owner.clone(),
+                    second_service: binding.service_name.clone(),
+                });
+            }
+            let entry = merged.path_servers.entry(path_key).or_default();
+            append_unique_servers(entry, &binding_servers);
+        }
+
+        for (hook_key, hook_item) in svc_webhooks {
+            merged.webhooks.entry(hook_key).or_insert(hook_item);
+        }
+
+        if let Some(comp) = components {
+            extend_object_map(&mut merged.parameters, comp.get("parameters"));
+            extend_object_map(&mut merged.headers, comp.get("headers"));
+        }
+    }
+
+    if let (None, Some((ver, info, servers))) = (&first_active_service, fallback_metadata) {
+        merged.openapi_version = ver;
+        merged.info = info;
+        merged.default_servers = servers;
     }
 
     Ok(merged)
+}
+
+fn build_service_info(binding: &RestServiceBinding, root_obj: &Map<String, Value>) -> Value {
+    let default_version = Some(binding.version.trim())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("1.0.0");
+    let mut info = Map::new();
+    info.insert(
+        "title".to_string(),
+        Value::String("UCP REST Service".to_string()),
+    );
+    info.insert(
+        "version".to_string(),
+        Value::String(default_version.to_string()),
+    );
+    let Some(src_info) = root_obj.get("info").and_then(Value::as_object) else {
+        return Value::Object(info);
+    };
+    for (k, v) in src_info {
+        if k == "version" && v.as_str().is_some_and(|s| s.trim().is_empty()) {
+            continue;
+        }
+        info.insert(k.clone(), v.clone());
+    }
+    Value::Object(info)
+}
+
+fn resolve_binding_servers(
+    binding: &RestServiceBinding,
+    root_obj: &Map<String, Value>,
+    options: &GenerateOpenApiOptions,
+) -> Vec<Value> {
+    if let Some(url) = options
+        .server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return vec![json!({ "url": url })];
+    }
+    if let Some(ep) = binding
+        .endpoint
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return vec![json!({ "url": ep })];
+    }
+    root_obj
+        .get("servers")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn append_unique_servers(dst: &mut Vec<Value>, src: &[Value]) {
+    for item in src {
+        if !dst.contains(item) {
+            dst.push(item.clone());
+        }
+    }
 }
 
 fn extend_object_map(dst: &mut Map<String, Value>, src: Option<&Value>) {
@@ -584,38 +713,59 @@ fn collect_component_refs(val: &Value, prefix: &str, out: &mut BTreeSet<String>)
     }
 }
 
-fn build_servers_array(
-    selected_services: &[&RestServiceBinding],
+fn resolve_root_and_path_servers(
+    paths: &mut Map<String, Value>,
+    path_servers: &BTreeMap<String, Vec<Value>>,
+    default_servers: Vec<Value>,
     options: &GenerateOpenApiOptions,
-    fallback_servers: Option<Value>,
-) -> Value {
-    if let Some(url) = options.server_url.as_deref().filter(|s| !s.is_empty()) {
-        return json!([{ "url": url }]);
+) -> Option<Value> {
+    if let Some(url) = options
+        .server_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        for path_val in paths.values_mut() {
+            if let Some(item_obj) = path_val.as_object_mut() {
+                item_obj.remove("servers");
+            }
+        }
+        return Some(json!([{ "url": url }]));
     }
 
-    let mut seen = BTreeSet::new();
-    let mut endpoints = Vec::new();
-    for binding in selected_services {
-        let Some(ep) = binding.endpoint.as_deref().map(str::trim) else {
+    let Some(first_key) = paths.keys().next() else {
+        return Some(Value::Array(default_servers));
+    };
+    let first_servers = path_servers.get(first_key).cloned().unwrap_or_default();
+    let uniform = paths
+        .keys()
+        .all(|k| path_servers.get(k).is_some_and(|s| s == &first_servers));
+    if uniform {
+        return Some(Value::Array(first_servers));
+    }
+
+    for (path_key, path_val) in paths.iter_mut() {
+        let Some(servers) = path_servers.get(path_key).filter(|s| !s.is_empty()) else {
             continue;
         };
-        if ep.is_empty() || !seen.insert(ep.to_string()) {
+        let Some(item_obj) = path_val.as_object_mut() else {
             continue;
-        }
-        endpoints.push(json!({ "url": ep }));
+        };
+        let existing_entries: Vec<(String, Value)> = std::mem::take(item_obj)
+            .into_iter()
+            .filter(|(k, _)| k != "servers")
+            .collect();
+        item_obj.insert("servers".to_string(), Value::Array(servers.clone()));
+        item_obj.extend(existing_entries);
     }
-
-    if !endpoints.is_empty() {
-        return Value::Array(endpoints);
-    }
-    fallback_servers.unwrap_or_else(|| json!([]))
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
 fn assemble_openapi_document(
     openapi_version: String,
     info: Value,
-    servers: Value,
+    servers: Option<Value>,
     paths: Map<String, Value>,
     webhooks: Map<String, Value>,
     parameters: Map<String, Value>,
@@ -629,7 +779,9 @@ fn assemble_openapi_document(
         Value::String(OAS_3_1_DIALECT.to_string()),
     );
     root.insert("info".to_string(), info);
-    root.insert("servers".to_string(), servers);
+    if let Some(servers_val) = servers {
+        root.insert("servers".to_string(), servers_val);
+    }
     root.insert("paths".to_string(), Value::Object(paths));
     if !webhooks.is_empty() {
         root.insert("webhooks".to_string(), Value::Object(webhooks));
@@ -737,5 +889,61 @@ mod tests {
         assert!(ucp.capability_stem.is_none());
         assert_eq!(ucp.target_def, "UcpBase");
         assert!(!ucp.is_error_oneof);
+    }
+
+    #[test]
+    fn build_service_info_ignores_empty_template_version_and_resolve_servers_adapts() {
+        let binding = RestServiceBinding {
+            service_name: "dev.ucp.shopping".to_string(),
+            version: "2026-08-25".to_string(),
+            endpoint: Some("https://shop.example.com".to_string()),
+            schema_url: "rest.openapi.json".to_string(),
+        };
+        let template_obj = json!({
+            "info": {
+                "title": "Custom Shopping",
+                "version": "   "
+            }
+        });
+        let info = build_service_info(&binding, template_obj.as_object().unwrap());
+        assert_eq!(info["title"], "Custom Shopping");
+        assert_eq!(info["version"], "2026-08-25");
+
+        let mut paths = Map::from_iter([
+            ("/checkout".to_string(), json!({ "post": {} })),
+            ("/ask".to_string(), json!({ "post": {} })),
+        ]);
+        let path_servers = BTreeMap::from([
+            (
+                "/checkout".to_string(),
+                vec![json!({ "url": "https://shop.example.com" })],
+            ),
+            (
+                "/ask".to_string(),
+                vec![json!({ "url": "https://common.example.com" })],
+            ),
+        ]);
+        let opts = GenerateOpenApiOptions::new("profile.json");
+        let root_servers = resolve_root_and_path_servers(&mut paths, &path_servers, vec![], &opts);
+        assert!(root_servers.is_none());
+        assert_eq!(
+            paths["/checkout"]["servers"],
+            json!([{ "url": "https://shop.example.com" }])
+        );
+        assert_eq!(
+            paths["/ask"]["servers"],
+            json!([{ "url": "https://common.example.com" }])
+        );
+
+        let override_opts =
+            GenerateOpenApiOptions::new("profile.json").server_url("https://gateway.example.com");
+        let overridden =
+            resolve_root_and_path_servers(&mut paths, &path_servers, vec![], &override_opts);
+        assert_eq!(
+            overridden,
+            Some(json!([{ "url": "https://gateway.example.com" }]))
+        );
+        assert!(paths["/checkout"].get("servers").is_none());
+        assert!(paths["/ask"].get("servers").is_none());
     }
 }

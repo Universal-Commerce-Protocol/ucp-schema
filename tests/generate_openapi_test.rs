@@ -112,6 +112,24 @@ fn validate_operation_invariants(method: &str, path: &str, op_val: &Value) {
     }
 }
 
+fn validate_servers_invariants(servers_val: &Value, ctx: &str) {
+    let servers = servers_val
+        .as_array()
+        .unwrap_or_else(|| panic!("servers at {ctx} must be an array"));
+    for srv in servers {
+        let srv_obj = srv
+            .as_object()
+            .unwrap_or_else(|| panic!("server entry at {ctx} must be an object"));
+        assert!(
+            srv_obj
+                .get("url")
+                .and_then(Value::as_str)
+                .is_some_and(|u| !u.trim().is_empty()),
+            "server entry at {ctx} must have non-empty string 'url': {srv:?}"
+        );
+    }
+}
+
 fn assert_openapi_invariants(spec: &Value) {
     assert_eq!(spec["openapi"], "3.1.0");
     assert!(spec["info"].is_object(), "info must be an object");
@@ -131,6 +149,9 @@ fn assert_openapi_invariants(spec: &Value) {
         spec["jsonSchemaDialect"],
         "https://spec.openapis.org/oas/3.1/dialect/base"
     );
+    if let Some(root_servers) = spec.get("servers") {
+        validate_servers_invariants(root_servers, "root");
+    }
     let paths = spec["paths"].as_object().expect("paths must be an object");
     for (path, item) in paths {
         assert!(
@@ -140,11 +161,17 @@ fn assert_openapi_invariants(spec: &Value) {
         let item_obj = item
             .as_object()
             .unwrap_or_else(|| panic!("path item for '{path}' must be an object"));
+        if let Some(item_servers) = item_obj.get("servers") {
+            validate_servers_invariants(item_servers, &format!("paths['{path}']"));
+        }
         for method in [
             "get", "put", "post", "delete", "options", "head", "patch", "trace",
         ] {
             if let Some(op) = item_obj.get(method) {
                 validate_operation_invariants(method, path, op);
+                if let Some(op_servers) = op.get("servers") {
+                    validate_servers_invariants(op_servers, &format!("{method} {path}"));
+                }
             }
         }
         if let Some(params) = item_obj.get("parameters").and_then(Value::as_array) {
@@ -640,16 +667,35 @@ fn container_capabilities_and_lodging_booking_bind_canonical_schemas() {
         generate_openapi(&GenerateOpenApiOptions::new(profile_path.to_str().unwrap())).unwrap();
     assert_openapi_invariants(&merged_spec);
 
-    assert_eq!(
-        merged_spec["servers"],
-        json!([
-            { "url": "https://commerce.example.com/shopping" },
-            { "url": "https://commerce.example.com/common" },
-            { "url": "https://commerce.example.com/lodging" }
-        ])
+    // Heterogeneous service endpoints omit root servers and stamp OAS 3.1 Path Item Object.servers
+    assert!(
+        merged_spec.get("servers").is_none(),
+        "root servers must be omitted when retained routes span distinct service endpoints"
     );
 
     let paths = merged_spec["paths"].as_object().unwrap();
+    for shopping_path in ["/catalog/search", "/catalog/lookup", "/catalog/product"] {
+        assert_eq!(
+            paths[shopping_path]["servers"],
+            json!([{ "url": "https://commerce.example.com/shopping" }])
+        );
+    }
+    for common_path in ["/locations/search", "/locations/lookup", "/ask"] {
+        assert_eq!(
+            paths[common_path]["servers"],
+            json!([{ "url": "https://commerce.example.com/common" }])
+        );
+    }
+    for lodging_path in [
+        "/booking-sessions",
+        "/booking-sessions/{id}",
+        "/booking-sessions/{id}/complete",
+    ] {
+        assert_eq!(
+            paths[lodging_path]["servers"],
+            json!([{ "url": "https://commerce.example.com/lodging" }])
+        );
+    }
     assert_eq!(
         paths["/catalog/search"]["post"]["requestBody"]["content"]["application/json"]["schema"]
             ["$ref"],
@@ -1003,4 +1049,260 @@ fn shopping_cart_retains_cart_routes_and_binds_directional_cart_schemas() {
     assert!(params.contains_key("cart_id_path"));
     assert!(!params.contains_key("checkout_session_id_path"));
     assert!(!params.contains_key("order_id_path"));
+}
+
+#[test]
+fn multi_service_fixture_per_path_servers_shared_gateway_inactive_pruning_and_collision() {
+    let compose_dir = fixture_compose_dir();
+    let schema_dir = compose_dir.join("schemas");
+    let checkout_schema = schema_dir
+        .join("shopping/checkout.json")
+        .to_string_lossy()
+        .into_owned();
+    let cart_schema = schema_dir
+        .join("shopping/cart.json")
+        .to_string_lossy()
+        .into_owned();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let checkout_tpl_path = tmp.path().join("checkout_service.openapi.json");
+    let cart_tpl_path = tmp.path().join("cart_service.openapi.json");
+
+    std::fs::write(
+        &checkout_tpl_path,
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "UCP Shopping Service" },
+            "paths": {
+                "/checkout-sessions": {
+                    "post": {
+                        "operationId": "create_checkout",
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/checkout" } } }
+                        },
+                        "responses": {
+                            "201": {
+                                "description": "Created",
+                                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/checkout" } } }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "checkout": { "$ref": checkout_schema }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    std::fs::write(
+        &cart_tpl_path,
+        json!({
+            "openapi": "3.1.0",
+            "info": { "title": "UCP Cart Service" },
+            "paths": {
+                "/carts": {
+                    "post": {
+                        "operationId": "create_cart",
+                        "responses": {
+                            "201": {
+                                "description": "Created",
+                                "content": { "application/json": { "schema": { "$ref": "#/components/schemas/cart" } } }
+                            }
+                        }
+                    }
+                }
+            },
+            "components": {
+                "parameters": {
+                    "unused_cart_param": {
+                        "name": "X-Cart",
+                        "in": "header",
+                        "required": false,
+                        "schema": { "type": "string" }
+                    }
+                },
+                "schemas": {
+                    "cart": { "$ref": cart_schema }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // 1. Heterogeneous endpoints -> per-path servers + omitted root servers
+    let hetero_profile_path = tmp.path().join("hetero_profile.json");
+    std::fs::write(
+        &hetero_profile_path,
+        json!({
+            "ucp": {
+                "version": "2026-08-25",
+                "services": {
+                    "dev.ucp.shopping": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/shopping",
+                        "schema": checkout_tpl_path.to_str().unwrap()
+                    }],
+                    "dev.ucp.cart_svc": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/carts",
+                        "schema": cart_tpl_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": checkout_schema }],
+                    "dev.ucp.shopping.cart": [{ "version": "2026-08-25", "schema": cart_schema }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let hetero_spec = generate_openapi(&GenerateOpenApiOptions::new(
+        hetero_profile_path.to_str().unwrap(),
+    ))
+    .unwrap();
+    assert_openapi_invariants(&hetero_spec);
+    assert!(hetero_spec.get("servers").is_none());
+    assert_eq!(
+        hetero_spec["paths"]["/checkout-sessions"]["servers"],
+        json!([{ "url": "https://api.example.com/shopping" }])
+    );
+    assert_eq!(
+        hetero_spec["paths"]["/carts"]["servers"],
+        json!([{ "url": "https://api.example.com/carts" }])
+    );
+
+    // 2. Shared gateway endpoint across services -> single root servers, no per-path servers
+    let shared_profile_path = tmp.path().join("shared_gateway_profile.json");
+    std::fs::write(
+        &shared_profile_path,
+        json!({
+            "ucp": {
+                "version": "2026-08-25",
+                "services": {
+                    "dev.ucp.shopping": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/ucp",
+                        "schema": checkout_tpl_path.to_str().unwrap()
+                    }],
+                    "dev.ucp.cart_svc": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/ucp",
+                        "schema": cart_tpl_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": checkout_schema }],
+                    "dev.ucp.shopping.cart": [{ "version": "2026-08-25", "schema": cart_schema }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let shared_spec = generate_openapi(&GenerateOpenApiOptions::new(
+        shared_profile_path.to_str().unwrap(),
+    ))
+    .unwrap();
+    assert_openapi_invariants(&shared_spec);
+    assert_eq!(
+        shared_spec["servers"],
+        json!([{ "url": "https://api.example.com/ucp" }])
+    );
+    assert!(shared_spec["paths"]["/checkout-sessions"]
+        .get("servers")
+        .is_none());
+    assert!(shared_spec["paths"]["/carts"].get("servers").is_none());
+
+    // 3. Inactive leading service does not leak its endpoint, info, or parameters
+    let inactive_first_path = tmp.path().join("inactive_first_profile.json");
+    std::fs::write(
+        &inactive_first_path,
+        json!({
+            "ucp": {
+                "version": "2026-08-25",
+                "services": {
+                    "dev.ucp.cart_svc": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://unused.example.com/carts",
+                        "schema": cart_tpl_path.to_str().unwrap()
+                    }],
+                    "dev.ucp.shopping": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/shopping",
+                        "schema": checkout_tpl_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": checkout_schema }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let pruned_spec = generate_openapi(&GenerateOpenApiOptions::new(
+        inactive_first_path.to_str().unwrap(),
+    ))
+    .unwrap();
+    assert_openapi_invariants(&pruned_spec);
+    assert_eq!(pruned_spec["info"]["title"], "UCP Shopping Service");
+    assert_eq!(
+        pruned_spec["servers"],
+        json!([{ "url": "https://api.example.com/shopping" }])
+    );
+    assert!(pruned_spec["paths"].get("/carts").is_none());
+
+    // 4. Conflicting active path across distinct services -> ConflictingServicePath (exit code 2)
+    let collision_profile_path = tmp.path().join("collision_profile.json");
+    std::fs::write(
+        &collision_profile_path,
+        json!({
+            "ucp": {
+                "version": "2026-08-25",
+                "services": {
+                    "dev.ucp.shopping": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/shopping",
+                        "schema": checkout_tpl_path.to_str().unwrap()
+                    }],
+                    "dev.vendor.alt_shopping": [{
+                        "version": "2026-08-25",
+                        "transport": "rest",
+                        "endpoint": "https://api.example.com/alt-shopping",
+                        "schema": checkout_tpl_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": checkout_schema }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let err = generate_openapi(&GenerateOpenApiOptions::new(
+        collision_profile_path.to_str().unwrap(),
+    ))
+    .expect_err("colliding active path across distinct services must error");
+    assert!(matches!(err, CodegenError::ConflictingServicePath { .. }));
+    assert_eq!(err.exit_code(), 2);
 }
