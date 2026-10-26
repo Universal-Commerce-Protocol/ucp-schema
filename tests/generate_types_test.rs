@@ -2309,3 +2309,142 @@ fn extended_subtypes_preserves_non_variant_branches_on_closed_unions() {
         "ExtendedB must preserve non-variant allOf branches from ClosedUnion"
     );
 }
+
+#[test]
+fn request_sliced_subtypes_do_not_pollute_unsliced_parent_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("base_policy.json"),
+        &serde_json::json!({
+            "title": "Base Policy",
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": { "type": "string" },
+                "summary": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "return" } } },
+                    "then": { "$ref": "return_policy.json" }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("return_policy.json"),
+        &serde_json::json!({
+            "title": "Return Policy",
+            "type": "object",
+            "required": ["type", "days"],
+            "properties": {
+                "type": { "type": "string", "const": "return" },
+                "days": { "type": "integer" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("unreferenced_sliced_policy.json"),
+        &serde_json::json!({
+            "title": "Unreferenced Sliced Policy",
+            "allOf": [
+                { "$ref": "base_policy.json" },
+                {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "unreferenced" },
+                        "audit_id": { "type": "string", "ucp_request": "omit" },
+                        "note": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("referenced_sliced_policy.json"),
+        &serde_json::json!({
+            "title": "Referenced Sliced Policy",
+            "allOf": [
+                { "$ref": "base_policy.json" },
+                {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "referenced" },
+                        "audit_id": { "type": "string", "ucp_request": "omit" },
+                        "code": { "type": "string" }
+                    }
+                },
+                {
+                    "dependentSchemas": {
+                        "code": { "required": ["summary"] }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("session.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.session",
+            "title": "Session",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": { "create": "omit", "update": "required" } },
+                "policies": {
+                    "type": "array",
+                    "items": { "$ref": "types/base_policy.json" },
+                    "ucp_request": "omit"
+                },
+                "extra_unreferenced": {
+                    "$ref": "types/unreferenced_sliced_policy.json",
+                    "ucp_request": "omit"
+                },
+                "override_policy": {
+                    "$ref": "types/referenced_sliced_policy.json"
+                }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    // BasePolicy.anyOf contains only unsliced variants + BasePolicyBase (no *CreateRequest/*UpdateRequest)
+    assert_eq!(
+        bundle.defs["BasePolicy"]["anyOf"],
+        serde_json::json!([
+            { "$ref": "#/$defs/ReturnPolicy" },
+            { "$ref": "#/$defs/ReferencedSlicedPolicy" },
+            { "$ref": "#/$defs/UnreferencedSlicedPolicy" },
+            { "$ref": "#/$defs/BasePolicyBase" }
+        ])
+    );
+
+    // Unused request slices of UnreferencedSlicedPolicy are pruned cleanly in Stage 8
+    assert!(!bundle
+        .defs
+        .contains_key("UnreferencedSlicedPolicyCreateRequest"));
+    assert!(!bundle
+        .defs
+        .contains_key("UnreferencedSlicedPolicyUpdateRequest"));
+
+    // Directly referenced ReferencedSlicedPolicyCreateRequest inherits BasePolicy's summary field,
+    // omits audit_id, and preserves dependentSchemas in allOf
+    let ref_create = &bundle.defs["ReferencedSlicedPolicyCreateRequest"];
+    assert_eq!(ref_create["properties"]["summary"]["type"], "string");
+    assert!(ref_create["properties"].get("audit_id").is_none());
+    assert!(ref_create["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b.get("dependentSchemas").is_some()));
+}

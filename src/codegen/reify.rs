@@ -6,11 +6,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::{json, Map, Value};
 
 use crate::codegen::hoist::insert_sliced_or_normalized_def;
-use crate::codegen::local_def_ref;
 use crate::codegen::normalizer::{
-    align_directional_refs, merge_schema_property, to_pascal_case, update_request_slice_metadata,
+    align_directional_refs, fold_inline_allof_branches, merge_schema_property, to_pascal_case,
+    update_request_slice_metadata,
 };
-use crate::codegen::CodegenError;
+use crate::codegen::{directional_request_suffix, local_def_ref, CodegenError};
 use crate::types::UCP_ANNOTATIONS;
 
 /// Derive a canonical PascalCase variant name from `parent_name` and a discriminator `tag_value`.
@@ -790,7 +790,7 @@ pub fn register_extended_subtypes(
             .unwrap_or_default();
 
         if let Some(subtype_schema) = defs.get_mut(&subtype_name) {
-            fold_inline_allof_branches_into_subtype(subtype_schema);
+            fold_inline_allof_branches(subtype_schema);
             inherit_parent_into_union_variant(
                 subtype_schema,
                 &base_template,
@@ -799,6 +799,10 @@ pub fn register_extended_subtypes(
                 &tag_val,
                 &non_variant_branches,
             );
+        }
+
+        if directional_request_suffix(&subtype_name) != directional_request_suffix(&parent_union) {
+            continue;
         }
 
         let remove_exhausted_base =
@@ -854,9 +858,7 @@ fn synthesize_directional_subtype_slices(
     for (subtype_name, subtype_schema) in defs.iter() {
         if union_discriminators.contains_key(subtype_name)
             || subtype_name.ends_with("Base")
-            || DIRECTIONAL_OPS
-                .iter()
-                .any(|(_, s)| subtype_name.ends_with(s))
+            || directional_request_suffix(subtype_name).is_some()
             || sliced_base_names.contains(subtype_name)
             || DIRECTIONAL_OPS
                 .iter()
@@ -869,10 +871,7 @@ fn synthesize_directional_subtype_slices(
         else {
             continue;
         };
-        if DIRECTIONAL_OPS
-            .iter()
-            .any(|(_, s)| parent_union.ends_with(s))
-        {
+        if directional_request_suffix(&parent_union).is_some() {
             continue;
         }
         for (op, suffix) in DIRECTIONAL_OPS {
@@ -1042,89 +1041,6 @@ fn find_extended_union_parent(
     });
     let tag_val = top_tag.or(inline_tag)?;
     Some((parent_union.to_string(), disc_prop, tag_val))
-}
-
-fn fold_inline_allof_branches_into_subtype(subtype_schema: &mut Value) {
-    let Some(obj) = subtype_schema.as_object_mut() else {
-        return;
-    };
-    let Some(all_of) = obj.get("allOf").and_then(Value::as_array).cloned() else {
-        return;
-    };
-    let mut kept = Vec::new();
-    for branch in all_of {
-        let Some(branch_obj) = branch.as_object() else {
-            kept.push(branch);
-            continue;
-        };
-        if [
-            "$ref", "if", "then", "else", "anyOf", "oneOf", "allOf", "not", "contains",
-        ]
-        .iter()
-        .any(|k| branch_obj.contains_key(*k))
-        {
-            kept.push(branch);
-            continue;
-        }
-        if let Some(Value::Object(branch_props)) = branch_obj.get("properties") {
-            let props_map = obj
-                .entry("properties".to_string())
-                .or_insert_with(|| Value::Object(Map::new()))
-                .as_object_mut()
-                .expect("properties is an object");
-            for (k, v) in branch_props {
-                let Some(existing) = props_map.get_mut(k) else {
-                    props_map.insert(k.clone(), v.clone());
-                    continue;
-                };
-                merge_schema_property(existing, v);
-            }
-        }
-        if let Some(Value::Array(branch_reqs)) = branch_obj.get("required") {
-            let req_arr = obj
-                .entry("required".to_string())
-                .or_insert_with(|| Value::Array(Vec::new()))
-                .as_array_mut()
-                .expect("required is an array");
-            for req in branch_reqs {
-                if !req_arr.contains(req) {
-                    req_arr.push(req.clone());
-                }
-            }
-        }
-        if let Some(Value::Object(branch_dep)) = branch_obj.get("dependentRequired") {
-            let dep_map = obj
-                .entry("dependentRequired".to_string())
-                .or_insert_with(|| Value::Object(Map::new()))
-                .as_object_mut()
-                .expect("dependentRequired is an object");
-            for (trigger, deps_val) in branch_dep {
-                let Some(deps_arr) = deps_val.as_array() else {
-                    continue;
-                };
-                let target_arr = dep_map
-                    .entry(trigger.clone())
-                    .or_insert_with(|| Value::Array(Vec::new()))
-                    .as_array_mut()
-                    .expect("dependentRequired value is an array");
-                for dep in deps_arr {
-                    if !target_arr.contains(dep) {
-                        target_arr.push(dep.clone());
-                    }
-                }
-            }
-        }
-        for key in ["minProperties", "maxProperties", "propertyNames"] {
-            if let Some(val) = branch_obj.get(key) {
-                obj.insert(key.to_string(), val.clone());
-            }
-        }
-    }
-    if kept.is_empty() {
-        obj.remove("allOf");
-    } else {
-        obj.insert("allOf".to_string(), Value::Array(kept));
-    }
 }
 
 #[cfg(test)]
@@ -2015,5 +1931,112 @@ mod tests {
             !defs.contains_key("AnnotatedSubtypeCompleteRequest"),
             "Subtype in sliced_base_names must not synthesize missing CompleteRequest from response schema"
         );
+    }
+
+    #[test]
+    fn register_extended_subtypes_skips_mismatched_directional_slices_and_preserves_applicator_allof(
+    ) {
+        let mut defs = BTreeMap::from([
+            (
+                "Policy".to_string(),
+                json!({
+                    "anyOf": [
+                        { "$ref": "#/$defs/CancellationPolicy" },
+                        { "$ref": "#/$defs/PolicyBase" }
+                    ]
+                }),
+            ),
+            (
+                "PolicyBase".to_string(),
+                json!({
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "not": { "enum": ["cancellation"] } },
+                        "description": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "CancellationPolicy".to_string(),
+                json!({
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "cancellation" },
+                        "description": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "CustomPolicy".to_string(),
+                json!({
+                    "allOf": [
+                        { "$ref": "#/$defs/Policy" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "const": "custom" },
+                                "code": { "type": "string" }
+                            }
+                        },
+                        {
+                            "dependentSchemas": {
+                                "code": { "required": ["description"] }
+                            }
+                        },
+                        {
+                            "additionalProperties": false
+                        }
+                    ]
+                }),
+            ),
+            (
+                "CustomPolicyCreateRequest".to_string(),
+                json!({
+                    "allOf": [
+                        { "$ref": "#/$defs/Policy" },
+                        {
+                            "type": "object",
+                            "properties": {
+                                "type": { "type": "string", "const": "custom" },
+                                "code": { "type": "string" }
+                            }
+                        }
+                    ]
+                }),
+            ),
+        ]);
+
+        let sliced_base_names = BTreeSet::from(["CustomPolicy".to_string()]);
+        register_extended_subtypes(&mut defs, &BTreeMap::new(), &sliced_base_names);
+
+        // Policy.anyOf registers only unsliced CustomPolicy, not CustomPolicyCreateRequest
+        assert_eq!(
+            defs["Policy"]["anyOf"],
+            json!([
+                { "$ref": "#/$defs/CancellationPolicy" },
+                { "$ref": "#/$defs/CustomPolicy" },
+                { "$ref": "#/$defs/PolicyBase" }
+            ])
+        );
+        // CustomPolicyCreateRequest still inherits PolicyBase properties and drops #/$defs/Policy
+        assert_eq!(
+            defs["CustomPolicyCreateRequest"]["properties"]["description"]["type"],
+            "string"
+        );
+        assert!(defs["CustomPolicyCreateRequest"].get("allOf").is_none());
+
+        // CustomPolicy preserves dependentSchemas and additionalProperties: false branches in allOf
+        let kept_all_of = defs["CustomPolicy"]["allOf"].as_array().unwrap();
+        assert_eq!(kept_all_of.len(), 2);
+        assert!(kept_all_of
+            .iter()
+            .any(|b| b.get("dependentSchemas").is_some()));
+        assert!(kept_all_of
+            .iter()
+            .any(|b| b.get("additionalProperties") == Some(&Value::Bool(false))));
     }
 }

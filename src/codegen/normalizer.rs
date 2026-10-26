@@ -964,6 +964,116 @@ fn merge_dependent_required_map(
     }
 }
 
+fn is_inline_allof_branch_flattenable(branch_obj: &Map<String, Value>) -> bool {
+    ![
+        "$ref",
+        "if",
+        "then",
+        "else",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "contains",
+        "not",
+        "dependentSchemas",
+        "patternProperties",
+        "unevaluatedProperties",
+    ]
+    .iter()
+    .any(|k| branch_obj.contains_key(*k))
+        && branch_obj
+            .get("additionalProperties")
+            .is_none_or(|v| v == &Value::Bool(true))
+}
+
+fn apply_merged_object_fields(
+    obj: &mut Map<String, Value>,
+    mut merged_props: Map<String, Value>,
+    mut merged_reqs: Vec<Value>,
+    merged_dep_req: &BTreeMap<String, Vec<String>>,
+    merged_constraints: Map<String, Value>,
+) {
+    if let Some(Value::Object(own_props)) = obj.remove("properties") {
+        for (k, v) in own_props {
+            let Some(existing) = merged_props.get_mut(&k) else {
+                merged_props.insert(k, v);
+                continue;
+            };
+            merge_schema_property(existing, &v);
+        }
+    }
+    if let Some(Value::Array(own_reqs)) = obj.remove("required") {
+        for req in own_reqs {
+            if !merged_reqs.contains(&req) {
+                merged_reqs.push(req);
+            }
+        }
+    }
+    merge_dependent_required_map(obj, merged_dep_req);
+    for (k, v) in merged_constraints {
+        obj.entry(k).or_insert(v);
+    }
+    if !merged_props.is_empty() {
+        obj.insert("properties".to_string(), Value::Object(merged_props));
+    }
+    if !merged_reqs.is_empty() {
+        obj.insert("required".to_string(), Value::Array(merged_reqs));
+    }
+}
+
+/// Fold flattenable inline `allOf` object branches into `target`'s top-level object fields
+/// while preserving `$ref`, conditional, union, applicator, and closed-object branches in `allOf`.
+pub(crate) fn fold_inline_allof_branches(target: &mut Value) {
+    let Some(obj) = target.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(all_of)) = obj.get("allOf").cloned() else {
+        return;
+    };
+
+    let mut merged_props = Map::new();
+    let mut merged_reqs: Vec<Value> = Vec::new();
+    let mut merged_dep_req: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut merged_constraints = Map::new();
+    let mut kept_all_of: Vec<Value> = Vec::new();
+    let mut any_flattened = false;
+
+    for branch in all_of {
+        let Some(branch_obj) = branch
+            .as_object()
+            .filter(|b| is_inline_allof_branch_flattenable(b))
+        else {
+            kept_all_of.push(branch);
+            continue;
+        };
+        merge_props_and_reqs_from_object(
+            branch_obj,
+            &mut merged_props,
+            &mut merged_reqs,
+            &mut merged_dep_req,
+            &mut merged_constraints,
+        );
+        any_flattened = true;
+    }
+
+    if !any_flattened {
+        return;
+    }
+
+    apply_merged_object_fields(
+        obj,
+        merged_props,
+        merged_reqs,
+        &merged_dep_req,
+        merged_constraints,
+    );
+    if kept_all_of.is_empty() {
+        obj.remove("allOf");
+    } else {
+        obj.insert("allOf".to_string(), Value::Array(kept_all_of));
+    }
+}
+
 fn flatten_single_object_allof(
     target: &mut Value,
     defs_snapshot: &BTreeMap<String, Value>,
@@ -1030,65 +1140,25 @@ fn flatten_single_object_allof(
             continue;
         }
 
-        let is_inline_flattenable = branch.as_object().is_some_and(|b| {
-            ![
-                "$ref",
-                "if",
-                "then",
-                "else",
-                "anyOf",
-                "oneOf",
-                "allOf",
-                "contains",
-                "not",
-                "dependentSchemas",
-                "patternProperties",
-                "unevaluatedProperties",
-            ]
-            .iter()
-            .any(|k| b.contains_key(*k))
-                && b.get("additionalProperties")
-                    .is_none_or(|v| v == &Value::Bool(true))
-        });
-        if is_inline_flattenable {
-            if let Some(branch_obj) = branch.as_object() {
-                merge_props_and_reqs_from_object(
-                    branch_obj,
-                    &mut merged_props,
-                    &mut merged_reqs,
-                    &mut merged_dep_req,
-                    &mut merged_constraints,
-                );
-                any_flattened = true;
-                continue;
-            }
+        if let Some(branch_obj) = branch
+            .as_object()
+            .filter(|b| is_inline_allof_branch_flattenable(b))
+        {
+            merge_props_and_reqs_from_object(
+                branch_obj,
+                &mut merged_props,
+                &mut merged_reqs,
+                &mut merged_dep_req,
+                &mut merged_constraints,
+            );
+            any_flattened = true;
+            continue;
         }
         kept_all_of.push(branch);
     }
 
     if !any_flattened {
         return false;
-    }
-
-    if let Some(Value::Object(own_props)) = obj.remove("properties") {
-        for (k, v) in own_props {
-            if let Some(existing) = merged_props.get_mut(&k) {
-                merge_schema_property(existing, &v);
-            } else {
-                merged_props.insert(k, v);
-            }
-        }
-    }
-    if let Some(Value::Array(own_reqs)) = obj.remove("required") {
-        for req in own_reqs {
-            if !merged_reqs.contains(&req) {
-                merged_reqs.push(req);
-            }
-        }
-    }
-    merge_dependent_required_map(obj, &merged_dep_req);
-    for (k, v) in merged_constraints {
-        obj.entry(k).or_insert(v);
     }
 
     let promoted_anyof = if kept_all_of.len() == 1 && !obj.contains_key("anyOf") {
@@ -1109,12 +1179,13 @@ fn flatten_single_object_allof(
         obj.entry("additionalProperties".to_string())
             .or_insert(Value::Bool(true));
     }
-    if !merged_props.is_empty() {
-        obj.insert("properties".to_string(), Value::Object(merged_props));
-    }
-    if !merged_reqs.is_empty() {
-        obj.insert("required".to_string(), Value::Array(merged_reqs));
-    }
+    apply_merged_object_fields(
+        obj,
+        merged_props,
+        merged_reqs,
+        &merged_dep_req,
+        merged_constraints,
+    );
     if kept_all_of.is_empty() {
         obj.remove("allOf");
     } else {

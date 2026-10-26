@@ -312,16 +312,19 @@ pub(super) fn has_root_schema_body(val: &Value) -> bool {
     val.is_object() && !is_empty_object_schema(val)
 }
 
+pub(super) fn directional_request_suffix(name: &str) -> Option<&'static str> {
+    ["CreateRequest", "UpdateRequest", "CompleteRequest"]
+        .into_iter()
+        .find(|s| name.ends_with(s))
+}
+
 fn align_all_directional_refs(
     defs: &mut BTreeMap<String, Value>,
     sliced_base_names: &BTreeSet<String>,
 ) {
     let known_defs: BTreeSet<String> = defs.keys().cloned().collect();
     for (def_name, schema_val) in defs.iter_mut() {
-        let Some(suffix) = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
-            .into_iter()
-            .find(|s| def_name.ends_with(s))
-        else {
+        let Some(suffix) = directional_request_suffix(def_name) else {
             continue;
         };
         align_directional_refs(schema_val, suffix, &known_defs);
