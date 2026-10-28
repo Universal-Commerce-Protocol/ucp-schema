@@ -217,7 +217,7 @@ fn ucp_corpus_checkout_with_discount_scoping_and_slicing() {
         "#/$defs/DiscountsObject"
     );
     assert_eq!(
-        bundle.defs["CheckoutCreateRequest"]["properties"]["discounts"]["$ref"],
+        bundle.defs["CheckoutCreateRequest"]["anyOf"][0]["properties"]["discounts"]["$ref"],
         "#/$defs/DiscountsObjectCreateRequest"
     );
     assert_eq!(
@@ -436,6 +436,10 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
     );
     assert_eq!(
         bundle.defs["Policy"]["anyOf"][1]["$ref"],
+        "#/$defs/ReturnPolicy"
+    );
+    assert_eq!(
+        bundle.defs["Policy"]["anyOf"][2]["$ref"],
         "#/$defs/PolicyBase"
     );
 
@@ -510,7 +514,7 @@ fn ucp_corpus_reclassification_and_cart_checkout_overlay() {
     .unwrap();
     assert_bundle_invariants(&cart_and_checkout.defs);
     assert!(
-        cart_and_checkout.defs["CheckoutCreateRequest"]["properties"]
+        cart_and_checkout.defs["CheckoutCreateRequest"]["anyOf"][1]["properties"]
             .get("cart_id")
             .is_some()
     );
@@ -1958,7 +1962,10 @@ fn open_union_lowering_on_ucp_corpus_enforces_ou1_through_ou4() {
         ("Provider", &[("Oauth2Provider", "oauth2")]),
         (
             "Policy",
-            &[("CancellationItem", "dev.ucp.lodging.policy.cancellation")],
+            &[
+                ("CancellationItem", "dev.ucp.lodging.policy.cancellation"),
+                ("ReturnPolicy", "dev.ucp.shopping.policy.return"),
+            ],
         ),
     ];
 
@@ -2207,12 +2214,16 @@ fn extended_subtypes_discovery_and_registration() {
             generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
         assert_bundle_invariants(&corpus_bundle.defs);
         let policy_anyof = corpus_bundle.defs["Policy"]["anyOf"].as_array().unwrap();
-        assert_eq!(policy_anyof.len(), 2);
+        assert_eq!(policy_anyof.len(), 3);
         assert_eq!(policy_anyof[0]["$ref"], "#/$defs/CancellationItem");
-        assert_eq!(policy_anyof[1]["$ref"], "#/$defs/PolicyBase");
+        assert_eq!(policy_anyof[1]["$ref"], "#/$defs/ReturnPolicy");
+        assert_eq!(policy_anyof[2]["$ref"], "#/$defs/PolicyBase");
         assert_eq!(
             corpus_bundle.defs["PolicyBase"]["properties"]["type"]["not"]["enum"],
-            serde_json::json!(["dev.ucp.lodging.policy.cancellation"])
+            serde_json::json!([
+                "dev.ucp.lodging.policy.cancellation",
+                "dev.ucp.shopping.policy.return"
+            ])
         );
     }
 }
@@ -2447,4 +2458,131 @@ fn request_sliced_subtypes_do_not_pollute_unsliced_parent_union() {
         .unwrap()
         .iter()
         .any(|b| b.get("dependentSchemas").is_some()));
+}
+
+#[test]
+fn dto_openness_and_non_string_format_normalization_preserves_validator_strictness() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    std::fs::create_dir_all(&shopping_dir).unwrap();
+
+    let non_str = [
+        "date-time",
+        "date",
+        "time",
+        "duration",
+        "uuid",
+        "ipv4",
+        "ipv6",
+    ];
+    let str_mapped = [
+        "uri",
+        "uri-reference",
+        "iri",
+        "email",
+        "idn-email",
+        "hostname",
+    ];
+
+    let mut props = serde_json::Map::new();
+    for fmt in non_str {
+        let key = format!("ns_{}", fmt.replace('-', "_"));
+        props.insert(
+            key,
+            serde_json::json!({ "type": "string", "format": fmt, "pattern": "^[0-9A-Za-z:.-]+$" }),
+        );
+    }
+    for fmt in str_mapped {
+        let key = format!("str_{}", fmt.replace('-', "_"));
+        props.insert(
+            key,
+            serde_json::json!({ "type": "string", "format": fmt, "pattern": "^[a-z0-9:./@-]+$" }),
+        );
+    }
+    props.insert(
+        "labels".to_string(),
+        serde_json::json!({ "type": "object", "additionalProperties": { "type": "string" } }),
+    );
+
+    let raw_schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "name": "dev.ucp.shopping.filter",
+        "title": "Filter",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": props,
+        "anyOf": [
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["ns_date_time"],
+                "properties": { "ns_date_time": { "type": "string", "format": "date-time", "pattern": "^2026-" } }
+            },
+            {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["str_uri"],
+                "properties": { "str_uri": { "type": "string", "format": "uri", "pattern": "^https://" } }
+            }
+        ]
+    });
+    std::fs::write(shopping_dir.join("filter.json"), raw_schema.to_string()).unwrap();
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+    let filter_def = &bundle.defs["Filter"];
+    assert_eq!(filter_def["additionalProperties"], Value::Bool(true));
+    assert_eq!(
+        filter_def["properties"]["labels"]["additionalProperties"],
+        serde_json::json!({ "type": "string" })
+    );
+    for fmt in non_str {
+        let key = format!("ns_{}", fmt.replace('-', "_"));
+        assert_eq!(filter_def["properties"][&key]["format"], fmt);
+        assert!(filter_def["properties"][&key].get("pattern").is_none());
+    }
+    for fmt in str_mapped {
+        let key = format!("str_{}", fmt.replace('-', "_"));
+        assert_eq!(filter_def["properties"][&key]["format"], fmt);
+        assert!(filter_def["properties"][&key].get("pattern").is_some());
+    }
+    for branch in filter_def["anyOf"].as_array().unwrap() {
+        assert_eq!(branch["additionalProperties"], Value::Bool(true));
+    }
+    assert!(filter_def["anyOf"][0]["properties"]["ns_date_time"]
+        .get("pattern")
+        .is_none());
+    assert_eq!(
+        filter_def["anyOf"][1]["properties"]["str_uri"]["pattern"],
+        "^https://"
+    );
+
+    // Validator isolation: ucp-schema validate still enforces pattern and additionalProperties: false
+    let opts = ucp_schema::ResolveOptions::new(ucp_schema::Direction::Response, "read");
+    let ok_payload = serde_json::json!({ "ns_date_time": "2026-11-01T09:00:00Z" });
+    let bad_pattern = serde_json::json!({ "ns_date_time": "2025-11-01T09:00:00Z" });
+    let extra_prop = serde_json::json!({ "ns_date_time": "2026-11-01T09:00:00Z", "unknown": true });
+    assert!(ucp_schema::validate(&raw_schema, &ok_payload, &opts).is_ok());
+    assert!(ucp_schema::validate(&raw_schema, &bad_pattern, &opts).is_err());
+    assert!(ucp_schema::validate(&raw_schema, &extra_prop, &opts).is_err());
+
+    if let Some(schema_dir) = ucp_schemas_dir() {
+        let corpus = generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+        let open_at =
+            &corpus.defs["LocationFilter"]["properties"]["hours"]["properties"]["open_at"];
+        assert_eq!(open_at["format"], "date-time");
+        assert!(open_at.get("pattern").is_none());
+        let start_date = &corpus.defs["DateInterval"]["properties"]["start_date"];
+        assert_eq!(start_date["format"], "date");
+        assert!(start_date.get("pattern").is_none());
+        for closed_def in ["ErrorResponse", "JsonrpcRequest", "RequestConstraints"] {
+            assert_eq!(
+                corpus.defs[closed_def]["additionalProperties"],
+                Value::Bool(true)
+            );
+        }
+        for branch in corpus.defs["ValueConstraint"]["anyOf"].as_array().unwrap() {
+            assert_eq!(branch["additionalProperties"], Value::Bool(true));
+        }
+    }
 }
