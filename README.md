@@ -120,14 +120,14 @@ ucp-schema resolve checkout.json --request --op create --bundle --pretty
 
 # Bundle a 3P extension with absolute URL refs (maps URLs to local copies)
 ucp-schema resolve my_extension.json --response --op read --bundle \
-  --schema-remote-base "https://ucp.dev/schemas" \
+  --schema-remote-base "https://ucp.dev/2026-08-25/schemas" \
   --schema-local-base ./local-ucp-schemas
 
 # Bundle a 3P extension with absolute URL refs (fetches from network)
 ucp-schema resolve my_extension.json --response --op read --bundle
 
 # Resolve from URL
-ucp-schema resolve https://ucp.dev/2026-04-08/schemas/shopping/checkout.json --request --op create
+ucp-schema resolve https://ucp.dev/2026-08-25/schemas/shopping/checkout.json --request --op create
 ```
 
 ### `validate` — Validate payload against resolved schema
@@ -376,12 +376,12 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
   "ucp": {
     "capabilities": {
       "dev.ucp.shopping.checkout": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+        "version": "2026-08-25",
+        "schema": "https://ucp.dev/2026-08-25/schemas/shopping/checkout.json"
       }],
       "dev.ucp.shopping.discount": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/discount.json",
+        "version": "2026-08-25",
+        "schema": "https://ucp.dev/2026-08-25/schemas/shopping/discount.json",
         "extends": "dev.ucp.shopping.checkout"
       }]
     }
@@ -407,7 +407,7 @@ Extension schemas define their additions in `$defs` keyed by the root capability
 
 ```json
 {
-  "$id": "https://ucp.dev/schemas/shopping/discount.json",
+  "$id": "https://ucp.dev/2026-08-25/schemas/shopping/discount.json",
   "name": "dev.ucp.shopping.discount",
   "$defs": {
     "dev.ucp.shopping.checkout": {
@@ -485,7 +485,7 @@ ucp-schema validate envelope.json --schema transports/jsonrpc.json --op read --d
 
 ```json
 {
-  "$id": "https://ucp.dev/schemas/shopping/fulfillment.json",
+  "$id": "https://ucp.dev/2026-08-25/schemas/shopping/fulfillment.json",
   "name": "dev.ucp.shopping.fulfillment",
   "$defs": {
     "dev.ucp.shopping.catalog.search": {
