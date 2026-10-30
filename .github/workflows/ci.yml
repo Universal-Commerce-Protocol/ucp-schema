@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main, master]
+    tags: ['v*']
   pull_request:
 
 # Every job here only reads the repository. Declaring this once at the workflow
@@ -21,6 +22,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
@@ -35,10 +38,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: 1.85.0
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
       - run: cargo check --all-targets
 
   clippy:
@@ -46,11 +51,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
       - run: cargo clippy --all-targets -- -D warnings
 
   test:
@@ -62,10 +69,12 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
       - name: Run tests
         run: cargo test --all-targets
 
@@ -75,10 +84,12 @@ jobs:
     needs: [fmt, clippy, test]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
       - name: Build release binary
         run: cargo build --release
       - name: Upload binary
@@ -109,17 +120,79 @@ jobs:
             artifact: ucp-schema-windows-x86_64.exe
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # master
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2 # zizmor: ignore[cache-poisoning]
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          set -euo pipefail
+          cargo build --release --target "$TARGET"
+          mkdir -p dist
+          if [ -f "target/${TARGET}/release/ucp-schema.exe" ]; then
+            cp "target/${TARGET}/release/ucp-schema.exe" "dist/${ARTIFACT}"
+          else
+            cp "target/${TARGET}/release/ucp-schema" "dist/${ARTIFACT}"
+          fi
       - name: Upload artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            target/${{ matrix.target }}/release/ucp-schema
-            target/${{ matrix.target }}/release/ucp-schema.exe
+          path: dist/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  publish-release-binaries:
+    name: Publish Release Binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, release-builds]
+    permissions:
+      contents: write
+    steps:
+      - name: Download release binaries
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: ucp-schema-*-*
+          path: release-dist
+          merge-multiple: true
+      - name: Generate SHA256SUMS and upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          DIST_DIR: release-dist
+        run: |
+          set -euo pipefail
+          for asset in \
+            ucp-schema-linux-x86_64 \
+            ucp-schema-macos-x86_64 \
+            ucp-schema-macos-aarch64 \
+            ucp-schema-windows-x86_64.exe; do
+            if [ ! -f "${DIST_DIR}/${asset}" ]; then
+              echo "::error::Missing expected release artifact: ${DIST_DIR}/${asset}"
+              exit 1
+            fi
+          done
+          chmod +x \
+            "${DIST_DIR}/ucp-schema-linux-x86_64" \
+            "${DIST_DIR}/ucp-schema-macos-x86_64" \
+            "${DIST_DIR}/ucp-schema-macos-aarch64"
+          (cd "$DIST_DIR" && sha256sum ucp-schema-* > SHA256SUMS)
+          assets=(
+            "${DIST_DIR}/ucp-schema-linux-x86_64"
+            "${DIST_DIR}/ucp-schema-macos-x86_64"
+            "${DIST_DIR}/ucp-schema-macos-aarch64"
+            "${DIST_DIR}/ucp-schema-windows-x86_64.exe"
+            "${DIST_DIR}/SHA256SUMS"
+          )
+          if ! gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GH_REPO"; then
+            gh release create "$TAG" "${assets[@]}" --verify-tag --generate-notes --repo "$GH_REPO" \
+              || gh release upload "$TAG" "${assets[@]}" --clobber --repo "$GH_REPO"
+          fi
