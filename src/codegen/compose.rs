@@ -48,6 +48,9 @@ pub(super) fn compose_active_extensions(
 
         for &ext_idx in active_ext_indices {
             let ext_item = &loaded[ext_idx];
+            if !ext_item.extends_capability(cap_name) {
+                continue;
+            }
             let Some(ext_block) = ext_item
                 .schema
                 .get("$defs")
@@ -172,7 +175,7 @@ fn merge_extension_into_schema(
     if let Some(all_of) = ext_val.get("allOf").and_then(Value::as_array) {
         for branch in all_of {
             if local_def_ref(branch) != Some(target_name) {
-                merge_single_branch_into_target(target, branch, root_raw_schemas, defs);
+                merge_extension_into_schema(target, branch, target_name, root_raw_schemas, defs);
             }
         }
     }
@@ -199,7 +202,9 @@ fn merge_single_branch_into_target(
                 if let Some(existing_prop) = target_props_map.get_mut(prop_name) {
                     merge_extension_property(existing_prop, ext_prop, root_raw_schemas, defs);
                 } else {
-                    target_props_map.insert(prop_name.clone(), ext_prop.clone());
+                    let mut relaxed_prop = ext_prop.clone();
+                    relax_extension_property_required(&mut relaxed_prop);
+                    target_props_map.insert(prop_name.clone(), relaxed_prop);
                 }
             }
         }
@@ -218,6 +223,45 @@ fn merge_single_branch_into_target(
                 req_arr.push(req.clone());
             }
         }
+    }
+}
+
+/// Downgrade `"required"` visibility in `ucp_request` / `ucp_response` to `"optional"`
+/// when flattening a new extension property onto a unified capability schema.
+///
+/// For example, `common/payment_ap2_mandate.json` marks `ap2` as `"complete": "required"`
+/// because `ap2` is mandatory when the AP2 extension is negotiated at runtime. When
+/// `generate-types` flattens optional extensions onto the unified `CheckoutCompleteRequest`
+/// model, `ap2` itself must remain optional for non-AP2 checkouts while `checkout_mandate`
+/// stays required inside `Ap2WithCheckoutMandateCompleteRequest`.
+fn relax_extension_property_required(prop: &mut Value) {
+    let Some(prop_obj) = prop.as_object_mut() else {
+        return;
+    };
+    for key in ["ucp_request", "ucp_response"] {
+        let Some(annotation) = prop_obj.get_mut(key) else {
+            continue;
+        };
+        match annotation.as_object_mut() {
+            Some(map) if !map.contains_key("transition") && !map.contains_key("from") => {
+                for val in map.values_mut() {
+                    relax_visibility_value(val);
+                }
+            }
+            _ => relax_visibility_value(annotation),
+        }
+    }
+}
+
+fn relax_visibility_value(val: &mut Value) {
+    let is_required_transition = val
+        .get("transition")
+        .or(Some(&*val))
+        .and_then(|t| t.get("from"))
+        .and_then(Value::as_str)
+        == Some("required");
+    if val.as_str() == Some("required") || is_required_transition {
+        *val = Value::String("optional".to_string());
     }
 }
 
@@ -373,6 +417,9 @@ fn compose_container_capability(
 
     for &ext_idx in active_ext_indices {
         let ext_item = &loaded[ext_idx];
+        if !ext_item.extends_capability(cap_name) {
+            continue;
+        }
         let Some(ext_cap_block) = ext_item
             .schema
             .get("$defs")
@@ -534,6 +581,28 @@ mod tests {
         );
         assert_eq!(target["properties"]["extra_req"]["type"], "string");
         assert_eq!(target["properties"]["colliding_field"]["type"], "boolean");
+
+        let mut ext_prop = json!({
+            "ucp_request": {
+                "complete": {
+                    "transition": {
+                        "from": "required",
+                        "to": "optional",
+                        "description": "Will become optional"
+                    }
+                }
+            },
+            "ucp_response": {
+                "transition": {
+                    "from": "required",
+                    "to": "omit",
+                    "description": "Will be removed"
+                }
+            }
+        });
+        relax_extension_property_required(&mut ext_prop);
+        assert_eq!(ext_prop["ucp_request"]["complete"], "optional");
+        assert_eq!(ext_prop["ucp_response"], "optional");
     }
 
     #[test]

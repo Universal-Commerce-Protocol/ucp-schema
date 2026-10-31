@@ -1706,6 +1706,80 @@ mod strict_mode {
     }
 
     #[test]
+    fn removes_explicit_true_from_allof_branches() {
+        let schema = json!({
+            "allOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" }
+                    },
+                    "additionalProperties": true
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["unevaluatedProperties"], json!(false));
+        assert!(result["allOf"][0].get("additionalProperties").is_none());
+        assert!(result["allOf"][1].get("additionalProperties").is_none());
+
+        let validator = jsonschema::validator_for(&result).unwrap();
+        assert!(validator.is_valid(&json!({ "id": "id_1", "name": "Ada" })));
+        assert!(!validator.is_valid(&json!({
+            "id": "id_1",
+            "name": "Ada",
+            "unexpected": true
+        })));
+    }
+
+    #[test]
+    fn removes_explicit_true_from_composition_parent() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": true,
+            "allOf": [
+                {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "id": { "type": "string" }
+                    }
+                },
+                {
+                    "type": "object",
+                    "additionalProperties": true,
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            ]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["unevaluatedProperties"], json!(false));
+        assert!(result.get("additionalProperties").is_none());
+        assert!(result["allOf"][0].get("additionalProperties").is_none());
+        assert!(result["allOf"][1].get("additionalProperties").is_none());
+
+        let validator = jsonschema::validator_for(&result).unwrap();
+        assert!(validator.is_valid(&json!({ "id": "id_1", "name": "Ada" })));
+        assert!(!validator.is_valid(&json!({
+            "id": "id_1",
+            "name": "Ada",
+            "unexpected": true
+        })));
+    }
+
+    #[test]
     fn non_strict_mode_skips_injection() {
         // With strict=false, additionalProperties should not be touched
         let schema = json!({

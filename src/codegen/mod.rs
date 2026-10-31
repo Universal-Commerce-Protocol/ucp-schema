@@ -3,7 +3,9 @@
 mod compose;
 mod hoist;
 pub mod normalizer;
+pub mod profile;
 mod reachability;
+pub mod reify;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -13,7 +15,10 @@ use serde_json::Value;
 
 use crate::codegen::compose::compose_active_extensions;
 use crate::codegen::hoist::{hoist_defs, insert_sliced_or_normalized_def};
-use crate::codegen::normalizer::{align_directional_refs, to_pascal_case};
+use crate::codegen::normalizer::{
+    align_directional_refs, flatten_object_allof, qualify_inline_object_titles, to_pascal_case,
+};
+pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
 };
@@ -48,6 +53,11 @@ impl GenerateTypesOptions {
     /// Create default [`GenerateTypesOptions`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Create [`GenerateTypesOptions`] scoped to a UCP discovery profile path or URL.
+    pub fn from_profile(profile: impl Into<String>) -> Self {
+        Self::new().profile(profile)
     }
 
     /// Set the local schema directory path.
@@ -120,6 +130,20 @@ pub enum CodegenError {
     ResolveError(#[from] ResolveError),
     #[error("schema composition error: {0}")]
     ComposeError(#[from] ComposeError),
+    #[error("profile '{profile}' does not declare any service binding with transport 'rest'")]
+    NoRestServiceBinding { profile: String },
+    #[error(
+        "REST service binding '{service}' in profile '{profile}' is missing required 'schema' URL"
+    )]
+    MissingServiceSchema { profile: String, service: String },
+    #[error(
+        "conflicting active OpenAPI route '{path}' declared by both '{first_service}' and '{second_service}' (use --service to scope to a single service)"
+    )]
+    ConflictingServicePath {
+        path: String,
+        first_service: String,
+        second_service: String,
+    },
 }
 
 impl CodegenError {
@@ -128,42 +152,68 @@ impl CodegenError {
         match self {
             Self::ResolveError(e) => e.exit_code(),
             Self::ComposeError(e) => e.exit_code(),
+            Self::NoRestServiceBinding { .. }
+            | Self::MissingServiceSchema { .. }
+            | Self::ConflictingServicePath { .. } => 2,
         }
     }
 }
 
 /// Compile UCP schemas into a self-contained `$defs` type table and intermediate metadata.
 pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, CodegenError> {
-    if options.profile.is_some() {
-        return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
-            message: "--profile mode is not yet implemented (deferred to Task 5)".to_string(),
-        }));
-    }
-    let Some(schema_dir) = options.schema_dir.as_deref() else {
-        return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
-            message: "--schema-dir is required when --profile is not provided".to_string(),
-        }));
-    };
-    if !schema_dir.exists() {
-        return Err(CodegenError::ResolveError(ResolveError::FileNotFound {
-            path: schema_dir.to_path_buf(),
-        }));
-    };
-
     // Stage 1: Entrypoint & Transitive $ref Reachability Crawl
-    let mut loaded = load_all_schemas(schema_dir)?;
-    let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
-    let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
-    let (active_cap_indices, active_ext_indices, active_capabilities) =
-        select_active_schemas(&loaded, cap_queries, ext_queries)?;
-    let include_all = cap_queries.is_none() && ext_queries.is_none();
-    let reachable_indices = compute_reachable_closure(
-        &loaded,
-        &active_cap_indices,
-        &active_ext_indices,
-        &active_capabilities,
-        include_all,
-    );
+    let (
+        mut loaded,
+        reachable_indices,
+        active_cap_indices,
+        active_ext_indices,
+        active_capabilities,
+    ) = if let Some(profile_source) = options.profile.as_deref() {
+        let has_caps = options
+            .capabilities
+            .as_deref()
+            .is_some_and(|s| !s.is_empty());
+        let has_exts = options.extensions.as_deref().is_some_and(|s| !s.is_empty());
+        if options.schema_dir.is_some() || has_caps || has_exts {
+            return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                message:
+                    "--profile cannot be combined with --schema-dir, --capability, or --extension"
+                        .to_string(),
+            }));
+        }
+        profile::load_and_compute_profile_closure(profile_source)?
+    } else {
+        let Some(schema_dir) = options.schema_dir.as_deref() else {
+            return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                message: "--schema-dir is required when --profile is not provided".to_string(),
+            }));
+        };
+        if !schema_dir.exists() {
+            return Err(CodegenError::ResolveError(ResolveError::FileNotFound {
+                path: schema_dir.to_path_buf(),
+            }));
+        }
+        let loaded = load_all_schemas(schema_dir)?;
+        let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
+        let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
+        let (active_cap_indices, active_ext_indices, active_capabilities) =
+            select_active_schemas(&loaded, cap_queries, ext_queries)?;
+        let include_all = cap_queries.is_none() && ext_queries.is_none();
+        let reachable_indices = compute_reachable_closure(
+            &loaded,
+            &active_cap_indices,
+            &active_ext_indices,
+            &active_capabilities,
+            include_all,
+        );
+        (
+            loaded,
+            reachable_indices,
+            active_cap_indices,
+            active_ext_indices,
+            active_capabilities,
+        )
+    };
 
     // Stage 2: Upfront $defs Hoisting & Collision Qualification
     let mut defs = BTreeMap::new();
@@ -190,7 +240,12 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         &mut inlined_mixin_defs,
     )?;
 
-    // Stage 4: Inline Conditional Variant Hoisting (added in Phase 3 / Task 6)
+    // Stage 4: Inline Conditional Variant Hoisting
+    reify::hoist_inline_conditional_variants(
+        &mut root_raw_schemas,
+        &mut defs,
+        &mut sliced_base_names,
+    )?;
 
     // Stage 5: Directional Slicing & Base Normalization
     for (base_name, raw_schema) in &root_raw_schemas {
@@ -203,10 +258,14 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         )?;
     }
 
-    // Stage 6: Directional $ref Alignment
+    // Stage 6: Directional $ref Alignment & Single-Object/Array allOf Flattening
     align_all_directional_refs(&mut defs, &sliced_base_names);
+    flatten_object_allof(&mut defs);
 
-    // Stage 7: Ordered anyOf Union Lowering & Subtype Registration (added in Phase 3 / Task 7)
+    // Stage 7: Ordered anyOf Union Lowering & Subtype Registration
+    let lowered_unions = reify::lower_conditional_unions(&mut defs);
+    reify::register_extended_subtypes(&mut defs, &lowered_unions, &sliced_base_names);
+    qualify_inline_object_titles(&mut defs);
 
     // Stage 8: Empty-Object, Inlined-Mixin & Unreachable Request-Slice Pruning
     let active_cap_root_requests: BTreeSet<String> = active_cap_indices
@@ -270,16 +329,19 @@ pub(super) fn has_root_schema_body(val: &Value) -> bool {
     val.is_object() && !is_empty_object_schema(val)
 }
 
+pub(super) fn directional_request_suffix(name: &str) -> Option<&'static str> {
+    ["CreateRequest", "UpdateRequest", "CompleteRequest"]
+        .into_iter()
+        .find(|s| name.ends_with(s))
+}
+
 fn align_all_directional_refs(
     defs: &mut BTreeMap<String, Value>,
     sliced_base_names: &BTreeSet<String>,
 ) {
     let known_defs: BTreeSet<String> = defs.keys().cloned().collect();
     for (def_name, schema_val) in defs.iter_mut() {
-        let Some(suffix) = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
-            .into_iter()
-            .find(|s| def_name.ends_with(s))
-        else {
+        let Some(suffix) = directional_request_suffix(def_name) else {
             continue;
         };
         align_directional_refs(schema_val, suffix, &known_defs);
@@ -288,8 +350,13 @@ fn align_all_directional_refs(
                 return;
             };
             all_of.retain(|branch| {
-                local_def_ref(branch).is_none_or(|target| !sliced_base_names.contains(target))
+                let target =
+                    local_def_ref(branch).or_else(|| branch.get("then").and_then(local_def_ref));
+                target.is_none_or(|t| !sliced_base_names.contains(t))
             });
+            if all_of.is_empty() {
+                obj.remove("allOf");
+            }
         });
     }
 }
@@ -320,9 +387,16 @@ fn prune_empty_object_defs(
             if is_empty_object_schema(val) || inlined_mixin_defs.contains(name) {
                 return false;
             }
-            let is_request_slice = ["CreateRequest", "UpdateRequest", "CompleteRequest"]
-                .iter()
-                .any(|s| name.ends_with(s));
+            let is_request_slice = [
+                "CreateRequest",
+                "UpdateRequest",
+                "CompleteRequest",
+                "CreateRequestBase",
+                "UpdateRequestBase",
+                "CompleteRequestBase",
+            ]
+            .iter()
+            .any(|s| name.ends_with(s));
             !is_request_slice || active_cap_root_requests.contains(name)
         });
         if defs.len() == before {
@@ -439,6 +513,7 @@ mod tests {
     fn options_builders_and_error_exit_codes_behave_as_expected() {
         let opts = GenerateTypesOptions::new()
             .profile("https://example.com/profile.json")
+            .schema_dir("/some/dir")
             .capabilities(Vec::<&str>::new())
             .extensions(Vec::<&str>::new())
             .title("");
@@ -450,7 +525,26 @@ mod tests {
         assert!(opts.extensions.is_none());
         assert_eq!(opts.title, "");
 
-        let profile_err = compile_types(&opts).expect_err("profile guard must error before Task 5");
-        assert_eq!(profile_err.exit_code(), 2);
+        let conflict_err =
+            compile_types(&opts).expect_err("combining profile and schema_dir must error");
+        assert_eq!(conflict_err.exit_code(), 2);
+
+        let no_rest = CodegenError::NoRestServiceBinding {
+            profile: "p".to_string(),
+        };
+        assert_eq!(no_rest.exit_code(), 2);
+
+        let missing_svc = CodegenError::MissingServiceSchema {
+            profile: "p".to_string(),
+            service: "s".to_string(),
+        };
+        assert_eq!(missing_svc.exit_code(), 2);
+
+        let conflicting_path = CodegenError::ConflictingServicePath {
+            path: "/orders".to_string(),
+            first_service: "dev.ucp.shopping".to_string(),
+            second_service: "dev.vendor.orders".to_string(),
+        };
+        assert_eq!(conflicting_path.exit_code(), 2);
     }
 }

@@ -281,6 +281,39 @@ mod validate_command {
     }
 
     #[test]
+    fn validate_rejects_a_schema_whose_required_is_not_an_array() {
+        // A malformed `required` used to be rewritten to an empty array during
+        // resolution, so the constraint vanished and an instance missing the
+        // field validated cleanly. The authored value now survives, the
+        // validator refuses the schema, and the run exits 2 rather than 0.
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "type": "object",
+                "properties": { "name": { "type": "string" } },
+                "required": "name"
+            }"#,
+        );
+        let payload = write_temp_file(&dir, "payload.json", r#"{}"#);
+
+        cmd()
+            .args([
+                "validate",
+                payload.to_str().unwrap(),
+                "--schema",
+                schema.to_str().unwrap(),
+                "--request",
+                "--op",
+                "create",
+            ])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("invalid schema"));
+    }
+
+    #[test]
     fn validate_wrong_type() {
         let dir = TempDir::new().unwrap();
         let schema = write_temp_file(
@@ -1469,6 +1502,98 @@ mod compose {
             .code(2)
             .stdout(predicate::str::contains(r#""valid":false"#))
             .stdout(predicate::str::contains(r#""errors":"#));
+    }
+}
+
+mod lint_command {
+    use super::*;
+
+    #[test]
+    fn valid_schema_succeeds() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "type": "object",
+                "properties": { "id": { "type": "string" } }
+            }"#,
+        );
+
+        cmd()
+            .args(["lint", schema.to_str().unwrap()])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("all passed"));
+    }
+
+    #[test]
+    fn broken_internal_ref_fails_with_diagnostic_code() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r##"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "$ref": "#/$defs/missing"
+            }"##,
+        );
+
+        cmd()
+            .args(["lint", schema.to_str().unwrap()])
+            .assert()
+            .code(1)
+            .stdout(predicate::str::contains("E003"));
+    }
+
+    #[test]
+    fn json_output_is_parseable() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "type": "string"
+            }"#,
+        );
+
+        let assert = cmd()
+            .args(["lint", schema.to_str().unwrap(), "--format", "json"])
+            .assert()
+            .success();
+        let output: serde_json::Value =
+            serde_json::from_slice(&assert.get_output().stdout).unwrap();
+
+        assert_eq!(output["files_checked"], 1);
+        assert_eq!(output["errors"], 0);
+        assert_eq!(output["results"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn unsupported_format_fails_before_linting() {
+        let dir = TempDir::new().unwrap();
+        let schema = write_temp_file(
+            &dir,
+            "schema.json",
+            r#"{
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "$id": "https://example.com/schema.json",
+                "type": "string"
+            }"#,
+        );
+
+        cmd()
+            .args(["lint", schema.to_str().unwrap(), "--format", "yaml"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "unsupported lint output format: yaml",
+            ));
     }
 }
 

@@ -55,6 +55,12 @@ fn assert_bundle_invariants(defs: &std::collections::BTreeMap<String, Value>) {
                     all_of.iter().all(|b| b.get("title").is_none()),
                     "def '{def_name}' contains inline allOf branch title"
                 );
+                assert!(
+                    !all_of
+                        .iter()
+                        .any(|b| b.get("then").and_then(|t| t.get("$ref")).is_some()),
+                    "def '{def_name}' retains an un-lowered if/then.$ref branch in allOf"
+                );
             }
             assert!(
                 !obj.keys().any(|k| {
@@ -425,8 +431,12 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
         serde_json::json!({ "$ref": "#/$defs/Policy" })
     );
     assert_eq!(
-        bundle.defs["Policy"]["allOf"][0]["then"]["$ref"],
+        bundle.defs["Policy"]["anyOf"][0]["$ref"],
         "#/$defs/CancellationItem"
+    );
+    assert_eq!(
+        bundle.defs["Policy"]["anyOf"][1]["$ref"],
+        "#/$defs/PolicyBase"
     );
 
     let complete_ap2_allof = bundle.defs["CheckoutCompleteRequest"]["properties"]["ap2"]["allOf"]
@@ -436,6 +446,14 @@ fn ucp_corpus_full_compilation_has_zero_dangling_refs_or_annotations() {
     assert_eq!(
         complete_ap2_allof[0]["$ref"],
         "#/$defs/Ap2WithCheckoutMandateCompleteRequest"
+    );
+    assert_eq!(
+        bundle.defs["CheckoutCompleteRequest"]["required"],
+        serde_json::json!(["payment"])
+    );
+    assert_eq!(
+        bundle.defs["Ap2WithCheckoutMandateCompleteRequest"]["required"],
+        serde_json::json!(["checkout_mandate"])
     );
 }
 
@@ -548,11 +566,11 @@ fn cli_generate_types_stdout_pretty_and_compact() {
         .is_some());
     assert!(!doc.defs.contains_key("Cart"));
 
-    // 2. --pretty=false emits compact single-line JSON, and --schema-local-base alias works
+    // 2. --pretty=false emits compact single-line JSON, and --capabilities/--extensions aliases work
     let compact_out = std::process::Command::new(bin)
         .args([
             "generate-types",
-            "--schema-local-base",
+            "--schema-dir",
             schema_dir.to_str().unwrap(),
             "--capabilities",
             "dev.ucp.shopping.checkout,dev.ucp.shopping.cart",
@@ -667,4 +685,1766 @@ fn cli_generate_types_error_exit_codes() {
         .output()
         .unwrap();
     assert_eq!(bad_out.status.code(), Some(3));
+
+    // 5. --output inside --schema-dir without .types.json suffix -> exit code 2
+    let inside_out = schema_dir.join("bundle.json");
+    let bad_inside_out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--schema-dir",
+            schema_dir.to_str().unwrap(),
+            "--output",
+            inside_out.to_str().unwrap(),
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(bad_inside_out.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&bad_inside_out.stderr).contains(".types.json"),
+        "expected .types.json guidance on stderr"
+    );
+    assert!(!inside_out.exists());
+}
+
+#[test]
+fn profile_mode_matches_directory_mode_closure_and_prunes_orphaned_extensions() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    let profile_json = serde_json::json!({
+        "ucp": {
+            "version": "2026-08-25",
+            "services": {
+                "dev.ucp.shopping": [{
+                    "version": "2026-08-25",
+                    "transport": "rest",
+                    "endpoint": "https://merchant.example.com/ucp",
+                    "schema": "https://ucp.dev/2026-08-25/services/shopping/rest.openapi.json"
+                }]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/discount.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.cart"]
+                }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.order"]
+                }],
+                "dev.ucp.lodging.policy.cancellation": [{
+                    "version": "2026-08-25",
+                    "schema": s("lodging/policy_cancellation.json"),
+                    "extends": "dev.ucp.lodging.booking"
+                }]
+            }
+        }
+    });
+    std::fs::write(&profile_path, profile_json.to_string()).unwrap();
+
+    let parsed = ucp_schema::parse_profile_source(profile_path.to_str().unwrap()).unwrap();
+    assert_eq!(parsed.capabilities.len(), 3);
+    assert_eq!(parsed.rest_services.len(), 1);
+    assert_eq!(
+        parsed.rest_services[0].endpoint.as_deref(),
+        Some("https://merchant.example.com/ucp")
+    );
+
+    let profile_bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&profile_bundle.defs);
+    assert_lacks_defs(&profile_bundle.defs, &["CancellationItem", "Booking"]);
+
+    let directory_bundle = generate_types(
+        &GenerateTypesOptions::new()
+            .schema_dir(&schema_dir)
+            .capabilities(["dev.ucp.shopping.checkout"])
+            .extensions(["dev.ucp.shopping.discount", "dev.ucp.shopping.fulfillment"]),
+    )
+    .unwrap();
+
+    assert_eq!(
+        profile_bundle.defs, directory_bundle.defs,
+        "--profile mode must produce the exact same $defs bundle as equivalent --capability/--extension flags"
+    );
+}
+
+#[test]
+fn profile_mode_allbirds_multi_origin_shopify_catalog_extension() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let tmp = tempfile::tempdir().unwrap();
+    let shopify_catalog_path = tmp.path().join("shopify_catalog.json");
+    let ucp_url = |rel: &str| format!("https://ucp.dev/2026-08-25/schemas/{rel}");
+
+    let shopify_catalog_schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://shopify.dev/ucp/schemas/2026-08-25/shopify_catalog.json",
+        "name": "dev.shopify.catalog",
+        "version": "2026-08-25",
+        "title": "Shopify Catalog Extensions",
+        "$defs": {
+            "collection": {
+                "type": "object",
+                "required": ["id", "handle", "title", "description"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "handle": { "type": "string" },
+                    "title": { "type": "string" },
+                    "description": { "$ref": ucp_url("common/types/description.json") },
+                    "media": { "$ref": ucp_url("common/types/media.json") }
+                }
+            },
+            "selling_plan_price": {
+                "type": "object",
+                "required": ["total"],
+                "properties": { "total": { "$ref": ucp_url("common/types/price.json") } }
+            },
+            "selling_plan": {
+                "type": "object",
+                "required": ["id", "name", "price"],
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" },
+                    "price": { "$ref": "#/$defs/selling_plan_price" }
+                }
+            },
+            "shopify_variant": {
+                "title": "Shopify Variant",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/variant.json") },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "checkout_url": { "type": "string", "format": "uri" },
+                            "selling_plans": {
+                                "type": "array",
+                                "items": { "$ref": "#/$defs/selling_plan" },
+                                "ucp_response": {
+                                    "transition": {
+                                        "from": "omit",
+                                        "to": "optional",
+                                        "description": "Planned: subscription selling plans."
+                                    }
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "shopify_product": {
+                "title": "Shopify Product",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/product.json") },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "variants": { "type": "array", "items": { "$ref": "#/$defs/shopify_variant" } }
+                        }
+                    }
+                ]
+            },
+            "storefront_variant": {
+                "title": "Storefront Variant",
+                "allOf": [{ "$ref": "#/$defs/shopify_variant" }]
+            },
+            "storefront_product": {
+                "title": "Storefront Product",
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_product" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "gift_card": { "type": "boolean" },
+                            "collections": { "type": "array", "items": { "$ref": "#/$defs/collection" } },
+                            "variants": { "type": "array", "items": { "$ref": "#/$defs/storefront_variant" } }
+                        }
+                    }
+                ]
+            },
+            "shopify_filters": {
+                "type": "object",
+                "title": "Shopify Filters",
+                "properties": { "available": { "type": "boolean", "default": true } }
+            },
+            "shopify_search_filters": {
+                "title": "Shopify Search Filters",
+                "allOf": [
+                    { "$ref": ucp_url("shopping/types/search_filters.json") },
+                    { "$ref": "#/$defs/shopify_filters" }
+                ]
+            },
+            "shopify_search_request": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_search.json#/$defs/search_request") },
+                    { "type": "object", "properties": { "filters": { "$ref": "#/$defs/shopify_search_filters" } } }
+                ]
+            },
+            "shopify_search_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_search.json#/$defs/search_response") },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/shopify_product" } } } }
+                ]
+            },
+            "shopify_lookup_request": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/lookup_request") },
+                    { "type": "object", "properties": { "filters": { "$ref": "#/$defs/shopify_filters" } } }
+                ]
+            },
+            "shopify_lookup_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/lookup_response") },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/shopify_product" } } } }
+                ]
+            },
+            "shopify_get_product_request": {
+                "allOf": [{ "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/get_product_request") }]
+            },
+            "shopify_get_product_response": {
+                "allOf": [
+                    { "$ref": ucp_url("shopping/catalog_lookup.json#/$defs/get_product_response") },
+                    { "type": "object", "properties": { "product": { "$ref": "#/$defs/shopify_product" } } }
+                ]
+            },
+            "storefront_search_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_search_request" }],
+                "required": ["query"]
+            },
+            "storefront_search_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_search_response" },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/storefront_product" } } } }
+                ]
+            },
+            "storefront_lookup_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_lookup_request" }]
+            },
+            "storefront_lookup_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_lookup_response" },
+                    { "type": "object", "properties": { "products": { "type": "array", "items": { "$ref": "#/$defs/storefront_product" } } } }
+                ]
+            },
+            "storefront_get_product_request": {
+                "allOf": [{ "$ref": "#/$defs/shopify_get_product_request" }]
+            },
+            "storefront_get_product_response": {
+                "allOf": [
+                    { "$ref": "#/$defs/shopify_get_product_response" },
+                    { "type": "object", "properties": { "product": { "$ref": "#/$defs/storefront_product" } } }
+                ]
+            },
+            "dev.ucp.shopping.catalog.search": {
+                "$defs": {
+                    "search_request": { "$ref": "#/$defs/storefront_search_request" },
+                    "search_response": { "$ref": "#/$defs/storefront_search_response" }
+                }
+            },
+            "dev.ucp.shopping.catalog.lookup": {
+                "$defs": {
+                    "lookup_request": { "$ref": "#/$defs/storefront_lookup_request" },
+                    "lookup_response": { "$ref": "#/$defs/storefront_lookup_response" },
+                    "get_product_request": { "$ref": "#/$defs/storefront_get_product_request" },
+                    "get_product_response": { "$ref": "#/$defs/storefront_get_product_response" }
+                }
+            }
+        }
+    });
+    std::fs::write(&shopify_catalog_path, shopify_catalog_schema.to_string()).unwrap();
+
+    let allbirds_profile_path = tmp.path().join("allbirds_profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+    let allbirds_profile = serde_json::json!({
+        "ucp": {
+            "version": "2026-08-25",
+            "services": {
+                "dev.ucp.shopping": [{
+                    "version": "2026-08-25",
+                    "transport": "mcp",
+                    "endpoint": "https://weareallbirds.myshopify.com/api/ucp/mcp",
+                    "schema": "https://ucp.dev/2026-08-25/services/shopping/mcp.openrpc.json"
+                }]
+            },
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.order"]
+                }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-08-25",
+                    "schema": s("shopping/discount.json"),
+                    "extends": ["dev.ucp.shopping.checkout", "dev.ucp.shopping.cart"]
+                }],
+                "dev.ucp.shopping.cart": [{ "version": "2026-08-25", "schema": s("shopping/cart.json") }],
+                "dev.ucp.shopping.order": [{ "version": "2026-08-25", "schema": s("shopping/order.json") }],
+                "dev.ucp.shopping.catalog.search": [{ "version": "2026-08-25", "schema": s("shopping/catalog_search.json") }],
+                "dev.ucp.shopping.catalog.lookup": [{ "version": "2026-08-25", "schema": s("shopping/catalog_lookup.json") }],
+                "dev.shopify.catalog": [{
+                    "version": "2026-08-25",
+                    "schema": shopify_catalog_path.to_str().unwrap(),
+                    "extends": ["dev.ucp.shopping.catalog.search", "dev.ucp.shopping.catalog.lookup"]
+                }],
+                "dev.ucp.common.identity_linking": [{ "version": "2026-08-25", "schema": s("common/identity_linking.json") }],
+                "dev.ucp.shopping.permalink": [{ "version": "2026-08-25", "schema": s("shopping/permalink.json") }]
+            }
+        }
+    });
+    std::fs::write(&allbirds_profile_path, allbirds_profile.to_string()).unwrap();
+
+    let bundle = generate_types(
+        &GenerateTypesOptions::new().profile(allbirds_profile_path.to_str().unwrap()),
+    )
+    .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "Checkout",
+            "CheckoutCreateRequest",
+            "Cart",
+            "Order",
+            "CatalogSearchRequest",
+            "CatalogSearchResponse",
+            "CatalogLookupRequest",
+            "CatalogLookupResponse",
+            "CatalogGetProductRequest",
+            "CatalogGetProductResponse",
+            "StorefrontProduct",
+            "StorefrontVariant",
+            "ShopifyProduct",
+            "ShopifyVariant",
+            "Collection",
+            "SellingPlan",
+            "SellingPlanPrice",
+            "ShopifyFilters",
+            "ShopifySearchFilters",
+            "IdentityLinkingPlatformSchema",
+            "PermalinkPlatformSchema",
+            "ErrorResponse",
+        ],
+    );
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "Booking",
+            "StorefrontSearchRequest",
+            "ShopifySearchRequest",
+            "StorefrontSearchResponse",
+            "ShopifySearchResponse",
+            "StorefrontLookupRequest",
+            "ShopifyLookupRequest",
+            "StorefrontLookupResponse",
+            "ShopifyLookupResponse",
+            "StorefrontGetProductRequest",
+            "ShopifyGetProductRequest",
+            "StorefrontGetProductResponse",
+            "ShopifyGetProductResponse",
+        ],
+    );
+
+    assert_eq!(
+        bundle.defs["CatalogSearchRequest"]["properties"]["filters"]["$ref"],
+        "#/$defs/ShopifySearchFilters"
+    );
+    assert!(bundle.defs["CatalogSearchRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("query".to_string())));
+    assert_eq!(
+        bundle.defs["CatalogSearchResponse"]["properties"]["products"]["items"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+    assert_eq!(
+        bundle.defs["CatalogLookupResponse"]["properties"]["products"]["items"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+    assert_eq!(
+        bundle.defs["CatalogGetProductResponse"]["properties"]["product"]["$ref"],
+        "#/$defs/StorefrontProduct"
+    );
+}
+
+#[test]
+fn cli_generate_types_profile_mode_orphaned_warning_and_flag_conflicts() {
+    let bin = env!("CARGO_BIN_EXE_ucp-schema");
+    let schema_dir = fixture_schemas_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let profile_path = tmp.path().join("profile.json");
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    let profile_json = serde_json::json!({
+        "ucp": {
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-01-11", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/discount.json"),
+                    "extends": "dev.ucp.shopping.checkout"
+                }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": "dev.ucp.shopping.order"
+                }]
+            }
+        }
+    });
+    std::fs::write(&profile_path, profile_json.to_string()).unwrap();
+
+    // 1. Valid --profile execution emits orphaned extension warning to stderr and valid bundle to stdout
+    let out = std::process::Command::new(bin)
+        .args([
+            "generate-types",
+            "--profile",
+            profile_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("run ucp-schema generate-types --profile");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("warning: pruning orphaned extension 'dev.ucp.shopping.fulfillment'"),
+        "expected orphaned extension warning on stderr, got: {stderr}"
+    );
+    let doc: ucp_schema::TypesBundleDoc = serde_json::from_slice(&out.stdout).unwrap();
+    assert_bundle_invariants(&doc.defs);
+    assert_has_defs(
+        &doc.defs,
+        &["Checkout", "CheckoutCreateRequest", "CheckoutUpdateRequest"],
+    );
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("discounts")
+        .is_some());
+    assert!(doc.defs["Checkout"]["properties"]
+        .get("fulfillment")
+        .is_none());
+
+    // 2. --profile conflicts with --schema-dir, --capability, and --extension (exit code 2)
+    for extra_args in [
+        ["--schema-dir", schema_dir.to_str().unwrap()],
+        ["--capability", "dev.ucp.shopping.checkout"],
+        ["--extension", "dev.ucp.shopping.discount"],
+    ] {
+        let conflict = std::process::Command::new(bin)
+            .args([
+                "generate-types",
+                "--profile",
+                profile_path.to_str().unwrap(),
+            ])
+            .args(extra_args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            conflict.status.code(),
+            Some(2),
+            "expected clap conflict exit code 2 for {extra_args:?}"
+        );
+    }
+}
+
+#[test]
+fn profile_mode_fixture_closure_and_declared_extends_scoping() {
+    let schema_dir = fixture_schemas_dir();
+    let tmp = tempfile::tempdir().unwrap();
+    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
+
+    // 1. Self-contained CI parity check: --profile vs --schema-dir with --capability/--extension
+    let parity_profile_path = tmp.path().join("parity_profile.json");
+    let parity_profile = serde_json::json!({
+        "ucp": {
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-01-11", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.discount": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/discount.json"),
+                    "extends": "dev.ucp.shopping.checkout"
+                }],
+                "dev.ucp.shopping.fulfillment": [{
+                    "version": "2026-01-11",
+                    "schema": s("shopping/fulfillment.json"),
+                    "extends": "dev.ucp.shopping.checkout"
+                }]
+            }
+        }
+    });
+    std::fs::write(&parity_profile_path, parity_profile.to_string()).unwrap();
+
+    let profile_bundle =
+        generate_types(&GenerateTypesOptions::new().profile(parity_profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&profile_bundle.defs);
+
+    let dir_bundle = generate_types(
+        &GenerateTypesOptions::new()
+            .schema_dir(&schema_dir)
+            .capabilities(["dev.ucp.shopping.checkout"])
+            .extensions(["dev.ucp.shopping.discount", "dev.ucp.shopping.fulfillment"]),
+    )
+    .unwrap();
+    assert_eq!(profile_bundle.defs, dir_bundle.defs);
+
+    // 2. Discriminating declared_extends test: two active root capabilities (checkout + cart)
+    //    with an extension whose schema defines overlays for both, but whose profile entry
+    //    declares `"extends": "dev.ucp.shopping.checkout"`.
+    let multi_ext_path = tmp.path().join("multi_ext.json");
+    let multi_ext_schema = serde_json::json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://ucp.dev/schemas/shopping/multi_ext.json",
+        "name": "dev.ucp.shopping.multi_ext",
+        "version": "2026-01-11",
+        "title": "Multi Target Extension",
+        "$defs": {
+            "checkout_perk": {
+                "title": "CheckoutPerk",
+                "type": "object",
+                "properties": { "code": { "type": "string" } }
+            },
+            "cart_perk": {
+                "title": "CartPerk",
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string" },
+                    "extra": { "$ref": "missing_cart_only.json" }
+                }
+            },
+            "dev.ucp.shopping.checkout": {
+                "type": "object",
+                "properties": {
+                    "checkout_perk": { "$ref": "#/$defs/checkout_perk" }
+                }
+            },
+            "dev.ucp.shopping.cart": {
+                "type": "object",
+                "properties": {
+                    "cart_perk": { "$ref": "#/$defs/cart_perk" }
+                }
+            }
+        }
+    });
+    std::fs::write(&multi_ext_path, multi_ext_schema.to_string()).unwrap();
+
+    let scoped_profile_path = tmp.path().join("scoped_profile.json");
+    let scoped_profile = serde_json::json!({
+        "ucp": {
+            "capabilities": {
+                "dev.ucp.shopping.checkout": [{ "version": "2026-01-11", "schema": s("shopping/checkout.json") }],
+                "dev.ucp.shopping.cart": [{ "version": "2026-01-11", "schema": s("shopping/cart.json") }],
+                "dev.ucp.shopping.multi_ext": [{
+                    "version": "2026-01-11",
+                    "schema": multi_ext_path.to_str().unwrap(),
+                    "extends": "dev.ucp.shopping.checkout"
+                }]
+            }
+        }
+    });
+    std::fs::write(&scoped_profile_path, scoped_profile.to_string()).unwrap();
+
+    let scoped_bundle =
+        generate_types(&GenerateTypesOptions::new().profile(scoped_profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&scoped_bundle.defs);
+    assert_has_defs(&scoped_bundle.defs, &["Checkout", "Cart", "CheckoutPerk"]);
+    assert_lacks_defs(&scoped_bundle.defs, &["CartPerk"]);
+    assert!(scoped_bundle.defs["Checkout"]["properties"]
+        .get("checkout_perk")
+        .is_some());
+    assert!(
+        scoped_bundle.defs["Cart"]["properties"]
+            .get("cart_perk")
+            .is_none(),
+        "Cart must not receive overlays when profile extends only dev.ucp.shopping.checkout"
+    );
+}
+
+#[test]
+fn profile_mode_multi_origin_relocates_only_matching_authority() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ucp_shopping = tmp.path().join("ucp_root/schemas/shopping");
+    let vendor_shopping = tmp.path().join("vendor_root/schemas/shopping");
+    std::fs::create_dir_all(&ucp_shopping).unwrap();
+    std::fs::create_dir_all(&vendor_shopping).unwrap();
+
+    let ucp_checkout_path = ucp_shopping.join("checkout.json");
+    std::fs::write(
+        &ucp_checkout_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+            "name": "dev.ucp.shopping.checkout",
+            "version": "2026-08-25",
+            "title": "Checkout",
+            "type": "object",
+            "properties": { "id": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    std::fs::write(
+        ucp_shopping.join("ucp_reward.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/ucp_reward.json",
+            "title": "UcpReward",
+            "type": "object",
+            "properties": { "ucp_points": { "type": "integer" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Decoy at the same relative path under ucp_root/schemas; must NOT be loaded for vendor URLs
+    std::fs::write(
+        ucp_shopping.join("vendor_reward.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/vendor_reward.json",
+            "title": "VendorReward",
+            "type": "object",
+            "properties": { "wrong_origin_decoy": { "type": "boolean" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    std::fs::write(
+        vendor_shopping.join("vendor_reward.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://vendor.example.com/schemas/shopping/vendor_reward.json",
+            "title": "VendorReward",
+            "type": "object",
+            "properties": { "vendor_tier": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let vendor_loyalty_path = vendor_shopping.join("loyalty.json");
+    std::fs::write(
+        &vendor_loyalty_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://vendor.example.com/schemas/shopping/loyalty.json",
+            "name": "com.example.vendor.loyalty",
+            "version": "2026-08-25",
+            "title": "Vendor Loyalty",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "properties": {
+                        "ucp_reward": { "$ref": "https://ucp.dev/2026-08-25/schemas/shopping/ucp_reward.json" },
+                        "vendor_reward": { "$ref": "https://vendor.example.com/2026-08-25/schemas/shopping/vendor_reward.json" }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let profile_path = tmp.path().join("profile.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::json!({
+            "ucp": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-08-25",
+                        "schema": ucp_checkout_path.to_str().unwrap()
+                    }],
+                    "com.example.vendor.loyalty": [{
+                        "version": "2026-08-25",
+                        "schema": vendor_loyalty_path.to_str().unwrap(),
+                        "extends": "dev.ucp.shopping.checkout"
+                    }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+    assert_has_defs(&bundle.defs, &["Checkout", "UcpReward", "VendorReward"]);
+    assert!(bundle.defs["UcpReward"]["properties"]
+        .get("ucp_points")
+        .is_some());
+    assert!(bundle.defs["VendorReward"]["properties"]
+        .get("vendor_tier")
+        .is_some());
+    assert!(
+        bundle.defs["VendorReward"]["properties"]
+            .get("wrong_origin_decoy")
+            .is_none(),
+        "vendor URL must not relocate to ucp.dev local schema root"
+    );
+}
+
+#[test]
+fn profile_mode_disambiguates_vendor_local_file_stem_colliding_with_ucp_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ucp_types = tmp.path().join("ucp/schemas/common/types");
+    let ucp_shopping = tmp.path().join("ucp/schemas/shopping");
+    let vendor_types = tmp.path().join("acme/schemas/types");
+    let vendor_shopping = tmp.path().join("acme/schemas/shopping");
+    std::fs::create_dir_all(&ucp_types).unwrap();
+    std::fs::create_dir_all(&ucp_shopping).unwrap();
+    std::fs::create_dir_all(&vendor_types).unwrap();
+    std::fs::create_dir_all(&vendor_shopping).unwrap();
+
+    // UCP canonical Price type (`price.json`)
+    std::fs::write(
+        ucp_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/price.json",
+            "title": "Price",
+            "type": "object",
+            "required": ["amount", "currency"],
+            "properties": {
+                "amount": { "type": "integer" },
+                "currency": { "type": "string" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let ucp_checkout_path = ucp_shopping.join("checkout.json");
+    std::fs::write(
+        &ucp_checkout_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+            "name": "dev.ucp.shopping.checkout",
+            "version": "2026-01-11",
+            "title": "Checkout",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "total_price": { "$ref": "../common/types/price.json" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Vendor local file with the exact same filename (`price.json`)
+    std::fs::write(
+        vendor_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.example.com/schemas/types/price.json",
+            "title": "Vendor Loyalty Price",
+            "type": "object",
+            "required": ["points_cost"],
+            "properties": {
+                "points_cost": { "type": "integer" },
+                "tier": { "type": "string" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let vendor_loyalty_path = vendor_shopping.join("loyalty.json");
+    std::fs::write(
+        &vendor_loyalty_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.example.com/schemas/shopping/loyalty.json",
+            "name": "com.acme.loyalty",
+            "version": "2026-01-11",
+            "title": "Acme Loyalty",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "properties": {
+                        "loyalty_price": { "$ref": "../types/price.json" }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let profile_path = tmp.path().join("profile.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::json!({
+            "ucp": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-01-11",
+                        "schema": ucp_checkout_path.to_str().unwrap()
+                    }],
+                    "com.acme.loyalty": [{
+                        "version": "2026-01-11",
+                        "schema": vendor_loyalty_path.to_str().unwrap(),
+                        "extends": "dev.ucp.shopping.checkout"
+                    }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+    assert_has_defs(&bundle.defs, &["Checkout", "Price", "AcmePrice"]);
+
+    assert!(bundle.defs["Price"]["properties"].get("amount").is_some());
+    assert!(bundle.defs["Price"]["properties"]
+        .get("points_cost")
+        .is_none());
+    assert!(bundle.defs["AcmePrice"]["properties"]
+        .get("points_cost")
+        .is_some());
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["total_price"]["$ref"],
+        "#/$defs/Price"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_price"]["$ref"],
+        "#/$defs/AcmePrice"
+    );
+}
+
+#[test]
+fn profile_mode_disambiguates_spoofed_ucp_id_and_prefix_starting_stems() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ucp_shopping = tmp.path().join("ucp/schemas/shopping");
+    let ucp_common_types = tmp.path().join("ucp/schemas/common/types");
+    let vendor_shopping = tmp.path().join("acme/schemas/shopping");
+    let vendor_types = tmp.path().join("acme/schemas/types");
+    std::fs::create_dir_all(&ucp_shopping).unwrap();
+    std::fs::create_dir_all(&ucp_common_types).unwrap();
+    std::fs::create_dir_all(&vendor_shopping).unwrap();
+    std::fs::create_dir_all(&vendor_types).unwrap();
+
+    std::fs::write(
+        ucp_common_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/price.json",
+            "title": "Price",
+            "type": "object",
+            "properties": { "amount": { "type": "integer" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    std::fs::write(
+        ucp_common_types.join("acme_item.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/acme_item.json",
+            "title": "Acme Item",
+            "type": "object",
+            "properties": { "sku": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let ucp_checkout_path = ucp_shopping.join("checkout.json");
+    std::fs::write(
+        &ucp_checkout_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+            "name": "dev.ucp.shopping.checkout",
+            "version": "2026-01-11",
+            "title": "Checkout",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "total_price": { "$ref": "../common/types/price.json" },
+                "base_item": { "$ref": "../common/types/acme_item.json" }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Vendor price.json with copy-pasted/spoofed https://ucp.dev/ $id
+    std::fs::write(
+        vendor_types.join("price.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/common/types/price.json",
+            "title": "Vendor Loyalty Price",
+            "type": "object",
+            "properties": { "points_cost": { "type": "integer" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    // Vendor acme_item.json whose PascalCase stem ("AcmeItem") already starts with vendor prefix ("Acme")
+    std::fs::write(
+        vendor_types.join("acme_item.json"),
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.com/schemas/types/acme_item.json",
+            "title": "Vendor Acme Item",
+            "type": "object",
+            "properties": { "reward_code": { "type": "string" } }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let vendor_loyalty_path = vendor_shopping.join("loyalty.json");
+    std::fs::write(
+        &vendor_loyalty_path,
+        serde_json::json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://acme.com/schemas/shopping/loyalty.json",
+            "name": "com.acme.loyalty",
+            "version": "2026-01-11",
+            "title": "Acme Loyalty",
+            "$defs": {
+                "dev.ucp.shopping.checkout": {
+                    "type": "object",
+                    "properties": {
+                        "loyalty_price": { "$ref": "../types/price.json" },
+                        "loyalty_url_price": { "$ref": "https://acme.com/2026-01-11/schemas/types/price.json" },
+                        "loyalty_item": { "$ref": "../types/acme_item.json" }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let profile_path = tmp.path().join("profile.json");
+    std::fs::write(
+        &profile_path,
+        serde_json::json!({
+            "ucp": {
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-01-11",
+                        "schema": ucp_checkout_path.to_str().unwrap()
+                    }],
+                    "com.acme.loyalty": [{
+                        "version": "2026-01-11",
+                        "schema": vendor_loyalty_path.to_str().unwrap(),
+                        "extends": "dev.ucp.shopping.checkout"
+                    }]
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let bundle =
+        generate_types(&GenerateTypesOptions::new().profile(profile_path.to_str().unwrap()))
+            .unwrap();
+    assert_bundle_invariants(&bundle.defs);
+    assert_has_defs(
+        &bundle.defs,
+        &["Checkout", "Price", "AcmePrice", "AcmeItem", "AcmeAcmeItem"],
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["total_price"]["$ref"],
+        "#/$defs/Price"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_price"]["$ref"],
+        "#/$defs/AcmePrice"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_url_price"]["$ref"],
+        "#/$defs/AcmePrice"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["base_item"]["$ref"],
+        "#/$defs/AcmeItem"
+    );
+    assert_eq!(
+        bundle.defs["Checkout"]["properties"]["loyalty_item"]["$ref"],
+        "#/$defs/AcmeAcmeItem"
+    );
+}
+
+#[test]
+fn hoist_inline_conditional_variants_and_ast_normalizers_on_ucp_corpus() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(schema_dir)).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    // 1. Pre-slicing inline variant hoisting on FulfillmentMethod -> ShippingMethod, PickupMethod
+    assert_has_defs(
+        &bundle.defs,
+        &[
+            "ShippingMethod",
+            "ShippingMethodCreateRequest",
+            "ShippingMethodUpdateRequest",
+            "PickupMethod",
+            "PickupMethodCreateRequest",
+            "PickupMethodUpdateRequest",
+            "Oauth2Provider",
+        ],
+    );
+    assert_eq!(
+        bundle.defs["ShippingMethodCreateRequest"]["properties"]["destinations"]["items"]["$ref"],
+        "#/$defs/ShippingDestinationCreateRequest"
+    );
+    assert!(
+        bundle.defs["PickupMethodCreateRequest"]["properties"]
+            .get("destinations")
+            .is_none(),
+        "PickupMethodCreateRequest must omit response-only destinations"
+    );
+    assert_eq!(
+        bundle.defs["Oauth2Provider"]["properties"]["type"]["const"],
+        "oauth2"
+    );
+    assert!(bundle.defs["Oauth2Provider"]["properties"]
+        .get("auth_url")
+        .is_some());
+
+    // 2. Scalar value constraints in Total are NOT hoisted into variant classes, and propertyless request slices are omitted
+    assert_lacks_defs(
+        &bundle.defs,
+        &[
+            "DiscountTotal",
+            "SubtotalTotal",
+            "ItemsDiscountTotal",
+            "FulfillmentTotal",
+            "TotalCreateRequest",
+            "TotalUpdateRequest",
+            "TotalsCreateRequest",
+            "TotalsUpdateRequest",
+            "OrderCreateRequest",
+            "OrderUpdateRequest",
+        ],
+    );
+    assert!(bundle.defs["ShippingMethodUpdateRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("type".to_string())));
+    assert!(bundle.defs["PickupMethodUpdateRequest"]["required"]
+        .as_array()
+        .unwrap()
+        .contains(&Value::String("type".to_string())));
+    assert_eq!(
+        bundle.defs["FulfillmentMethodUpdateRequestBase"]["dependentRequired"],
+        serde_json::json!({ "destinations": ["type"] })
+    );
+    assert_eq!(
+        bundle.defs["FulfillmentMethodBase"]["dependentRequired"],
+        serde_json::json!({ "destinations": ["type"] })
+    );
+    assert!(bundle.defs["ShippingMethod"]
+        .get("dependentRequired")
+        .is_none());
+
+    // 3. Totals strips top-level contains allOf, flattens items.allOf, and qualifies inline object titles
+    assert!(bundle.defs["Totals"].get("allOf").is_none());
+    assert_eq!(bundle.defs["Totals"]["items"]["type"], "object");
+    assert_eq!(bundle.defs["Totals"]["items"]["title"], "TotalsItem");
+    assert_eq!(
+        bundle.defs["Totals"]["items"]["properties"]["lines"]["items"]["title"],
+        "TotalsItemLine"
+    );
+    assert!(bundle.defs["Totals"]["items"]["properties"]
+        .get("amount")
+        .is_some());
+    assert!(bundle.defs["Totals"]["items"]["properties"]
+        .get("lines")
+        .is_some());
+    assert_eq!(
+        bundle.defs["Adjustment"]["properties"]["line_items"]["items"]["title"],
+        "AdjustmentLineItem"
+    );
+    assert_eq!(
+        bundle.defs["Expectation"]["properties"]["line_items"]["items"]["title"],
+        "ExpectationLineItem"
+    );
+    assert_eq!(
+        bundle.defs["FulfillmentEvent"]["properties"]["line_items"]["items"]["title"],
+        "FulfillmentEventLineItem"
+    );
+    assert_eq!(
+        bundle.defs["Order"]["properties"]["fulfillment"]["title"],
+        "OrderFulfillment"
+    );
+    assert_eq!(
+        bundle.defs["UnitPrice"]["properties"]["measure"]["title"],
+        "UnitPriceMeasure"
+    );
+    assert_eq!(
+        bundle.defs["UnitPrice"]["properties"]["reference"]["title"],
+        "UnitPriceReference"
+    );
+
+    // 4. Bare anyOf property distribution and branch title qualification on ValueConstraint and StayCreateRequest
+    assert!(bundle.defs["ValueConstraint"].get("properties").is_none());
+    assert_eq!(bundle.defs["ValueConstraint"]["anyOf"][0]["type"], "object");
+    assert_eq!(
+        bundle.defs["ValueConstraint"]["anyOf"][0]["title"],
+        "ValueConstraintEnum"
+    );
+    assert_eq!(
+        bundle.defs["ValueConstraint"]["anyOf"][1]["title"],
+        "ValueConstraintConst"
+    );
+    assert!(bundle.defs["ValueConstraint"]["anyOf"][0]["properties"]
+        .get("enum")
+        .is_some());
+    assert!(bundle.defs["StayCreateRequest"].get("properties").is_none());
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][0]["title"],
+        "StayCreateRequestId"
+    );
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["title"],
+        "StayCreateRequestAccommodationType"
+    );
+    assert_eq!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["properties"]["accommodation_type"]["$ref"],
+        "#/$defs/AccommodationTypeCreateRequest"
+    );
+    assert!(
+        bundle.defs["StayCreateRequest"]["anyOf"][1]["properties"]["accommodation_type"]
+            .get("required")
+            .is_none(),
+        "base $ref property must stay isolated without sibling required keys"
+    );
+
+    // 5. Scalar-or-array union normalization on CapabilityBase.properties.extends
+    assert!(bundle.defs["CapabilityBase"]["properties"]["extends"]
+        .get("oneOf")
+        .is_none());
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][0]["$ref"],
+        "#/$defs/ReverseDomainName"
+    );
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][1]["type"],
+        "array"
+    );
+    assert_eq!(
+        bundle.defs["CapabilityBase"]["properties"]["extends"]["anyOf"][1]["items"]["$ref"],
+        "#/$defs/ReverseDomainName"
+    );
+    assert_eq!(
+        bundle.defs["Location"]["dependentRequired"],
+        serde_json::json!({
+            "exception_hours": ["timezone"],
+            "hours": ["timezone"]
+        })
+    );
+    assert_eq!(
+        bundle.defs["LookupLocation"]["dependentRequired"],
+        serde_json::json!({
+            "exception_hours": ["timezone"],
+            "hours": ["timezone"]
+        })
+    );
+
+    // 6. Single-object allOf flattening on ShippingDestination, LocationDestination, CardPaymentInstrument, LookupLocation
+    for def_name in [
+        "ShippingDestination",
+        "ShippingDestinationCreateRequest",
+        "LocationDestination",
+        "CardPaymentInstrument",
+        "LookupLocation",
+        "UcpPlatformSchema",
+    ] {
+        assert!(
+            bundle.defs[def_name].get("allOf").is_none(),
+            "expected {def_name}.allOf to be flattened"
+        );
+        assert_eq!(bundle.defs[def_name]["type"], "object");
+    }
+    assert!(bundle.defs["ShippingDestination"]["properties"]
+        .get("street_address")
+        .is_some());
+    assert_eq!(
+        bundle.defs["UcpPlatformSchema"]["properties"]["services"]["type"],
+        "object"
+    );
+    assert_eq!(
+        bundle.defs["UcpPlatformSchema"]["properties"]["services"]["additionalProperties"]["items"]
+            ["$ref"],
+        "#/$defs/ServicePlatformSchema"
+    );
+    assert_eq!(
+        bundle.defs["ServicePlatformSchema"]["anyOf"][0]["title"],
+        "ServicePlatformSchemaRest"
+    );
+}
+
+#[test]
+fn open_union_lowering_on_ucp_corpus_enforces_ou1_through_ou4() {
+    let Some(schema_dir) = ucp_schemas_dir() else {
+        return;
+    };
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    let expected_open_unions: &[(&str, &[(&str, &str)])] = &[
+        (
+            "FulfillmentDestination",
+            &[
+                ("LocationDestination", "business_location"),
+                ("ShippingDestination", "shipping_address"),
+            ],
+        ),
+        (
+            "FulfillmentMethod",
+            &[("PickupMethod", "pickup"), ("ShippingMethod", "shipping")],
+        ),
+        (
+            "FulfillmentMethodCreateRequest",
+            &[
+                ("PickupMethodCreateRequest", "pickup"),
+                ("ShippingMethodCreateRequest", "shipping"),
+            ],
+        ),
+        (
+            "FulfillmentMethodUpdateRequest",
+            &[
+                ("PickupMethodUpdateRequest", "pickup"),
+                ("ShippingMethodUpdateRequest", "shipping"),
+            ],
+        ),
+        (
+            "Media",
+            &[
+                ("MediaExternalVideo", "external_video"),
+                ("MediaImage", "image"),
+                ("MediaModel3d", "model_3d"),
+                ("MediaVideo", "video"),
+            ],
+        ),
+        ("Provider", &[("Oauth2Provider", "oauth2")]),
+        (
+            "Policy",
+            &[("CancellationItem", "dev.ucp.lodging.policy.cancellation")],
+        ),
+    ];
+
+    for (union_name, variants) in expected_open_unions {
+        let union_def = &bundle.defs[*union_name];
+        let base_name = format!("{union_name}Base");
+        assert!(
+            bundle.defs.contains_key(&base_name),
+            "expected {base_name} in $defs"
+        );
+
+        // OU-3: No closed discriminator keyword on union
+        assert!(
+            union_def.get("discriminator").is_none(),
+            "{union_name} must not have discriminator keyword"
+        );
+        assert!(
+            union_def.get("allOf").is_none(),
+            "{union_name} must not retain allOf"
+        );
+        assert!(
+            union_def.get("properties").is_none(),
+            "{union_name} must not retain properties"
+        );
+
+        // OU-1: <Union>Base is the final element of anyOf
+        let any_of = union_def["anyOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{union_name} must have anyOf array"));
+        assert_eq!(any_of.len(), variants.len() + 1);
+        for (idx, (variant_name, tag)) in variants.iter().enumerate() {
+            assert_eq!(any_of[idx]["$ref"], format!("#/$defs/{variant_name}"));
+            let variant_def = &bundle.defs[*variant_name];
+            assert_eq!(variant_def["properties"]["type"]["const"], *tag);
+            // OU-4: No default on variant discriminator property
+            assert!(
+                variant_def["properties"]["type"].get("default").is_none(),
+                "{variant_name}.properties.type must not have default"
+            );
+        }
+        assert_eq!(
+            any_of.last().unwrap()["$ref"],
+            format!("#/$defs/{base_name}"),
+            "{base_name} must be last in {union_name}.anyOf"
+        );
+
+        // OU-2: <Union>Base.properties.type.not.enum contains all known variant tags
+        let base_def = &bundle.defs[&base_name];
+        assert_eq!(base_def["type"], "object");
+        assert_eq!(base_def["additionalProperties"], true);
+        let expected_tags: Vec<serde_json::Value> = variants
+            .iter()
+            .map(|(_, tag)| serde_json::Value::String((*tag).to_string()))
+            .collect();
+        assert_eq!(
+            base_def["properties"]["type"]["not"]["enum"],
+            serde_json::Value::Array(expected_tags)
+        );
+        // OU-4: No default on <Union>Base discriminator property
+        assert!(
+            base_def["properties"]["type"].get("default").is_none(),
+            "{base_name}.properties.type must not have default"
+        );
+    }
+
+    // MediaImage and CancellationItem inherit parent properties
+    assert_eq!(
+        bundle.defs["MediaImage"]["properties"]["url"]["format"],
+        "uri"
+    );
+    assert!(bundle.defs["CancellationItem"].get("allOf").is_none());
+    assert_eq!(
+        bundle.defs["CancellationItem"]["properties"]["description"]["$ref"],
+        "#/$defs/Description"
+    );
+    assert!(bundle.defs["PolicyBase"]["properties"]["type"]
+        .get("pattern")
+        .is_some());
+}
+
+#[test]
+fn extended_subtypes_discovery_and_registration() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("shipping_destination.json"),
+        &serde_json::json!({
+            "title": "Shipping Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string", "const": "shipping_address" },
+                "street_address": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("location_destination.json"),
+        &serde_json::json!({
+            "title": "Location Destination",
+            "type": "object",
+            "required": ["id", "type", "name"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string", "const": "business_location" },
+                "name": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("fulfillment_destination.json"),
+        &serde_json::json!({
+            "title": "Fulfillment Destination",
+            "type": "object",
+            "required": ["id", "type"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "type": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "shipping_address" } } },
+                    "then": { "$ref": "shipping_destination.json" }
+                },
+                {
+                    "if": { "properties": { "type": { "const": "business_location" } } },
+                    "then": { "$ref": "location_destination.json" }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("locker_destination.json"),
+        &serde_json::json!({
+            "title": "Locker Destination",
+            "allOf": [
+                { "$ref": "fulfillment_destination.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "locker_code"],
+                    "properties": {
+                        "type": { "type": "string", "const": "locker" },
+                        "locker_code": { "type": "string" },
+                        "compartment": {
+                            "type": "object",
+                            "properties": {
+                                "size": { "type": "string" }
+                            }
+                        }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("checkout.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.checkout",
+            "title": "Checkout",
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "destination": { "$ref": "types/fulfillment_destination.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    assert!(bundle.defs["LockerDestination"].get("allOf").is_none());
+    assert_eq!(bundle.defs["LockerDestination"]["type"], "object");
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["id"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["locker_code"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["compartment"]["title"],
+        "LockerDestinationCompartment"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestination"]["properties"]["type"]["const"],
+        "locker"
+    );
+    assert!(bundle.defs["LockerDestination"]["properties"]["type"]
+        .get("default")
+        .is_none());
+
+    let dest_anyof = bundle.defs["FulfillmentDestination"]["anyOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(dest_anyof.len(), 4);
+    assert_eq!(dest_anyof[0]["$ref"], "#/$defs/LocationDestination");
+    assert_eq!(dest_anyof[1]["$ref"], "#/$defs/ShippingDestination");
+    assert_eq!(dest_anyof[2]["$ref"], "#/$defs/LockerDestination");
+    assert_eq!(dest_anyof[3]["$ref"], "#/$defs/FulfillmentDestinationBase");
+
+    assert_eq!(
+        bundle.defs["FulfillmentDestinationBase"]["properties"]["type"]["not"]["enum"],
+        serde_json::json!(["business_location", "shipping_address", "locker"])
+    );
+
+    // Directional request slice synthesized for LockerDestination (which has no local ucp_request keys)
+    assert!(bundle.defs.contains_key("LockerDestinationCreateRequest"));
+    assert!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]
+            .get("id")
+            .is_none(),
+        "LockerDestinationCreateRequest must inherit parent slice where id is omitted"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]["locker_code"]["type"],
+        "string"
+    );
+    assert_eq!(
+        bundle.defs["LockerDestinationCreateRequest"]["properties"]["compartment"]["title"],
+        "LockerDestinationCreateRequestCompartment"
+    );
+    let create_dest_anyof = bundle.defs["FulfillmentDestinationCreateRequest"]["anyOf"]
+        .as_array()
+        .unwrap();
+    assert_eq!(create_dest_anyof.len(), 4);
+    assert_eq!(
+        create_dest_anyof[2]["$ref"],
+        "#/$defs/LockerDestinationCreateRequest"
+    );
+    assert_eq!(
+        bundle.defs["FulfillmentDestinationCreateRequestBase"]["properties"]["type"]["not"]["enum"],
+        serde_json::json!(["business_location", "shipping_address", "locker"])
+    );
+
+    if let Some(schema_dir) = ucp_schemas_dir() {
+        let corpus_bundle =
+            generate_types(&GenerateTypesOptions::new().schema_dir(&schema_dir)).unwrap();
+        assert_bundle_invariants(&corpus_bundle.defs);
+        let policy_anyof = corpus_bundle.defs["Policy"]["anyOf"].as_array().unwrap();
+        assert_eq!(policy_anyof.len(), 2);
+        assert_eq!(policy_anyof[0]["$ref"], "#/$defs/CancellationItem");
+        assert_eq!(policy_anyof[1]["$ref"], "#/$defs/PolicyBase");
+        assert_eq!(
+            corpus_bundle.defs["PolicyBase"]["properties"]["type"]["not"]["enum"],
+            serde_json::json!(["dev.ucp.lodging.policy.cancellation"])
+        );
+    }
+}
+
+#[test]
+fn extended_subtypes_preserves_non_variant_branches_on_closed_unions() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("closed_variant_a.json"),
+        &serde_json::json!({
+            "title": "Closed Variant A",
+            "type": "object",
+            "required": ["type", "a_field"],
+            "properties": {
+                "type": { "type": "string", "const": "a" },
+                "a_field": { "type": "string" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("closed_union.json"),
+        &serde_json::json!({
+            "title": "Closed Union",
+            "type": "object",
+            "required": ["type", "shared_field"],
+            "properties": {
+                "type": { "type": "string", "enum": ["a", "b"] },
+                "shared_field": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "a" } } },
+                    "then": { "$ref": "closed_variant_a.json" }
+                },
+                {
+                    "description": "non-variant validation branch",
+                    "not": { "required": ["forbidden_key"] }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("extended_b.json"),
+        &serde_json::json!({
+            "title": "Extended B",
+            "allOf": [
+                { "$ref": "closed_union.json" },
+                {
+                    "type": "object",
+                    "required": ["type", "b_field"],
+                    "properties": {
+                        "type": { "type": "string", "const": "b" },
+                        "b_field": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("service.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.service",
+            "title": "Service",
+            "type": "object",
+            "properties": {
+                "item": { "$ref": "types/closed_union.json" },
+                "b_item": { "$ref": "types/extended_b.json" }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    let ext_b = &bundle.defs["ExtendedB"];
+    assert_eq!(ext_b["properties"]["shared_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["b_field"]["type"], "string");
+    assert_eq!(ext_b["properties"]["type"]["const"], "b");
+
+    // Verify non-variant validation branch was preserved on ExtendedB
+    let all_of = ext_b["allOf"].as_array().expect("ExtendedB has allOf");
+    assert!(
+        all_of
+            .iter()
+            .any(|branch| branch.get("description").and_then(Value::as_str)
+                == Some("non-variant validation branch")),
+        "ExtendedB must preserve non-variant allOf branches from ClosedUnion"
+    );
+}
+
+#[test]
+fn request_sliced_subtypes_do_not_pollute_unsliced_parent_union() {
+    let dir = tempfile::tempdir().unwrap();
+    let shopping_dir = dir.path().join("shopping");
+    let types_dir = shopping_dir.join("types");
+    std::fs::create_dir_all(&types_dir).unwrap();
+    let write_json = |path: &Path, val: &Value| {
+        std::fs::write(path, serde_json::to_string_pretty(val).unwrap()).unwrap();
+    };
+
+    write_json(
+        &types_dir.join("base_policy.json"),
+        &serde_json::json!({
+            "title": "Base Policy",
+            "type": "object",
+            "required": ["type"],
+            "properties": {
+                "type": { "type": "string" },
+                "summary": { "type": "string" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "return" } } },
+                    "then": { "$ref": "return_policy.json" }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("return_policy.json"),
+        &serde_json::json!({
+            "title": "Return Policy",
+            "type": "object",
+            "required": ["type", "days"],
+            "properties": {
+                "type": { "type": "string", "const": "return" },
+                "days": { "type": "integer" }
+            }
+        }),
+    );
+    write_json(
+        &types_dir.join("unreferenced_sliced_policy.json"),
+        &serde_json::json!({
+            "title": "Unreferenced Sliced Policy",
+            "allOf": [
+                { "$ref": "base_policy.json" },
+                {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "unreferenced" },
+                        "audit_id": { "type": "string", "ucp_request": "omit" },
+                        "note": { "type": "string" }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &types_dir.join("referenced_sliced_policy.json"),
+        &serde_json::json!({
+            "title": "Referenced Sliced Policy",
+            "allOf": [
+                { "$ref": "base_policy.json" },
+                {
+                    "type": "object",
+                    "required": ["type"],
+                    "properties": {
+                        "type": { "type": "string", "const": "referenced" },
+                        "audit_id": { "type": "string", "ucp_request": "omit" },
+                        "code": { "type": "string" }
+                    }
+                },
+                {
+                    "dependentSchemas": {
+                        "code": { "required": ["summary"] }
+                    }
+                }
+            ]
+        }),
+    );
+    write_json(
+        &shopping_dir.join("session.json"),
+        &serde_json::json!({
+            "name": "dev.ucp.shopping.session",
+            "title": "Session",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": { "create": "omit", "update": "required" } },
+                "policies": {
+                    "type": "array",
+                    "items": { "$ref": "types/base_policy.json" },
+                    "ucp_request": "omit"
+                },
+                "extra_unreferenced": {
+                    "$ref": "types/unreferenced_sliced_policy.json",
+                    "ucp_request": "omit"
+                },
+                "override_policy": {
+                    "$ref": "types/referenced_sliced_policy.json"
+                }
+            }
+        }),
+    );
+
+    let bundle = generate_types(&GenerateTypesOptions::new().schema_dir(dir.path())).unwrap();
+    assert_bundle_invariants(&bundle.defs);
+
+    // BasePolicy.anyOf contains only unsliced variants + BasePolicyBase (no *CreateRequest/*UpdateRequest)
+    assert_eq!(
+        bundle.defs["BasePolicy"]["anyOf"],
+        serde_json::json!([
+            { "$ref": "#/$defs/ReturnPolicy" },
+            { "$ref": "#/$defs/ReferencedSlicedPolicy" },
+            { "$ref": "#/$defs/UnreferencedSlicedPolicy" },
+            { "$ref": "#/$defs/BasePolicyBase" }
+        ])
+    );
+
+    // Unused request slices of UnreferencedSlicedPolicy are pruned cleanly in Stage 8
+    assert!(!bundle
+        .defs
+        .contains_key("UnreferencedSlicedPolicyCreateRequest"));
+    assert!(!bundle
+        .defs
+        .contains_key("UnreferencedSlicedPolicyUpdateRequest"));
+
+    // Directly referenced ReferencedSlicedPolicyCreateRequest inherits BasePolicy's summary field,
+    // omits audit_id, and preserves dependentSchemas in allOf
+    let ref_create = &bundle.defs["ReferencedSlicedPolicyCreateRequest"];
+    assert_eq!(ref_create["properties"]["summary"]["type"], "string");
+    assert!(ref_create["properties"].get("audit_id").is_none());
+    assert!(ref_create["allOf"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|b| b.get("dependentSchemas").is_some()));
 }
