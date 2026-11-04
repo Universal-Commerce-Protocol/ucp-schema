@@ -1308,126 +1308,55 @@ fn multi_service_fixture_per_path_servers_shared_gateway_inactive_pruning_and_co
 }
 
 #[test]
-fn generate_openapi_template_info_with_null_or_non_string_version_and_title_falls_back() {
+fn generate_openapi_template_info_with_non_string_title_or_version_falls_back() {
     let compose_dir = fixture_compose_dir();
-    let schema_dir = compose_dir.join("schemas");
-    let template_base_path = compose_dir.join("shopping_rest.openapi.json");
-    let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
-
+    let checkout_schema = compose_dir.join("schemas/shopping/checkout.json");
+    let base: Value = serde_json::from_str(
+        &std::fs::read_to_string(compose_dir.join("shopping_rest.openapi.json")).unwrap(),
+    )
+    .unwrap();
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut template: Value =
-        serde_json::from_str(&std::fs::read_to_string(&template_base_path).unwrap()).unwrap();
+    for (i, (title, version)) in [
+        (json!(null), json!(null)),
+        (json!(42), json!(1)),
+        (json!("   "), json!(" \t ")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut template = base.clone();
+        template["info"]["title"] = title;
+        template["info"]["version"] = version;
+        let template_path = tmp.path().join(format!("template_{i}.openapi.json"));
+        std::fs::write(&template_path, template.to_string()).unwrap();
 
-    // 1. Test null version and title fall back to seeded defaults
-    template["info"]["title"] = Value::Null;
-    template["info"]["version"] = Value::Null;
-    let template_null_path = tmp.path().join("template_null.openapi.json");
-    std::fs::write(&template_null_path, template.to_string()).unwrap();
-
-    let profile_null_path = tmp.path().join("profile_null.json");
-    let profile_null = json!({
-        "ucp": {
-            "version": "2026-01-11",
-            "services": {
-                "dev.ucp.shopping": [{
-                    "version": "2026-01-11",
-                    "transport": "rest",
-                    "endpoint": "https://merchant.example.com/ucp",
-                    "schema": template_null_path.to_str().unwrap()
-                }]
-            },
-            "capabilities": {
-                "dev.ucp.shopping.checkout": [{
-                    "version": "2026-01-11",
-                    "schema": s("shopping/checkout.json")
-                }]
+        let profile_path = tmp.path().join(format!("profile_{i}.json"));
+        let profile = json!({
+            "ucp": {
+                "version": "2026-01-11",
+                "services": {
+                    "dev.ucp.shopping": [{
+                        "version": "2026-01-11",
+                        "transport": "rest",
+                        "endpoint": "https://merchant.example.com/ucp",
+                        "schema": template_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-01-11",
+                        "schema": checkout_schema.to_str().unwrap()
+                    }]
+                }
             }
-        }
-    });
-    std::fs::write(&profile_null_path, profile_null.to_string()).unwrap();
+        });
+        std::fs::write(&profile_path, profile.to_string()).unwrap();
 
-    let spec_null = generate_openapi(&GenerateOpenApiOptions::new(
-        profile_null_path.to_str().unwrap(),
-    ))
-    .unwrap();
-
-    assert_openapi_invariants(&spec_null);
-    assert_eq!(spec_null["info"]["title"], "UCP REST Service");
-    assert_eq!(spec_null["info"]["version"], "2026-01-11");
-
-    // 2. Test non-string (numbers) fall back to seeded defaults
-    template["info"]["title"] = json!(42);
-    template["info"]["version"] = json!(1);
-    let template_non_str_path = tmp.path().join("template_non_str.openapi.json");
-    std::fs::write(&template_non_str_path, template.to_string()).unwrap();
-
-    let profile_non_str_path = tmp.path().join("profile_non_str.json");
-    let profile_non_str = json!({
-        "ucp": {
-            "version": "2026-01-11",
-            "services": {
-                "dev.ucp.shopping": [{
-                    "version": "2026-01-11",
-                    "transport": "rest",
-                    "endpoint": "https://merchant.example.com/ucp",
-                    "schema": template_non_str_path.to_str().unwrap()
-                }]
-            },
-            "capabilities": {
-                "dev.ucp.shopping.checkout": [{
-                    "version": "2026-01-11",
-                    "schema": s("shopping/checkout.json")
-                }]
-            }
-        }
-    });
-    std::fs::write(&profile_non_str_path, profile_non_str.to_string()).unwrap();
-
-    let spec_non_str = generate_openapi(&GenerateOpenApiOptions::new(
-        profile_non_str_path.to_str().unwrap(),
-    ))
-    .unwrap();
-
-    assert_openapi_invariants(&spec_non_str);
-    assert_eq!(spec_non_str["info"]["title"], "UCP REST Service");
-    assert_eq!(spec_non_str["info"]["version"], "2026-01-11");
-
-    // 3. Test empty/whitespace strings fall back to seeded defaults
-    template["info"]["title"] = json!("   ");
-    template["info"]["version"] = json!(" \t ");
-    let template_blank_path = tmp.path().join("template_blank.openapi.json");
-    std::fs::write(&template_blank_path, template.to_string()).unwrap();
-
-    let profile_blank_path = tmp.path().join("profile_blank.json");
-    let profile_blank = json!({
-        "ucp": {
-            "version": "2026-01-11",
-            "services": {
-                "dev.ucp.shopping": [{
-                    "version": "2026-01-11",
-                    "transport": "rest",
-                    "endpoint": "https://merchant.example.com/ucp",
-                    "schema": template_blank_path.to_str().unwrap()
-                }]
-            },
-            "capabilities": {
-                "dev.ucp.shopping.checkout": [{
-                    "version": "2026-01-11",
-                    "schema": s("shopping/checkout.json")
-                }]
-            }
-        }
-    });
-    std::fs::write(&profile_blank_path, profile_blank.to_string()).unwrap();
-
-    let spec_blank = generate_openapi(&GenerateOpenApiOptions::new(
-        profile_blank_path.to_str().unwrap(),
-    ))
-    .unwrap();
-
-    assert_openapi_invariants(&spec_blank);
-    assert_eq!(spec_blank["info"]["title"], "UCP REST Service");
-    assert_eq!(spec_blank["info"]["version"], "2026-01-11");
+        let spec =
+            generate_openapi(&GenerateOpenApiOptions::new(profile_path.to_str().unwrap())).unwrap();
+        assert_openapi_invariants(&spec);
+        assert_eq!(spec["info"]["title"], "UCP REST Service", "case {i}");
+        assert_eq!(spec["info"]["version"], "2026-01-11", "case {i}");
+    }
 }
-
