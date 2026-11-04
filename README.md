@@ -395,7 +395,7 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
 
 1. **Root capability** — one capability has no `extends`, providing the base schema
 2. **Extensions** — capabilities with `extends` add fields to the root
-3. **Merge** — extensions define their additions in `$defs[root_capability_name]`; the tool composes them via `allOf`
+3. **Merge** — extensions define their additions in `$defs[root_capability_name]` (or, for an extension of an extension, `$defs[parent_capability_name]`); the tool composes them via `allOf`
 
 **Graph rules:** composition receives an already-negotiated active capability set with exactly one root (no `extends`). Each extension must have at least one path through active declared parents that transitively reaches that root; absent alternative parents are ignored.
 
@@ -403,7 +403,7 @@ Because absent parents are ignored, a misspelled parent name is indistinguishabl
 
 **Schema authoring for extensions:**
 
-Extension schemas define their additions in `$defs` keyed by the root capability name:
+Extension schemas define their additions in `$defs` keyed by the root capability name. An extension of an extension may instead key on the parent it extends; the root key takes precedence when both are present:
 
 ```json
 {

@@ -411,7 +411,8 @@ pub fn check_version_constraints(
 ///
 /// 1. Finds the single root capability (no extends)
 /// 2. Validates that every extension has at least one active path to the root
-/// 3. Fetches schemas and extracts $defs[root] entries
+/// 3. Fetches schemas and extracts each extension's $defs[root] entry, falling
+///    back to $defs[parent] for an active declared parent
 /// 4. Composes using allOf
 ///
 /// An extension's `extends` entries are alternative paths. Parents absent from
@@ -502,7 +503,8 @@ pub fn compose_schema(
     })?;
     let container = is_container_schema(&root_schema);
 
-    // Compose: for each extension, extract its self-contained `$defs[root.name]`.
+    // Compose: for each extension, extract its self-contained `$defs[root.name]`
+    // (or `$defs[parent]` for an active declared parent when the root key is absent).
     let mut ext_defs = Vec::new();
 
     for ext in &extensions {
@@ -526,7 +528,7 @@ pub fn compose_schema(
             });
         }
 
-        // Extract $defs[root.name] and inline any internal refs
+        // Extract the extension's contribution and inline any internal refs
         let defs = ext_schema
             .get("$defs")
             .ok_or_else(|| ComposeError::MissingDefEntry {
@@ -534,8 +536,19 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
+        // Prefer the root key; otherwise fall back to an active declared parent,
+        // so an extension of an extension can key on the capability it extends.
         let ext_def = defs
             .get(&root.name)
+            .or_else(|| {
+                ext.extends.iter().flatten().find_map(|parent| {
+                    if cap_map.contains_key(parent.as_str()) {
+                        defs.get(parent)
+                    } else {
+                        None
+                    }
+                })
+            })
             .ok_or_else(|| ComposeError::MissingDefEntry {
                 extension: ext.name.clone(),
                 expected_key: root.name.clone(),

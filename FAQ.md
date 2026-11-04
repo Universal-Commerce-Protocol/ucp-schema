@@ -124,8 +124,10 @@ If `dev.ucp.shopping.checkout` is the root capability, your extension schema sho
 The validator:
 
 1. Finds the root capability (no `extends`)
-2. Extracts `$defs[root_name]` from each extension
+2. Extracts `$defs[root_name]` from each extension, or `$defs[parent_name]` for an active declared parent when the root key is absent
 3. Composes them with `allOf`
+
+An extension of an extension (for example, one that extends `dev.ucp.shopping.catalog.feed`, which itself extends `dev.ucp.common.feed`) may key its additions on the parent it extends rather than the root. The additions are still composed onto the root, so they use the root's shape: for a container root, the operation or shape keys the root defines. If both keys are present, the root key wins.
 
 If the capability is a **container** (see below), repeat the base's operation keys instead: `$defs[root_name]` is itself `{ "$defs": { "<op>_<direction>": ... } }`, and the tool merges one shape at a time.
 
