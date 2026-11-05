@@ -2503,12 +2503,21 @@ fn dto_openness_and_non_string_format_normalization_preserves_validator_strictne
         "labels".to_string(),
         serde_json::json!({ "type": "object", "additionalProperties": { "type": "string" } }),
     );
+    props.insert(
+        "strict_grammar".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "eq": { "type": "string" } }
+        }),
+    );
 
     let raw_schema = serde_json::json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "name": "dev.ucp.shopping.filter",
         "title": "Filter",
         "type": "object",
+        "required": ["ns_date_time"],
         "additionalProperties": false,
         "properties": props,
         "anyOf": [
@@ -2535,6 +2544,10 @@ fn dto_openness_and_non_string_format_normalization_preserves_validator_strictne
     assert_eq!(
         filter_def["properties"]["labels"]["additionalProperties"],
         serde_json::json!({ "type": "string" })
+    );
+    assert_eq!(
+        filter_def["properties"]["strict_grammar"]["additionalProperties"],
+        Value::Bool(false)
     );
     for fmt in non_str {
         let key = format!("ns_{}", fmt.replace('-', "_"));
@@ -2575,14 +2588,20 @@ fn dto_openness_and_non_string_format_normalization_preserves_validator_strictne
         let start_date = &corpus.defs["DateInterval"]["properties"]["start_date"];
         assert_eq!(start_date["format"], "date");
         assert!(start_date.get("pattern").is_none());
-        for closed_def in ["ErrorResponse", "JsonrpcRequest", "RequestConstraints"] {
+        for closed_def in ["ErrorResponse", "JsonrpcRequest"] {
             assert_eq!(
                 corpus.defs[closed_def]["additionalProperties"],
                 Value::Bool(true)
             );
         }
+        for strict_grammar_def in ["ConstraintExpression", "RequestConstraints"] {
+            assert_eq!(
+                corpus.defs[strict_grammar_def]["additionalProperties"],
+                Value::Bool(false)
+            );
+        }
         for branch in corpus.defs["ValueConstraint"]["anyOf"].as_array().unwrap() {
-            assert_eq!(branch["additionalProperties"], Value::Bool(true));
+            assert_eq!(branch["additionalProperties"], Value::Bool(false));
         }
     }
 }

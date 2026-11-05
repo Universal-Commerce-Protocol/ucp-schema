@@ -386,9 +386,11 @@ pub fn qualify_inline_object_titles(defs: &mut BTreeMap<String, Value>) {
 ///    native temporal/UUID/IP types without invalid `Field(pattern=...)` constraints.
 ///    String-mapped formats (`"uri"`, `"uri-reference"`, `"iri"`, `"email"`,
 ///    `"idn-email"`, `"hostname"`) retain `"pattern"` unchanged.
-/// 2. When a schema object has `"additionalProperties": false` (`Value::Bool(false)`),
-///    replaces it with `Value::Bool(true)` so Tier 1 wire DTOs uphold tolerant-reader
-///    deserialization across top-level definitions and nested `anyOf`/`allOf` branches.
+/// 2. When a schema object has `"additionalProperties": false` (`Value::Bool(false)`)
+///    and at least one `required` property, replaces it with `Value::Bool(true)` so
+///    Tier 1 wire DTOs uphold tolerant-reader deserialization across top-level
+///    definitions and nested `anyOf`/`allOf` branches while closed grammar nodes with
+///    no `required` properties (e.g. `ConstraintExpression`) remain strict.
 ///    Schema-valued `"additionalProperties": { ... }` map definitions are preserved.
 pub fn normalize_dto_openness_and_formats(value: &mut Value) {
     for_each_schema_object_mut(value, &mut |obj| {
@@ -398,7 +400,12 @@ pub fn normalize_dto_openness_and_formats(value: &mut Value) {
         ) {
             obj.remove("pattern");
         }
-        if obj.get("additionalProperties") == Some(&Value::Bool(false)) {
+        if obj.get("additionalProperties") == Some(&Value::Bool(false))
+            && obj
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|req| !req.is_empty())
+        {
             obj.insert("additionalProperties".to_string(), Value::Bool(true));
         }
     });
@@ -2164,23 +2171,30 @@ mod tests {
         );
         assert_eq!(normalized["additionalProperties"], Value::Bool(true));
 
-        // Boolean additionalProperties: false is rewritten to true (root and nested),
-        // while schema-valued map additionalProperties is preserved unchanged
+        // Boolean additionalProperties: false is rewritten to true (root and nested)
+        // when at least one required property is present, while objects without
+        // required properties and schema-valued map additionalProperties are preserved
         let closed_obj = json!({
             "type": "object",
+            "required": ["code"],
             "additionalProperties": false,
             "properties": {
                 "code": { "type": "string" },
                 "open_at": { "type": "string", "format": "date-time", "pattern": "^\\d{4}" },
-                "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" }
-            },
-            "anyOf": [{ "type": "object", "additionalProperties": false }]
+                "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+                "nested_union": {
+                    "anyOf": [
+                        { "type": "object", "required": ["code"], "additionalProperties": false },
+                        { "type": "object", "required": ["open_at"], "additionalProperties": false }
+                    ]
+                }
+            }
         });
         let normalized_closed = normalize_def_schema(&closed_obj, "Closed", None);
         assert_eq!(normalized_closed["title"], "Closed");
         assert_eq!(normalized_closed["additionalProperties"], Value::Bool(true));
         assert_eq!(
-            normalized_closed["anyOf"][0]["additionalProperties"],
+            normalized_closed["properties"]["nested_union"]["anyOf"][0]["additionalProperties"],
             Value::Bool(true)
         );
         assert!(normalized_closed["properties"]["open_at"]
@@ -2189,6 +2203,17 @@ mod tests {
         assert_eq!(
             normalized_closed["properties"]["endpoint"]["pattern"],
             "^https://"
+        );
+
+        let strict_unrequired = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "eq": { "type": "string" } }
+        });
+        let normalized_strict = normalize_def_schema(&strict_unrequired, "StrictGrammar", None);
+        assert_eq!(
+            normalized_strict["additionalProperties"],
+            Value::Bool(false)
         );
 
         let map_obj = json!({ "type": "object", "additionalProperties": { "type": "string" } });
