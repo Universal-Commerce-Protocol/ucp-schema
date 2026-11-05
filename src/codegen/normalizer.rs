@@ -376,14 +376,51 @@ pub fn qualify_inline_object_titles(defs: &mut BTreeMap<String, Value>) {
     }
 }
 
-/// Normalize a single `$defs` entry by stripping UCP authoring keywords, distributing bare
-/// `anyOf` properties, normalizing scalar-or-array unions, rewriting `$ref` pointers to
-/// `#/$defs/<PascalName>`, attaching `const` defaults, synchronizing `"title"` to `current_def`,
-/// and setting `"additionalProperties": true` on object schemas that omit `"additionalProperties"`
+/// Normalizes DTO openness and string format collisions across all schema objects
+/// in a `$defs` entry prior to union property distribution and `allOf` flattening.
+///
+/// 1. When a schema object has `"pattern"` alongside a non-string-mapped `"format"`
+///    (`obj.get("format").and_then(Value::as_str)` matching `"date-time" | "date" |
+///    "time" | "duration" | "uuid" | "ipv4" | "ipv6"`), removes `"pattern"` so
+///    downstream generators (`datamodel-code-generator --field-constraints`) emit
+///    native temporal/UUID/IP types without invalid `Field(pattern=...)` constraints.
+///    String-mapped formats (`"uri"`, `"uri-reference"`, `"iri"`, `"email"`,
+///    `"idn-email"`, `"hostname"`) retain `"pattern"` unchanged.
+/// 2. When a schema object has `"additionalProperties": false` (`Value::Bool(false)`)
+///    and at least one `required` property, replaces it with `Value::Bool(true)` so
+///    Tier 1 wire DTOs uphold tolerant-reader deserialization across top-level
+///    definitions and nested `anyOf`/`allOf` branches while closed grammar nodes with
+///    no `required` properties (e.g. `ConstraintExpression`) remain strict.
+///    Schema-valued `"additionalProperties": { ... }` map definitions are preserved.
+pub fn normalize_dto_openness_and_formats(value: &mut Value) {
+    for_each_schema_object_mut(value, &mut |obj| {
+        if matches!(
+            obj.get("format").and_then(Value::as_str),
+            Some("date-time" | "date" | "time" | "duration" | "uuid" | "ipv4" | "ipv6")
+        ) {
+            obj.remove("pattern");
+        }
+        if obj.get("additionalProperties") == Some(&Value::Bool(false))
+            && obj
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|req| !req.is_empty())
+        {
+            obj.insert("additionalProperties".to_string(), Value::Bool(true));
+        }
+    });
+}
+
+/// Normalize a single `$defs` entry by stripping UCP authoring keywords, normalizing DTO
+/// openness and non-string-mapped format patterns, distributing bare `anyOf` properties,
+/// normalizing scalar-or-array unions, rewriting `$ref` pointers to `#/$defs/<PascalName>`,
+/// attaching `const` defaults, synchronizing `"title"` to `current_def`, and setting
+/// `"additionalProperties": true` on object schemas that omit `"additionalProperties"`
 /// to preserve UCP's open-world property semantics.
 pub fn normalize_def_schema(schema: &Value, current_def: &str, parent_name: Option<&str>) -> Value {
     let mut val = schema.clone();
     strip_ucp_keywords(&mut val);
+    normalize_dto_openness_and_formats(&mut val);
     distribute_properties_in_bare_anyof(&mut val);
     normalize_scalar_or_array_unions(&mut val);
     rewrite_refs_to_defs(&mut val, current_def, parent_name);
@@ -2134,17 +2171,56 @@ mod tests {
         );
         assert_eq!(normalized["additionalProperties"], Value::Bool(true));
 
-        // Explicit additionalProperties is preserved
+        // Boolean additionalProperties: false is rewritten to true (root and nested)
+        // when at least one required property is present, while objects without
+        // required properties and schema-valued map additionalProperties are preserved
         let closed_obj = json!({
             "type": "object",
+            "required": ["code"],
             "additionalProperties": false,
-            "properties": { "code": { "type": "string" } }
+            "properties": {
+                "code": { "type": "string" },
+                "open_at": { "type": "string", "format": "date-time", "pattern": "^\\d{4}" },
+                "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+                "nested_union": {
+                    "anyOf": [
+                        { "type": "object", "required": ["code"], "additionalProperties": false },
+                        { "type": "object", "required": ["open_at"], "additionalProperties": false }
+                    ]
+                }
+            }
         });
         let normalized_closed = normalize_def_schema(&closed_obj, "Closed", None);
         assert_eq!(normalized_closed["title"], "Closed");
+        assert_eq!(normalized_closed["additionalProperties"], Value::Bool(true));
         assert_eq!(
-            normalized_closed["additionalProperties"],
+            normalized_closed["properties"]["nested_union"]["anyOf"][0]["additionalProperties"],
+            Value::Bool(true)
+        );
+        assert!(normalized_closed["properties"]["open_at"]
+            .get("pattern")
+            .is_none());
+        assert_eq!(
+            normalized_closed["properties"]["endpoint"]["pattern"],
+            "^https://"
+        );
+
+        let strict_unrequired = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "eq": { "type": "string" } }
+        });
+        let normalized_strict = normalize_def_schema(&strict_unrequired, "StrictGrammar", None);
+        assert_eq!(
+            normalized_strict["additionalProperties"],
             Value::Bool(false)
+        );
+
+        let map_obj = json!({ "type": "object", "additionalProperties": { "type": "string" } });
+        let normalized_map = normalize_def_schema(&map_obj, "StringMap", None);
+        assert_eq!(
+            normalized_map["additionalProperties"],
+            json!({ "type": "string" })
         );
 
         // Schema with properties but no explicit "type": "object" receives additionalProperties: true
