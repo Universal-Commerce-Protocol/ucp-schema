@@ -403,7 +403,7 @@ Because absent parents are ignored, a misspelled parent name is indistinguishabl
 
 **Schema authoring for extensions:**
 
-Extension schemas define their additions in `$defs` keyed by the root capability name. An extension of an extension may instead key on the parent it extends; the root key takes precedence when both are present:
+Extension schemas define their additions in `$defs` keyed by the root capability name. An extension of an extension may instead key on the parent it extends. The root key always takes precedence; without it, exactly one active declared parent may have an entry, and entries for two or more active parents are rejected as ambiguous:
 
 ```json
 {

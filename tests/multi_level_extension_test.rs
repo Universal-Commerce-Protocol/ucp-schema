@@ -8,6 +8,10 @@
 //!   2. When both the root key and the parent key are present, the root key
 //!      wins.
 //!   3. An extension with neither key is still rejected.
+//!   4. Parent fallback requires exactly one active declared parent with an
+//!      entry: entries for two active parents are rejected in either declaration
+//!      order unless a root-keyed entry is supplied, and inactive parents are
+//!      ignored.
 
 use std::path::Path;
 
@@ -117,6 +121,94 @@ fn write_fixtures(dir: &Path) {
     )
     .unwrap();
 
+    // A second extension of the root, so an extension can have two active parents.
+    std::fs::write(
+        shopping.join("feed_labels.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/feed_labels.json",
+          "name": "dev.ucp.shopping.feed_labels",
+          "$defs": {
+            "dev.ucp.common.feed": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "label": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }"##,
+    )
+    .unwrap();
+
+    // Extension of both Catalog Feed and Feed Labels with conflicting parent
+    // entries and no root entry.
+    std::fs::write(
+        shopping.join("ads_multi.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/ads_multi.json",
+          "name": "dev.ucp.shopping.ads_multi",
+          "$defs": {
+            "dev.ucp.shopping.catalog.feed": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "ads_eligible": { "type": "boolean" } }
+                }
+              }
+            },
+            "dev.ucp.shopping.feed_labels": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "ads_eligible": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }"##,
+    )
+    .unwrap();
+
+    // The same two parent entries plus a root entry that settles the choice.
+    std::fs::write(
+        shopping.join("ads_multi_root.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/ads_multi_root.json",
+          "name": "dev.ucp.shopping.ads_multi_root",
+          "$defs": {
+            "dev.ucp.common.feed": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "ads_eligible": { "type": "boolean" } }
+                }
+              }
+            },
+            "dev.ucp.shopping.catalog.feed": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "ads_eligible": { "type": "string" } }
+                }
+              }
+            },
+            "dev.ucp.shopping.feed_labels": {
+              "$defs": {
+                "record": {
+                  "type": "object",
+                  "properties": { "ads_eligible": { "type": "string" } }
+                }
+              }
+            }
+          }
+        }"##,
+    )
+    .unwrap();
+
     // Extension of Catalog Feed keyed on neither the root nor its parent.
     std::fs::write(
         shopping.join("ads_unkeyed.json"),
@@ -146,6 +238,24 @@ fn config(dir: &Path) -> SchemaBaseConfig<'static> {
 /// A record payload declaring Common Feed, Catalog Feed, and one extension of
 /// Catalog Feed.
 fn record_payload(extension: &str, schema_file: &str, record: Value) -> Value {
+    multi_parent_payload(
+        extension,
+        schema_file,
+        json!("dev.ucp.shopping.catalog.feed"),
+        false,
+        record,
+    )
+}
+
+/// A record payload declaring Common Feed, Catalog Feed, optionally Feed Labels,
+/// and one extension with the given `extends` value.
+fn multi_parent_payload(
+    extension: &str,
+    schema_file: &str,
+    extends: Value,
+    with_feed_labels: bool,
+    record: Value,
+) -> Value {
     let mut payload = json!({
         "ucp": { "capabilities": {
             "dev.ucp.common.feed": [
@@ -156,10 +266,17 @@ fn record_payload(extension: &str, schema_file: &str, record: Value) -> Value {
             ]
         } }
     });
+    if with_feed_labels {
+        payload["ucp"]["capabilities"]["dev.ucp.shopping.feed_labels"] = json!([{
+            "version": "2026-04-08",
+            "schema": "https://ucp.dev/schemas/shopping/feed_labels.json",
+            "extends": "dev.ucp.common.feed"
+        }]);
+    }
     payload["ucp"]["capabilities"][extension] = json!([{
         "version": "2026-04-08",
         "schema": format!("https://ucp.dev/schemas/shopping/{schema_file}"),
-        "extends": "dev.ucp.shopping.catalog.feed"
+        "extends": extends
     }]);
     for (key, value) in record.as_object().unwrap() {
         payload[key] = value.clone();
@@ -282,4 +399,147 @@ fn extension_with_neither_key_is_rejected() {
             .contains("missing $defs entry for 'dev.ucp.common.feed'"),
         "got: {err}"
     );
+}
+
+// --- 4. Parent fallback requires exactly one active parent with an entry ---
+
+fn assert_ambiguous(err: impl std::fmt::Display) {
+    let msg = err.to_string();
+    assert!(
+        msg.contains("multiple active parents")
+            && msg.contains("dev.ucp.shopping.catalog.feed")
+            && msg.contains("dev.ucp.shopping.feed_labels")
+            && msg.contains("add a $defs entry for 'dev.ucp.common.feed'"),
+        "expected ambiguous-parent error naming both parents and the root, got: {msg}"
+    );
+}
+
+#[test]
+fn multiple_active_parent_entries_are_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    let cfg = config(dir.path());
+
+    let payload = multi_parent_payload(
+        "dev.ucp.shopping.ads_multi",
+        "ads_multi.json",
+        json!([
+            "dev.ucp.shopping.catalog.feed",
+            "dev.ucp.shopping.feed_labels"
+        ]),
+        true,
+        json!({ "id": "p1", "title": "Widget", "ads_eligible": true }),
+    );
+    assert_ambiguous(compose_from_payload(&payload, &cfg).unwrap_err());
+}
+
+#[test]
+fn multiple_active_parent_entries_are_rejected_in_reversed_order() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    let cfg = config(dir.path());
+
+    // Same parents declared in the opposite order: still ambiguous, never
+    // resolved by declaration order.
+    let payload = multi_parent_payload(
+        "dev.ucp.shopping.ads_multi",
+        "ads_multi.json",
+        json!([
+            "dev.ucp.shopping.feed_labels",
+            "dev.ucp.shopping.catalog.feed"
+        ]),
+        true,
+        json!({ "id": "p1", "title": "Widget", "ads_eligible": true }),
+    );
+    assert_ambiguous(compose_from_payload(&payload, &cfg).unwrap_err());
+}
+
+#[test]
+fn inactive_parent_entry_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    let cfg = config(dir.path());
+
+    // Feed Labels is declared but not active, so only the Catalog Feed entry
+    // (ads_eligible: boolean) is eligible.
+    for extends in [
+        json!([
+            "dev.ucp.shopping.catalog.feed",
+            "dev.ucp.shopping.feed_labels"
+        ]),
+        json!([
+            "dev.ucp.shopping.feed_labels",
+            "dev.ucp.shopping.catalog.feed"
+        ]),
+    ] {
+        let boolean = multi_parent_payload(
+            "dev.ucp.shopping.ads_multi",
+            "ads_multi.json",
+            extends.clone(),
+            false,
+            json!({ "id": "p1", "title": "Widget", "ads_eligible": true }),
+        );
+        let schema = compose_from_payload(&boolean, &cfg).unwrap();
+        assert!(
+            validate(&schema, &boolean, &record_opts()).is_ok(),
+            "the active parent's entry must be used ({extends})"
+        );
+
+        let string = multi_parent_payload(
+            "dev.ucp.shopping.ads_multi",
+            "ads_multi.json",
+            extends.clone(),
+            false,
+            json!({ "id": "p1", "title": "Widget", "ads_eligible": "yes" }),
+        );
+        assert!(
+            validate(&schema, &string, &record_opts()).is_err(),
+            "the inactive parent's entry must be ignored ({extends})"
+        );
+    }
+}
+
+#[test]
+fn root_key_resolves_multiple_active_parents() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    let cfg = config(dir.path());
+
+    // Both parents are active and have entries, but the root entry
+    // (ads_eligible: boolean) is used and the parent entries are ignored.
+    for extends in [
+        json!([
+            "dev.ucp.shopping.catalog.feed",
+            "dev.ucp.shopping.feed_labels"
+        ]),
+        json!([
+            "dev.ucp.shopping.feed_labels",
+            "dev.ucp.shopping.catalog.feed"
+        ]),
+    ] {
+        let boolean = multi_parent_payload(
+            "dev.ucp.shopping.ads_multi_root",
+            "ads_multi_root.json",
+            extends.clone(),
+            true,
+            json!({ "id": "p1", "title": "Widget", "ads_eligible": true }),
+        );
+        let schema = compose_from_payload(&boolean, &cfg).unwrap();
+        assert!(
+            validate(&schema, &boolean, &record_opts()).is_ok(),
+            "root entry must be used ({extends})"
+        );
+
+        let string = multi_parent_payload(
+            "dev.ucp.shopping.ads_multi_root",
+            "ads_multi_root.json",
+            extends.clone(),
+            true,
+            json!({ "id": "p1", "title": "Widget", "ads_eligible": "yes" }),
+        );
+        assert!(
+            validate(&schema, &string, &record_opts()).is_err(),
+            "parent entries must be ignored when the root entry is present ({extends})"
+        );
+    }
 }
