@@ -44,11 +44,10 @@ use std::path::Path;
 use serde_json::{json, Value};
 
 use crate::error::ComposeError;
-use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
+use crate::loader::{
+    bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema, RemoteSession,
+};
 use crate::types::{is_valid_version, Direction, Requires, VersionConstraint};
-
-#[cfg(feature = "remote")]
-use crate::loader::{bundle_refs_remote, load_schema_url};
 
 /// Configuration for mapping schema URLs to local paths.
 ///
@@ -310,7 +309,8 @@ fn parse_capabilities_object(caps: &Value) -> Result<Vec<Capability>, ComposeErr
 
 /// Fetch a profile from a URL or local path.
 fn fetch_profile(url: &str, schema_base: &SchemaBaseConfig) -> Result<Value, ComposeError> {
-    resolve_schema_url(url, schema_base).map_err(|e| ComposeError::ProfileFetch {
+    let session = RemoteSession::new();
+    resolve_schema_url(url, schema_base, &session).map_err(|e| ComposeError::ProfileFetch {
         url: url.to_string(),
         message: e.to_string(),
     })
@@ -424,6 +424,10 @@ pub fn compose_schema(
         return Err(ComposeError::EmptyCapabilities);
     }
 
+    // One session for this composition: capabilities routinely `$ref` the
+    // same base types, and each document must be downloaded at most once.
+    let session = RemoteSession::new();
+
     // Authority binding: a capability's `schema` URL must originate from the
     // namespace authority encoded in its name (spec §Authority Binding). Verify
     // ALL capabilities before dereferencing any of them (validate-before-fetch).
@@ -483,7 +487,7 @@ pub fn compose_schema(
     // namespace of `{op}_{direction}` shapes. The operation shape, if any, is
     // chosen downstream by `select_operation_schema`.
     if extensions.is_empty() {
-        return resolve_schema_url(&root.schema_url, schema_base).map_err(|e| {
+        return resolve_schema_url(&root.schema_url, schema_base, &session).map_err(|e| {
             ComposeError::SchemaFetch {
                 url: root.schema_url.clone(),
                 message: e.to_string(),
@@ -494,7 +498,7 @@ pub fn compose_schema(
     // Load the root schema to classify the capability (single-object vs
     // container) and, for a container, to seed the per-operation merge with the
     // base's `$defs`.
-    let root_schema = resolve_schema_url(&root.schema_url, schema_base).map_err(|e| {
+    let root_schema = resolve_schema_url(&root.schema_url, schema_base, &session).map_err(|e| {
         ComposeError::SchemaFetch {
             url: root.schema_url.clone(),
             message: e.to_string(),
@@ -506,12 +510,13 @@ pub fn compose_schema(
     let mut ext_defs = Vec::new();
 
     for ext in &extensions {
-        let ext_schema = resolve_schema_url(&ext.schema_url, schema_base).map_err(|e| {
-            ComposeError::SchemaFetch {
-                url: ext.schema_url.clone(),
-                message: e.to_string(),
-            }
-        })?;
+        let ext_schema =
+            resolve_schema_url(&ext.schema_url, schema_base, &session).map_err(|e| {
+                ComposeError::SchemaFetch {
+                    url: ext.schema_url.clone(),
+                    message: e.to_string(),
+                }
+            })?;
 
         // Check version constraints: if requires is declared and violated, fail.
         // No requires = backwards compat (composer asserts compatibility).
@@ -786,7 +791,11 @@ pub fn verify_bindings(value: &Value) -> Result<(), ComposeError> {
 /// After loading, bundles external $ref pointers so the schema is self-contained.
 /// This is necessary because extension schemas often have relative refs like
 /// `$ref: "checkout.json"` that need resolution before composition.
-fn resolve_schema_url(url: &str, schema_base: &SchemaBaseConfig) -> Result<Value, ComposeError> {
+fn resolve_schema_url(
+    url: &str,
+    schema_base: &SchemaBaseConfig,
+    session: &RemoteSession,
+) -> Result<Value, ComposeError> {
     if let Some(base) = schema_base.local_base {
         // Map URL to local path
         let path = if let Some(remote_base) = schema_base.remote_base {
@@ -832,16 +841,18 @@ fn resolve_schema_url(url: &str, schema_base: &SchemaBaseConfig) -> Result<Value
         // HTTP fetch with remote bundling
         #[cfg(feature = "remote")]
         {
-            let mut schema = load_schema_url(url).map_err(|e| ComposeError::SchemaFetch {
+            let mut schema = session.load(url).map_err(|e| ComposeError::SchemaFetch {
                 url: url.to_string(),
                 message: e.to_string(),
             })?;
 
             // Bundle refs using the URL as base for resolving relative refs
-            bundle_refs_remote(&mut schema, url).map_err(|e| ComposeError::SchemaFetch {
-                url: url.to_string(),
-                message: format!("bundling refs: {}", e),
-            })?;
+            session
+                .bundle(&mut schema, url)
+                .map_err(|e| ComposeError::SchemaFetch {
+                    url: url.to_string(),
+                    message: format!("bundling refs: {}", e),
+                })?;
 
             Ok(schema)
         }
