@@ -234,6 +234,71 @@ mod tests {
     }
 
     #[test]
+    fn validate_omitted_field_absent_open_schema_is_valid() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "name": { "type": "string" }
+            }
+        });
+        let payload = json!({ "name": "test" });
+        let options = ResolveOptions::new(Direction::Request, "create");
+
+        let result = validate(&schema, &payload, &options);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_omitted_field_present_open_schema_is_accepted_as_unknown() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "name": { "type": "string" }
+            }
+        });
+        let payload = json!({ "name": "test", "id": "123" });
+        let options = ResolveOptions::new(Direction::Request, "create");
+
+        let result = validate(&schema, &payload, &options);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_omitted_field_absent_closed_schema_is_valid() {
+        let schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "name": { "type": "string" }
+            }
+        });
+        let payload = json!({ "name": "test" });
+        let options = ResolveOptions::new(Direction::Request, "create");
+
+        let result = validate(&schema, &payload, &options);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn validate_omitted_field_present_strict_is_rejected() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "name": { "type": "string" }
+            }
+        });
+        let payload = json!({ "name": "test", "id": "123" });
+        let options = ResolveOptions::new(Direction::Request, "create").strict(true);
+
+        let result = validate(&schema, &payload, &options);
+        assert!(matches!(result, Err(ValidateError::Invalid { .. })));
+    }
+
+    #[test]
     fn validate_collects_multiple_errors() {
         let schema = json!({
             "type": "object",
