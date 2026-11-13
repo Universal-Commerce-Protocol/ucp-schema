@@ -16,6 +16,28 @@ use std::time::Duration;
 #[cfg(feature = "remote")]
 const HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The process-wide HTTP client.
+///
+/// Reusing one client keeps a single connection pool alive: consecutive
+/// fetches from the same origin reuse the established TCP/TLS connection
+/// instead of paying a fresh handshake per document.
+#[cfg(feature = "remote")]
+fn http_client() -> Result<&'static reqwest::blocking::Client, reqwest::Error> {
+    static CLIENT: std::sync::OnceLock<reqwest::blocking::Client> = std::sync::OnceLock::new();
+    if let Some(client) = CLIENT.get() {
+        return Ok(client);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .timeout(HTTP_TIMEOUT)
+        .user_agent(concat!(
+            env!("CARGO_PKG_NAME"),
+            "/",
+            env!("CARGO_PKG_VERSION")
+        ))
+        .build()?;
+    Ok(CLIENT.get_or_init(|| client))
+}
+
 /// Load a schema from a file path.
 ///
 /// # Errors
@@ -56,18 +78,10 @@ pub fn load_schema_str(content: &str) -> Result<Value, ResolveError> {
 /// or `ResolveError::InvalidJson` if the response isn't valid JSON.
 #[cfg(feature = "remote")]
 pub fn load_schema_url(url: &str) -> Result<Value, ResolveError> {
-    let client = reqwest::blocking::Client::builder()
-        .timeout(HTTP_TIMEOUT)
-        .user_agent(concat!(
-            env!("CARGO_PKG_NAME"),
-            "/",
-            env!("CARGO_PKG_VERSION")
-        ))
-        .build()
-        .map_err(|source| ResolveError::NetworkError {
-            url: url.to_string(),
-            source,
-        })?;
+    let client = http_client().map_err(|source| ResolveError::NetworkError {
+        url: url.to_string(),
+        source,
+    })?;
 
     let response = client
         .get(url)
@@ -242,6 +256,39 @@ struct UcpRetriever {
     prefixes: std::sync::Mutex<Vec<(String, PathBuf)>>,
     /// Explicit URL→path mapping (`--schema-local-base`/`--schema-remote-base`).
     mapping: Option<(PathBuf, String)>,
+    /// Documents already fetched over HTTP during this [`RemoteSession`],
+    /// so a schema shared by the root and several extensions is downloaded
+    /// once instead of once per document that refers to it. Unused (and so
+    /// always `None`) without the `remote` feature.
+    remote_docs: Option<RemoteDocs>,
+}
+
+/// Documents fetched once per composition, keyed by their retrieval URL.
+type RemoteDocs = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>;
+
+/// Fetch `url`, reusing the session cache when one is attached.
+///
+/// Cached documents are kept exactly as received so every consumer can run
+/// its own preparation pass; the cache only removes the network round trip.
+#[cfg(feature = "remote")]
+fn fetch_remote(url: &str, docs: Option<&RemoteDocs>) -> Result<Value, ResolveError> {
+    if let Some(docs) = docs {
+        let cached = docs
+            .lock()
+            .expect("remote document cache poisoned")
+            .get(url)
+            .cloned();
+        if let Some(doc) = cached {
+            return Ok(doc);
+        }
+    }
+    let doc = load_schema_url(url)?;
+    if let Some(docs) = docs {
+        docs.lock()
+            .expect("remote document cache poisoned")
+            .insert(url.to_string(), doc.clone());
+    }
+    Ok(doc)
 }
 
 impl UcpRetriever {
@@ -322,7 +369,7 @@ impl jsonschema::Retrieve for UcpRetriever {
         // 4. Remote fetch, when built with the `remote` feature.
         #[cfg(feature = "remote")]
         if is_url(uri) {
-            let mut doc = load_schema_url(uri)?;
+            let mut doc = fetch_remote(uri, self.remote_docs.as_ref())?;
             prepare_document(&mut doc)?;
             return Ok(doc);
         }
@@ -534,6 +581,63 @@ fn flatten(
     base_uri: String,
     mapping: Option<(PathBuf, String)>,
 ) -> Result<(), ResolveError> {
+    flatten_with(schema, base_dir, base_uri, mapping, None)
+}
+
+/// A composition's remote fetch state: one HTTP client and one document
+/// cache shared by every schema loaded for that composition.
+///
+/// Composing a profile loads the root capability plus one document per
+/// extension, and those documents routinely `$ref` the same base types.
+/// Bundling each document on its own would download every shared type once
+/// per referring capability; a session downloads each URL once.
+#[derive(Default)]
+pub struct RemoteSession {
+    docs: RemoteDocs,
+}
+
+impl RemoteSession {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load one document through this session, so a URL fetched here is not
+    /// downloaded again while the same session is in use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::NetworkError`] when the fetch fails.
+    #[cfg(feature = "remote")]
+    pub fn load(&self, url: &str) -> Result<Value, ResolveError> {
+        fetch_remote(url, Some(&self.docs))
+    }
+
+    /// Bundle `schema` (whose base is `base_url`), fetching through this
+    /// session so documents already downloaded are reused.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ResolveError::BundleError`] when a reference cannot be
+    /// resolved or fetched.
+    pub fn bundle(&self, schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
+        flatten_with(
+            schema,
+            None,
+            base_url.to_string(),
+            None,
+            Some(self.docs.clone()),
+        )
+    }
+}
+
+fn flatten_with(
+    schema: &mut Value,
+    base_dir: Option<PathBuf>,
+    base_uri: String,
+    mapping: Option<(PathBuf, String)>,
+    remote_docs: Option<RemoteDocs>,
+) -> Result<(), ResolveError> {
     // Work on a copy: the input must stay untouched on any error path.
     let mut work = schema.clone();
     prepare_document(&mut work)?;
@@ -548,6 +652,7 @@ fn flatten(
     let retriever = UcpRetriever {
         prefixes: std::sync::Mutex::new(prefixes),
         mapping,
+        remote_docs,
     };
 
     // Upstream dereference resolves lazily-discovered external refs only at
@@ -1192,6 +1297,64 @@ mod tests {
             let result =
                 load_schema_url("https://this-domain-does-not-exist-12345.invalid/schema.json");
             assert!(matches!(result, Err(ResolveError::NetworkError { .. })));
+        }
+
+        // Composing a profile bundles the root capability and every
+        // extension, and those documents routinely `$ref` the same base
+        // types. One session must download each URL once: the shared mock
+        // asserts exactly one hit across both bundles.
+        #[test]
+        fn one_session_fetches_a_shared_document_once() {
+            use serde_json::json;
+
+            let mut server = mockito::Server::new();
+            let shared = server
+                .mock("GET", "/docs/shared.json")
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"type": "object", "properties": {"id": {"type": "string"}}}"#)
+                .expect(1)
+                .create();
+
+            let base = format!("{}/docs", server.url());
+            let session = RemoteSession::new();
+            for name in ["a.json", "b.json"] {
+                let mut doc = json!({
+                    "type": "object",
+                    "properties": {"shared": {"$ref": format!("{base}/shared.json")}},
+                });
+                session.bundle(&mut doc, &format!("{base}/{name}")).unwrap();
+                // The reference is inlined in both bundles, so the cached
+                // document is usable, not just remembered.
+                assert_eq!(
+                    doc["properties"]["shared"]["properties"]["id"]["type"],
+                    "string"
+                );
+            }
+
+            shared.assert();
+        }
+
+        #[test]
+        fn a_session_does_not_fetch_a_document_it_already_loaded() {
+            use serde_json::json;
+
+            let mut server = mockito::Server::new();
+            let shared = server
+                .mock("GET", "/shared.json")
+                .with_header("content-type", "application/json")
+                .with_body(r#"{"type": "object"}"#)
+                .expect(1)
+                .create();
+            let url = format!("{}/shared.json", server.url());
+
+            let session = RemoteSession::new();
+            session.load(&url).unwrap();
+            let mut doc = json!({"$ref": url});
+            session
+                .bundle(&mut doc, &format!("{}/doc.json", server.url()))
+                .unwrap();
+
+            shared.assert();
         }
 
         #[test]
