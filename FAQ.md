@@ -95,6 +95,20 @@ Sending `{ "name": "foo", "id": "123" }` for a request fails. The `id` field was
 
 ---
 
+## What takes precedence between `ucp_request: omit` and `additionalProperties: false`?
+
+**`additionalProperties: false` decides whether the field is rejected. `omit` only removes it from the schema.**
+
+Schemas are open by default, so an omitted field that is sent anyway is accepted as an additional field:
+
+| Resolved object                        | Field absent | Field present       |
+| -------------------------------------- | ------------ | ------------------- |
+| Open (default)                         | Valid        | Accepted as unknown |
+| Closed (`additionalProperties: false`) | Valid        | Rejected            |
+| `--strict`                             | Valid        | Rejected            |
+
+---
+
 ## How do I write an extension schema?
 
 **Extensions must define their additions in `$defs[root_capability_name]`.** Composition happens at validation time. Each extension owns its additions but references the base it extends.
