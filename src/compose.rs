@@ -38,7 +38,7 @@
 //! the payload being the raw checkout object. Use `--profile` CLI flag to
 //! simulate this pattern.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{json, Value};
@@ -411,7 +411,8 @@ pub fn check_version_constraints(
 ///
 /// 1. Finds the single root capability (no extends)
 /// 2. Validates that every extension has at least one active path to the root
-/// 3. Fetches schemas and extracts $defs[root] entries
+/// 3. Fetches schemas and extracts each extension's $defs[root] entry, falling
+///    back to $defs[parent] when exactly one active declared parent has one
 /// 4. Composes using allOf
 ///
 /// An extension's `extends` entries are alternative paths. Parents absent from
@@ -502,7 +503,8 @@ pub fn compose_schema(
     })?;
     let container = is_container_schema(&root_schema);
 
-    // Compose: for each extension, extract its self-contained `$defs[root.name]`.
+    // Compose: for each extension, extract its self-contained `$defs[root.name]`
+    // (or `$defs[parent]` when exactly one active declared parent has an entry).
     let mut ext_defs = Vec::new();
 
     for ext in &extensions {
@@ -526,7 +528,7 @@ pub fn compose_schema(
             });
         }
 
-        // Extract $defs[root.name] and inline any internal refs
+        // Extract the extension's contribution and inline any internal refs
         let defs = ext_schema
             .get("$defs")
             .ok_or_else(|| ComposeError::MissingDefEntry {
@@ -534,12 +536,7 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
-        let ext_def = defs
-            .get(&root.name)
-            .ok_or_else(|| ComposeError::MissingDefEntry {
-                extension: ext.name.clone(),
-                expected_key: root.name.clone(),
-            })?;
+        let ext_def = select_extension_def(ext, defs, &root.name, &cap_map)?;
 
         // Anchor any root-local refs the bundler retained (recursion), so the
         // extracted def stays correct outside its source document.
@@ -655,6 +652,45 @@ fn compose_container(
         .expect("container root is an object")
         .insert("$defs".to_string(), Value::Object(merged_defs));
     Ok(result)
+}
+
+/// Select the `$defs` entry an extension contributes to the root.
+///
+/// The root key always wins. Without it, an extension of an extension may key
+/// its contribution on a declared parent, but only when exactly one active
+/// declared parent has an entry; inactive parents are ignored. Entries for two
+/// or more active parents are ambiguous and rejected regardless of declaration
+/// order, so the author must supply a root-keyed entry to choose.
+fn select_extension_def<'a>(
+    ext: &Capability,
+    defs: &'a Value,
+    root_name: &str,
+    cap_map: &HashMap<&str, &Capability>,
+) -> Result<&'a Value, ComposeError> {
+    if let Some(def) = defs.get(root_name) {
+        return Ok(def);
+    }
+
+    let parents: BTreeSet<&str> = ext
+        .extends
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|parent| cap_map.contains_key(parent) && defs.get(*parent).is_some())
+        .collect();
+
+    match parents.len() {
+        0 => Err(ComposeError::MissingDefEntry {
+            extension: ext.name.clone(),
+            expected_key: root_name.to_string(),
+        }),
+        1 => Ok(&defs[parents.into_iter().next().unwrap()]),
+        _ => Err(ComposeError::AmbiguousParentDefs {
+            extension: ext.name.clone(),
+            root: root_name.to_string(),
+            parents: parents.into_iter().collect::<Vec<_>>().join(", "),
+        }),
+    }
 }
 
 /// Make an extracted `$defs` contribution self-contained.

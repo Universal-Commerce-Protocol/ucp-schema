@@ -31,6 +31,18 @@ pub enum ComposeError {
         expected_key: String,
     },
 
+    /// An extension has no `$defs` entry for the root, and more than one active
+    /// declared parent has an entry, so the parent fallback is ambiguous.
+    #[error(
+        "extension '{extension}' has $defs entries for multiple active parents ({parents}) \
+         and none for root '{root}'; add a $defs entry for '{root}' to select its contribution"
+    )]
+    AmbiguousParentDefs {
+        extension: String,
+        root: String,
+        parents: String,
+    },
+
     /// A container-shaped capability (request/response shapes live under
     /// `$defs/{op}_{direction}`) is extended by a schema whose `$defs[<capability>]`
     /// is not itself a container of operation shapes. Container extensions MUST
