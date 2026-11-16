@@ -794,7 +794,7 @@ pub fn verify_bindings(value: &Value) -> Result<(), ComposeError> {
 fn resolve_schema_url(
     url: &str,
     schema_base: &SchemaBaseConfig,
-    session: &RemoteSession,
+    #[cfg_attr(not(feature = "remote"), allow(unused_variables))] session: &RemoteSession,
 ) -> Result<Value, ComposeError> {
     if let Some(base) = schema_base.local_base {
         // Map URL to local path

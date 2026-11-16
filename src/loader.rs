@@ -258,12 +258,13 @@ struct UcpRetriever {
     mapping: Option<(PathBuf, String)>,
     /// Documents already fetched over HTTP during this [`RemoteSession`],
     /// so a schema shared by the root and several extensions is downloaded
-    /// once instead of once per document that refers to it. Unused (and so
-    /// always `None`) without the `remote` feature.
+    /// once instead of once per document that refers to it.
+    #[cfg(feature = "remote")]
     remote_docs: Option<RemoteDocs>,
 }
 
 /// Documents fetched once per composition, keyed by their retrieval URL.
+#[cfg(feature = "remote")]
 type RemoteDocs = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Value>>>;
 
 /// Fetch `url`, reusing the session cache when one is attached.
@@ -581,7 +582,14 @@ fn flatten(
     base_uri: String,
     mapping: Option<(PathBuf, String)>,
 ) -> Result<(), ResolveError> {
-    flatten_with(schema, base_dir, base_uri, mapping, None)
+    flatten_with(
+        schema,
+        base_dir,
+        base_uri,
+        mapping,
+        #[cfg(feature = "remote")]
+        None,
+    )
 }
 
 /// A composition's remote fetch state: one HTTP client and one document
@@ -592,13 +600,14 @@ fn flatten(
 /// Bundling each document on its own would download every shared type once
 /// per referring capability; a session downloads each URL once.
 #[derive(Default)]
-pub struct RemoteSession {
+pub(crate) struct RemoteSession {
+    #[cfg(feature = "remote")]
     docs: RemoteDocs,
 }
 
 impl RemoteSession {
     #[must_use]
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
@@ -609,7 +618,7 @@ impl RemoteSession {
     ///
     /// Returns [`ResolveError::NetworkError`] when the fetch fails.
     #[cfg(feature = "remote")]
-    pub fn load(&self, url: &str) -> Result<Value, ResolveError> {
+    pub(crate) fn load(&self, url: &str) -> Result<Value, ResolveError> {
         fetch_remote(url, Some(&self.docs))
     }
 
@@ -620,7 +629,8 @@ impl RemoteSession {
     ///
     /// Returns [`ResolveError::BundleError`] when a reference cannot be
     /// resolved or fetched.
-    pub fn bundle(&self, schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
+    #[cfg(feature = "remote")]
+    pub(crate) fn bundle(&self, schema: &mut Value, base_url: &str) -> Result<(), ResolveError> {
         flatten_with(
             schema,
             None,
@@ -636,7 +646,7 @@ fn flatten_with(
     base_dir: Option<PathBuf>,
     base_uri: String,
     mapping: Option<(PathBuf, String)>,
-    remote_docs: Option<RemoteDocs>,
+    #[cfg(feature = "remote")] remote_docs: Option<RemoteDocs>,
 ) -> Result<(), ResolveError> {
     // Work on a copy: the input must stay untouched on any error path.
     let mut work = schema.clone();
@@ -652,6 +662,7 @@ fn flatten_with(
     let retriever = UcpRetriever {
         prefixes: std::sync::Mutex::new(prefixes),
         mapping,
+        #[cfg(feature = "remote")]
         remote_docs,
     };
 
