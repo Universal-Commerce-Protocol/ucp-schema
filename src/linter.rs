@@ -483,11 +483,7 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
             let child_path = pointer_path(path, key);
             if matches!(
                 key.as_str(),
-                "properties"
-                    | "patternProperties"
-                    | "$defs"
-                    | "definitions"
-                    | "dependentSchemas"
+                "properties" | "patternProperties" | "$defs" | "definitions" | "dependentSchemas"
             ) {
                 // Values in schema maps are always schemas, even when their
                 // property names collide with instance-data keywords above.
