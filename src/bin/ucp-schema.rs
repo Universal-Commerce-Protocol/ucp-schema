@@ -9,8 +9,9 @@ use clap::{Parser, Subcommand};
 use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
-    extract_jsonrpc_payload, is_url, lint, load_schema, load_schema_auto, resolve,
-    select_operation_schema, validate, ComposeError, DetectedDirection, Direction, FileStatus,
+    extract_jsonrpc_payload, generate_openapi, generate_types, is_url, lint, load_schema,
+    load_schema_auto, resolve, select_operation_schema, validate, CodegenError, ComposeError,
+    DetectedDirection, Direction, FileStatus, GenerateOpenApiOptions, GenerateTypesOptions,
     ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
 };
 
@@ -28,6 +29,12 @@ impl CliExitCode for ResolveError {
 impl CliExitCode for ComposeError {
     fn exit_code(&self) -> u8 {
         ComposeError::exit_code(self) as u8
+    }
+}
+
+impl CliExitCode for CodegenError {
+    fn exit_code(&self) -> u8 {
+        CodegenError::exit_code(self) as u8
     }
 }
 
@@ -114,7 +121,8 @@ enum Commands {
         #[arg(long)]
         pretty: bool,
 
-        /// Dereference all $ref pointers (bundle into single schema; schema input only)
+        /// Materialize external $refs into a self-contained schema; recursive
+        /// references are retained with their resource identity (schema input only)
         #[arg(long)]
         bundle: bool,
 
@@ -232,9 +240,88 @@ enum Commands {
         #[arg(long)]
         strict: bool,
 
-        /// Suppress progress output, only show errors
+        /// Suppress per-file progress output; the final summary is still printed
         #[arg(long, short)]
         quiet: bool,
+    },
+
+    /// Generate a self-contained JSON Schema 2020-12 type bundle ($defs) from a UCP profile or capability set
+    #[command(name = "generate-types")]
+    GenerateTypes {
+        /// Path or URL to a UCP discovery profile (e.g. profile.json or https://allbirds.com/.well-known/ucp)
+        #[arg(long, short = 'p')]
+        profile: Option<String>,
+
+        /// Explicit capability FQDN to include in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.checkout)
+        #[arg(
+            long = "capability",
+            alias = "capabilities",
+            value_delimiter = ',',
+            conflicts_with = "profile"
+        )]
+        capabilities: Vec<String>,
+
+        /// Explicit capability extension FQDN to include and compose in directory mode (repeatable or comma-separated, e.g. dev.ucp.shopping.fulfillment)
+        #[arg(
+            long = "extension",
+            alias = "extensions",
+            value_delimiter = ',',
+            conflicts_with = "profile"
+        )]
+        extensions: Vec<String>,
+
+        /// Local directory containing UCP JSON schema files (mutually exclusive with --profile)
+        #[arg(
+            long,
+            short = 's',
+            conflicts_with = "profile",
+            required_unless_present = "profile"
+        )]
+        schema_dir: Option<PathBuf>,
+
+        /// Output file path (emits JSON to stdout if omitted)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Pretty-print JSON output (defaults to true; use --pretty=false for compact)
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        pretty: bool,
+    },
+
+    /// Generate an OpenAPI 3.1.0 specification by binding a UCP profile's REST service schema to its compiled capability types
+    #[command(name = "generate-openapi")]
+    GenerateOpenapi {
+        /// Path or URL to a UCP discovery profile declaring a REST service binding (required)
+        #[arg(long, short = 'p')]
+        profile: String,
+
+        /// Optional service FQDN filter when a profile declares multiple REST services (e.g. dev.ucp.shopping)
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Base server URL injected into servers (overrides the profile's REST service endpoint)
+        #[arg(long)]
+        server_url: Option<String>,
+
+        /// Output file path (emits JSON to stdout if omitted)
+        #[arg(long, short = 'o')]
+        output: Option<PathBuf>,
+
+        /// Pretty-print JSON output (defaults to true; use --pretty=false for compact)
+        #[arg(
+            long,
+            default_value_t = true,
+            num_args = 0..=1,
+            default_missing_value = "true",
+            action = clap::ArgAction::Set
+        )]
+        pretty: bool,
     },
 }
 
@@ -322,6 +409,30 @@ fn main() -> ExitCode {
             strict,
             quiet,
         } => run_lint(&path, &format, strict, quiet),
+
+        Commands::GenerateTypes {
+            profile,
+            capabilities,
+            extensions,
+            schema_dir,
+            output,
+            pretty,
+        } => run_generate_types(
+            profile,
+            capabilities,
+            extensions,
+            schema_dir,
+            output,
+            pretty,
+        ),
+
+        Commands::GenerateOpenapi {
+            profile,
+            service,
+            server_url,
+            output,
+            pretty,
+        } => run_generate_openapi(profile, service, server_url, output, pretty),
     };
 
     match result {
@@ -704,12 +815,106 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
             report_error(json_output, &e.to_string());
             Err(e.exit_code() as u8)
         }
+        // ValidateError is non_exhaustive: a variant added later must not stop
+        // this binary compiling. Report it and exit 2, matching the schema-error
+        // class the other arms use.
+        Err(e) => {
+            report_error(json_output, &e.to_string());
+            Err(2)
+        }
     }
 }
 
+fn run_generate_types(
+    profile: Option<String>,
+    capabilities: Vec<String>,
+    extensions: Vec<String>,
+    schema_dir: Option<PathBuf>,
+    output: Option<PathBuf>,
+    pretty: bool,
+) -> Result<(), u8> {
+    if let (Some(dir), Some(out)) = (&schema_dir, &output) {
+        validate_output_outside_schema_dir_or_types_json(dir, out)?;
+    }
+    let options = GenerateTypesOptions {
+        profile,
+        capabilities: (!capabilities.is_empty()).then_some(capabilities),
+        extensions: (!extensions.is_empty()).then_some(extensions),
+        schema_dir,
+        ..GenerateTypesOptions::default()
+    };
+    let bundle = generate_types(&options).map_err(cli_err(false))?;
+    write_json_output(&bundle, output, pretty)
+}
+
+fn validate_output_outside_schema_dir_or_types_json(
+    schema_dir: &Path,
+    output: &Path,
+) -> Result<(), u8> {
+    let is_types_json = output
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.ends_with(".types.json"));
+    if is_types_json {
+        return Ok(());
+    }
+    let resolved_dir = resolve_path_for_prefix_check(schema_dir);
+    let resolved_out = resolve_path_for_prefix_check(output);
+    if resolved_out.starts_with(&resolved_dir) {
+        eprintln!(
+            "Error: output file inside --schema-dir must end with '.types.json' so subsequent directory scans ignore it: {}",
+            output.display()
+        );
+        return Err(2);
+    }
+    Ok(())
+}
+
+fn resolve_path_for_prefix_check(p: &Path) -> PathBuf {
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        std::env::current_dir().map_or_else(|_| p.to_path_buf(), |cwd| cwd.join(p))
+    };
+    let mut normalized = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            c => normalized.push(c.as_os_str()),
+        }
+    }
+    normalized
+        .canonicalize()
+        .ok()
+        .or_else(|| {
+            let parent = normalized.parent()?.canonicalize().ok()?;
+            Some(parent.join(normalized.file_name()?))
+        })
+        .unwrap_or(normalized)
+}
+
+fn run_generate_openapi(
+    profile: String,
+    service: Option<String>,
+    server_url: Option<String>,
+    output: Option<PathBuf>,
+    pretty: bool,
+) -> Result<(), u8> {
+    let options = GenerateOpenApiOptions {
+        profile,
+        service,
+        server_url,
+    };
+    let spec = generate_openapi(&options).map_err(cli_err(false))?;
+    write_json_output(&spec, output, pretty)
+}
+
 /// Shared helper: serialize JSON and write to output or stdout.
-fn write_json_output(
-    value: &serde_json::Value,
+fn write_json_output<T: serde::Serialize + ?Sized>(
+    value: &T,
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
@@ -796,6 +1001,11 @@ fn report_error(json_output: bool, msg: &str) {
 fn run_lint(path: &Path, format: &str, strict: bool, quiet: bool) -> Result<(), u8> {
     use ucp_schema::Severity;
 
+    if !matches!(format, "text" | "json") {
+        eprintln!("Error: unsupported lint output format: {format}. Use 'text' or 'json'.");
+        return Err(2);
+    }
+
     if !path.exists() {
         eprintln!("Error: path not found: {}", path.display());
         return Err(2);
@@ -845,9 +1055,17 @@ fn run_lint(path: &Path, format: &str, strict: bool, quiet: bool) -> Result<(), 
 
         println!();
         if result.is_ok() && (!strict || result.warnings == 0) {
+            // Warnings do not fail a non-strict run, but omitting them from
+            // the summary lets a log tail read "all passed" while warnings
+            // scroll past above it.
+            let warnings = match result.warnings {
+                0 => String::new(),
+                1 => " (1 warning)".to_string(),
+                n => format!(" ({n} warnings)"),
+            };
             println!(
-                "\x1b[32m✓ {} files checked, all passed\x1b[0m",
-                result.files_checked
+                "\x1b[32m✓ {} files checked, all passed{}\x1b[0m",
+                result.files_checked, warnings
             );
         } else {
             println!(

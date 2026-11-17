@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::loader::{load_schema, navigate_fragment};
+use crate::loader::{collect_json_files, load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
 use crate::types::{
     is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
     UCP_ANNOTATIONS, VALID_OPERATIONS,
@@ -78,7 +78,7 @@ impl LintResult {
 /// If `strict` is true, warnings are treated as errors.
 /// Returns aggregated results for all files.
 pub fn lint(path: &Path, strict: bool) -> LintResult {
-    let files = collect_schema_files(path);
+    let files = collect_json_files(path);
     let mut results = Vec::new();
     let mut total_errors = 0;
     let mut total_warnings = 0;
@@ -123,6 +123,15 @@ pub fn lint(path: &Path, strict: bool) -> LintResult {
     }
 }
 
+/// Whether a document is an OpenAPI or OpenRPC service definition rather than a
+/// JSON Schema. Both declare their version under a fixed root key (`openapi` /
+/// `openrpc`), which is how their own specifications identify the document type.
+fn is_service_definition(schema: &Value) -> bool {
+    ["openapi", "openrpc"]
+        .iter()
+        .any(|key| schema.get(key).is_some_and(Value::is_string))
+}
+
 /// Lint a single schema file.
 pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     let mut diagnostics = Vec::new();
@@ -157,10 +166,12 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     check_requires(&schema, file, &mut diagnostics);
 
     // Check that `examples` entries validate against their own (sub)schema
-    check_examples(&schema, file, "", &mut diagnostics);
+    check_examples(&schema, &schema, file, "", &mut diagnostics);
 
-    // Check for missing $id (warning)
-    if schema.get("$id").is_none() {
+    // Check for missing $id (warning). Service definitions are OpenAPI/OpenRPC
+    // documents, not JSON Schemas: neither root object defines $id, so requiring
+    // one would ask authors to add a key their own specification rejects.
+    if schema.get("$id").is_none() && !is_service_definition(&schema) {
         diagnostics.push(Diagnostic {
             severity: Severity::Warning,
             code: "W002".to_string(),
@@ -188,6 +199,11 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
     }
 }
 
+fn pointer_path(path: &str, token: &str) -> String {
+    let escaped = token.replace('~', "~0").replace('/', "~1");
+    format!("{}/{}", path, escaped)
+}
+
 /// Validate that every `examples` entry conforms to its enclosing (sub)schema.
 ///
 /// `examples` is an annotation that validators ignore, so a listed value that
@@ -196,39 +212,106 @@ pub fn lint_file(file: &Path, base_path: &Path) -> FileResult {
 /// This turns `examples` into an executable, drift-free conformance battery that
 /// lives next to the grammar it documents.
 ///
-/// Best-effort: a sub-schema whose validator cannot be compiled in isolation
-/// (e.g., unresolved external `$ref`s) is skipped here — broken refs are already
-/// reported by the `$ref` checks.
-fn check_examples(value: &Value, file: &Path, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+/// A sub-schema is compiled with the root schema registered as a resource, so
+/// document-internal refs such as `#/$defs/x` still resolve from nested example
+/// sites. If the validator still cannot be compiled, the example is reported as
+/// W006 rather than passed over: the `$ref` checks confirm a reference
+/// *resolves*, which is a different question from whether the example was
+/// ever validated, and a schema whose refs are all healthy can still have
+/// every example silently unchecked.
+fn check_examples(
+    value: &Value,
+    root: &Value,
+    file: &Path,
+    path: &str,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
     match value {
         Value::Object(map) => {
             if let Some(Value::Array(examples)) = map.get("examples") {
-                if let Ok(validator) = jsonschema::validator_for(value) {
-                    for (i, example) in examples.iter().enumerate() {
-                        if !validator.is_valid(example) {
-                            diagnostics.push(Diagnostic {
-                                severity: Severity::Error,
-                                code: "E008".to_string(),
-                                file: file.to_path_buf(),
-                                path: format!("{}/examples/{}", path, i),
-                                message: format!(
-                                    "example does not validate against its schema: {}",
-                                    example
-                                ),
-                            });
+                const ROOT_URI: &str = "urn:ucp-schema:lint-root";
+                let mut root = root.clone();
+                if let Some(root) = root.as_object_mut() {
+                    root.insert("$id".to_string(), Value::String(ROOT_URI.to_string()));
+                }
+                let validator = jsonschema::Registry::new()
+                    .add(ROOT_URI, jsonschema::Resource::from_contents(root))
+                    .and_then(|registry| registry.prepare())
+                    .ok()
+                    .and_then(|registry| {
+                        jsonschema::options()
+                            .with_registry(&registry)
+                            .build(&serde_json::json!({
+                                "$ref": format!("{}#{}", ROOT_URI, path)
+                            }))
+                            .ok()
+                    });
+
+                match validator {
+                    Some(validator) => {
+                        for (i, example) in examples.iter().enumerate() {
+                            if !validator.is_valid(example) {
+                                diagnostics.push(Diagnostic {
+                                    severity: Severity::Error,
+                                    code: "E008".to_string(),
+                                    file: file.to_path_buf(),
+                                    path: format!("{}/examples/{}", path, i),
+                                    message: format!(
+                                        "example does not validate against its schema: {}",
+                                        example
+                                    ),
+                                });
+                            }
                         }
+                    }
+                    None => {
+                        diagnostics.push(Diagnostic {
+                            severity: Severity::Warning,
+                            code: "W006".to_string(),
+                            file: file.to_path_buf(),
+                            path: format!("{}/examples", path),
+                            message: format!(
+                                "{} example(s) not validated: schema could not be compiled with root context",
+                                examples.len()
+                            ),
+                        });
                     }
                 }
             }
             for (key, child) in map {
-                let child_path = format!("{}/{}", path, key);
-                check_examples(child, file, &child_path, diagnostics);
+                // These keywords hold JSON instance data, not child schemas.
+                if matches!(
+                    key.as_str(),
+                    "default" | "const" | "examples" | "example" | "enum"
+                ) {
+                    continue;
+                }
+                let child_path = pointer_path(path, key);
+                if matches!(
+                    key.as_str(),
+                    "properties"
+                        | "patternProperties"
+                        | "$defs"
+                        | "definitions"
+                        | "dependentSchemas"
+                ) {
+                    // Values in schema maps are always schemas, even when their
+                    // property names collide with instance-data keywords above.
+                    if let Value::Object(schemas) = child {
+                        for (name, schema) in schemas {
+                            let schema_path = pointer_path(&child_path, name);
+                            check_examples(schema, root, file, &schema_path, diagnostics);
+                        }
+                    }
+                } else {
+                    check_examples(child, root, file, &child_path, diagnostics);
+                }
             }
         }
         Value::Array(items) => {
             for (i, item) in items.iter().enumerate() {
                 let child_path = format!("{}/{}", path, i);
-                check_examples(item, file, &child_path, diagnostics);
+                check_examples(item, root, file, &child_path, diagnostics);
             }
         }
         _ => {}
@@ -251,7 +334,12 @@ fn check_refs(
             }
 
             for (key, val) in map {
-                let child_path = format!("{}/{}", path, key);
+                // These keywords hold JSON instance data, not child schemas.
+                // A business payload field named `$ref` should not be resolved.
+                if matches!(key.as_str(), "default" | "const" | "examples" | "enum") {
+                    continue;
+                }
+                let child_path = pointer_path(path, key);
                 check_refs(val, file, file_dir, &child_path, root, diagnostics);
             }
         }
@@ -345,9 +433,36 @@ fn check_annotations(value: &Value, file: &Path, path: &str, diagnostics: &mut V
             }
         }
 
-        // Recurse
+        // The `ucp_` prefix is reserved for UCP annotations in every key
+        // position, so membership of that small set is the whole rule — no
+        // need to work out whether this object is a schema, a definition map
+        // or an extension carrier. An unrecognized `ucp_` key is inert, and
+        // inert is indistinguishable from working by inspection, whether it
+        // is a misspelled annotation or a definition squatting the prefix.
+        for key in map.keys() {
+            if key.starts_with("ucp_") && !UCP_ANNOTATIONS.contains(&key.as_str()) {
+                diagnostics.push(Diagnostic {
+                    severity: Severity::Warning,
+                    code: "W007".to_string(),
+                    file: file.to_path_buf(),
+                    path: pointer_path(path, key),
+                    message: format!(
+                        "{} is not a UCP annotation and has no effect; the ucp_ prefix is reserved (known: {})",
+                        key,
+                        UCP_ANNOTATIONS.join(", ")
+                    ),
+                });
+            }
+        }
+
+        // Recurse, but never into instance data: a `ucp_*` key inside a
+        // `const`/`enum`/`default`/`examples` value is payload the schema
+        // matches against, not an annotation to validate.
         for (key, val) in map {
-            let child_path = format!("{}/{}", path, key);
+            if INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                continue;
+            }
+            let child_path = pointer_path(path, key);
             check_annotations(val, file, &child_path, diagnostics);
         }
     } else if let Value::Array(arr) = value {
@@ -366,7 +481,7 @@ fn check_annotation_value(
     path: &str,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
-    let annotation_path = format!("{}/{}", path, key);
+    let annotation_path = pointer_path(path, key);
 
     match annotation {
         Value::String(s) => {
@@ -386,7 +501,7 @@ fn check_annotation_value(
         Value::Object(map) => {
             // Object form: { "create": "omit", "update": "required" }
             for (op, val) in map {
-                let op_path = format!("{}/{}", annotation_path, op);
+                let op_path = pointer_path(&annotation_path, op);
 
                 // Handle shorthand transition key
                 if op == "transition" {
@@ -565,7 +680,7 @@ fn check_version_constraint(
                 severity: Severity::Warning,
                 code: "W005".to_string(),
                 file: file.to_path_buf(),
-                path: format!("{}/{}", path, key),
+                path: pointer_path(path, key),
                 message: format!(
                     "unknown key \"{}\" in version constraint: expected min, max",
                     key
@@ -687,7 +802,7 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
                 severity: Severity::Warning,
                 code: "W005".to_string(),
                 file: file.to_path_buf(),
-                path: format!("{}/{}", requires_path, key),
+                path: pointer_path(requires_path, key),
                 message: format!(
                     "unknown key \"{}\" in requires: expected protocol, capabilities",
                     key
@@ -734,7 +849,7 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
             .unwrap_or_default();
 
         for (cap_name, constraint) in caps_obj {
-            let cap_path = format!("{}/{}", caps_path, cap_name);
+            let cap_path = pointer_path(&caps_path, cap_name);
 
             check_version_constraint(constraint, file, &cap_path, diagnostics);
 
@@ -755,41 +870,192 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
     }
 }
 
-/// Collect all .json files in a path (file or directory).
-fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            return vec![path.to_path_buf()];
-        }
-        return vec![];
-    }
-
-    let mut files = Vec::new();
-    collect_files_recursive(path, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, files);
-        } else if path.extension().map(|e| e == "json").unwrap_or(false) {
-            files.push(path);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
     use tempfile::{tempdir, NamedTempFile};
+
+    // A sub-schema is compiled on its own, so a `$ref` to a sibling file or a
+    // document-level `#/$defs/...` cannot resolve and its examples go
+    // unchecked. Silence there reports a clean file while validating nothing,
+    // so the gap is surfaced as W006. The nested cases are the ones that bite:
+    // examples at the document root compile fine and are genuinely checked.
+    // `ucp_` is the spec's prefix, not an extension point, so an
+    // unrecognized one is inert — and inert reads exactly like working.
+    // Position matters: a definition or property may legitimately be named
+    // `ucp_agent`, and a `ucp_*` key inside instance data is payload.
+    #[test]
+    fn unrecognized_ucp_annotations_are_reported() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/unknown.json",
+                "ucp_shared_request": true,
+                "properties": {{ "a": {{ "type": "string" }} }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let hit = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "W007")
+            .unwrap_or_else(|| panic!("expected W007, got {:?}", result.diagnostics));
+        assert_eq!(hit.severity, Severity::Warning);
+        assert!(hit.message.contains("ucp_shared_request"));
+    }
+
+    // The prefix is reserved in every key position, so a definition or
+    // property squatting it is reported too \u2014 `$defs/ucp_agent` exists in the
+    // transports schema today. Deciding that from position instead would mean
+    // enumerating name-keyed carriers, and those are open-ended
+    // (`capabilities`, `methods`, `services`, `payment_handlers`, ...).
+    #[test]
+    fn the_ucp_prefix_is_reserved_in_every_key_position() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/reserved.json",
+                "type": "object",
+                "$defs": {{ "ucp_agent": {{ "type": "object" }} }},
+                "methods": {{ "ucp_custom": {{ "title": "a method" }} }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let hits: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "W007")
+            .collect();
+        assert_eq!(hits.len(), 2, "expected both, got {:?}", result.diagnostics);
+        assert!(hits.iter().all(|d| d.severity == Severity::Warning));
+    }
+
+    // Instance data is the exception, and not because of where it sits: a
+    // `ucp_*` key inside `const`/`enum`/`default`/`examples` is a value the
+    // schema matches against, not a key in the schema at all. Reported as
+    // E005 before this traversal skipped it.
+    #[test]
+    fn ucp_keys_inside_instance_data_are_payload() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/payload.json",
+                "type": "object",
+                "properties": {{
+                    "template": {{ "const": {{ "ucp_request": 12345 }} }},
+                    "choice": {{ "enum": [{{ "ucp_whatever": true }}] }}
+                }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert!(
+            result.diagnostics.is_empty(),
+            "instance data is not schema keys: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn examples_behind_an_external_ref_are_reported_not_skipped() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("amount.json"),
+            r#"{"$id": "https://example.test/amount.json", "type": "integer"}"#,
+        )
+        .unwrap();
+        let main = dir.path().join("main.json");
+        std::fs::write(
+            &main,
+            r#"{
+                "$id": "https://example.test/main.json",
+                "properties": {
+                    "price": {
+                        "allOf": [{ "$ref": "amount.json" }],
+                        "examples": ["not-an-integer"]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = lint_file(&main, dir.path());
+        assert_eq!(
+            result.status,
+            FileStatus::Warning,
+            "unvalidated examples must not report a clean file: {:?}",
+            result.diagnostics
+        );
+        assert!(
+            result.diagnostics.iter().any(|d| d.code == "W006"),
+            "expected W006, got {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn examples_behind_a_nested_internal_ref_are_validated() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r##"{{
+                "$id": "https://example.test/internal.json",
+                "$defs": {{ "code": {{ "type": "string", "pattern": "^[A-Z]+$" }} }},
+                "properties": {{
+                    "kind": {{
+                        "allOf": [{{ "$ref": "#/$defs/code" }}],
+                        "examples": ["lowercase"]
+                    }}
+                }}
+            }}"##
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        let e008: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .collect();
+        assert_eq!(e008.len(), 1, "expected lowercase to fail: {e008:?}");
+        assert_eq!(e008[0].path, "/properties/kind/examples/0");
+    }
+
+    // Self-contained sub-schemas still compile, so their examples are checked
+    // as errors rather than excused as warnings.
+    #[test]
+    fn self_contained_examples_are_still_validated() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+                "$id": "https://example.test/plain.json",
+                "properties": {{
+                    "amount": {{ "type": "integer", "examples": ["not-an-integer"] }}
+                }}
+            }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        assert!(result.diagnostics.iter().any(|d| d.code == "E008"));
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "W006"),
+            "a compilable schema must not warn: {:?}",
+            result.diagnostics
+        );
+    }
 
     #[test]
     fn lint_valid_schema() {
@@ -834,6 +1100,130 @@ mod tests {
     }
 
     #[test]
+    fn lint_escapes_dynamic_json_pointer_tokens() {
+        let dir = tempdir().unwrap();
+        let schema_path = dir.path().join("schema.json");
+        std::fs::write(
+            &schema_path,
+            r#"{
+                "$id": "https://example.com/test.json",
+                "type": "object",
+                "properties": {
+                    "a/b~c": {
+                        "type": "string",
+                        "ucp_request": "invalid",
+                        "ucp_bad/key~name": "omit",
+                        "examples": [123]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = lint_file(&schema_path, dir.path());
+        for (code, expected_path) in [
+            ("E004", "/properties/a~1b~0c/ucp_request"),
+            ("W007", "/properties/a~1b~0c/ucp_bad~1key~0name"),
+            ("E008", "/properties/a~1b~0c/examples/0"),
+        ] {
+            let diagnostic = result
+                .diagnostics
+                .iter()
+                .find(|d| d.code == code)
+                .unwrap_or_else(|| panic!("missing {code}: {:?}", result.diagnostics));
+            assert_eq!(diagnostic.path, expected_path);
+        }
+
+        let ref_path = dir.path().join("ref.json");
+        std::fs::write(
+            &ref_path,
+            r#"{
+                "$id": "https://example.com/ref.json",
+                "properties": {
+                    "ref/a~b": { "$ref": "missing.json" }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let result = lint_file(&ref_path, dir.path());
+        let diagnostic = result
+            .diagnostics
+            .iter()
+            .find(|d| d.code == "E002")
+            .unwrap_or_else(|| panic!("missing E002: {:?}", result.diagnostics));
+        assert_eq!(diagnostic.path, "/properties/ref~1a~0b");
+    }
+
+    #[test]
+    fn lint_does_not_check_examples_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "type": "string", "examples": [123] }},
+            "const": {{ "type": "string", "examples": [123] }},
+            "examples": [{{ "type": "string", "examples": [123] }}],
+            "example": {{ "type": "string", "examples": [123] }},
+            "enum": [{{ "type": "string", "examples": [123] }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E008"),
+            "instance data should not produce E008: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_property_names_that_collide_with_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "properties": {{
+                "default": {{ "type": "string", "examples": [123] }},
+                "const": {{ "type": "string", "examples": [123] }},
+                "examples": {{ "type": "string", "examples": [123] }},
+                "example": {{ "type": "string", "examples": [123] }},
+                "enum": {{ "type": "string", "examples": [123] }}
+            }},
+            "dependentSchemas": {{
+                "default": {{ "type": "string", "examples": [123] }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let paths: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .map(|d| d.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/properties/default/examples/0",
+                "/properties/const/examples/0",
+                "/properties/examples/examples/0",
+                "/properties/example/examples/0",
+                "/properties/enum/examples/0",
+                "/dependentSchemas/default/examples/0",
+            ]
+        );
+    }
+
+    #[test]
     fn lint_invalid_example_fails() {
         // A documented-valid example that no longer matches the pattern (e.g.,
         // after a grammar regression) MUST be flagged.
@@ -863,6 +1253,37 @@ mod tests {
             result.diagnostics
         );
         assert_eq!(e008[0].path, "/examples/1");
+    }
+
+    #[test]
+    fn lint_referenced_examples_use_root_schema() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r##"{{
+            "$id": "https://example.com/root.json",
+            "$defs": {{
+                "positive": {{ "type": "integer", "minimum": 1 }}
+            }},
+            "properties": {{
+                "value": {{
+                    "$ref": "#/$defs/positive",
+                    "examples": [0, 2]
+                }}
+            }}
+        }}"##
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Error);
+        let e008: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .collect();
+        assert_eq!(e008.len(), 1, "expected only 0 to fail: {e008:?}");
+        assert_eq!(e008[0].path, "/properties/value/examples/0");
     }
 
     #[test]
@@ -913,6 +1334,31 @@ mod tests {
         let result = lint_file(file.path(), file.path().parent().unwrap());
         assert_eq!(result.status, FileStatus::Error);
         assert!(result.diagnostics.iter().any(|d| d.code == "E002"));
+    }
+
+    #[test]
+    fn lint_does_not_check_refs_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "$ref": "business-id" }},
+            "const": {{ "$ref": "business-id" }},
+            "examples": [{{ "$ref": "business-id" }}],
+            "enum": [{{ "$ref": "business-id" }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E002"),
+            "instance data should not produce E002: {:?}",
+            result.diagnostics
+        );
     }
 
     #[test]
@@ -1081,6 +1527,61 @@ mod tests {
             r#"{{
             "type": "object",
             "properties": {{}}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Warning);
+        assert!(result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_openapi_service_definition_skips_missing_id_warning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "openapi": "3.1.0",
+            "info": {{ "title": "Shopping", "version": "1.0.0" }},
+            "paths": {{}}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(!result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_openrpc_service_definition_skips_missing_id_warning() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "openrpc": "1.3.2",
+            "info": {{ "title": "Shopping", "version": "1.0.0" }},
+            "methods": []
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(!result.diagnostics.iter().any(|d| d.code == "W002"));
+    }
+
+    #[test]
+    fn lint_non_string_openapi_property_still_warns() {
+        // A JSON Schema describing an OpenAPI document has an `openapi`
+        // property, but it is a subschema object, not a version string.
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "type": "object",
+            "properties": {{ "openapi": {{ "type": "string" }} }}
         }}"#
         )
         .unwrap();

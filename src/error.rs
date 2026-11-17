@@ -5,6 +5,7 @@ use thiserror::Error;
 
 /// Errors during schema composition from UCP capability metadata.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ComposeError {
     #[error("payload is not self-describing: missing ucp.capabilities (response) or meta.profile (request)")]
     NotSelfDescribing,
@@ -21,9 +22,6 @@ pub enum ComposeError {
     #[error("multiple root capabilities found: {}", names.join(", "))]
     MultipleRootCapabilities { names: Vec<String> },
 
-    #[error("extension '{extension}' references unknown parent '{parent}'")]
-    UnknownParent { extension: String, parent: String },
-
     #[error("extension '{extension}' does not connect to root '{root}'")]
     OrphanExtension { extension: String, root: String },
 
@@ -31,6 +29,18 @@ pub enum ComposeError {
     MissingDefEntry {
         extension: String,
         expected_key: String,
+    },
+
+    /// An extension has no `$defs` entry for the root, and more than one active
+    /// declared parent has an entry, so the parent fallback is ambiguous.
+    #[error(
+        "extension '{extension}' has $defs entries for multiple active parents ({parents}) \
+         and none for root '{root}'; add a $defs entry for '{root}' to select its contribution"
+    )]
+    AmbiguousParentDefs {
+        extension: String,
+        root: String,
+        parents: String,
     },
 
     /// A container-shaped capability (request/response shapes live under
@@ -82,6 +92,7 @@ impl ComposeError {
 
 /// Errors during schema resolution.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ResolveError {
     // IO errors (exit code 3)
     #[error("file not found: {path}")]
@@ -169,6 +180,7 @@ pub enum ResolveError {
 
 /// Errors during validation.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ValidateError {
     #[error(transparent)]
     Resolve(#[from] ResolveError),

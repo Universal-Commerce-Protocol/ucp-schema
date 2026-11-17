@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ucp.dev/schemas/shopping/cart.json",
+  "name": "dev.ucp.shopping.cart",
+  "version": "2026-01-11",
+  "title": "Cart",
+  "description": "Minimal cart schema for testing composition.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "id": { "type": "string" },
+    "items": { "type": "array" },
+    "ucp": { "type": "object", "additionalProperties": true }
+  }
+}

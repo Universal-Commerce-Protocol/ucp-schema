@@ -38,14 +38,14 @@
 //! the payload being the raw checkout object. Use `--profile` CLI flag to
 //! simulate this pattern.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
 use crate::error::ComposeError;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
-use crate::types::{Direction, Requires, VersionConstraint};
+use crate::types::{is_valid_version, Direction, Requires, VersionConstraint};
 
 #[cfg(feature = "remote")]
 use crate::loader::{bundle_refs_remote, load_schema_url};
@@ -77,7 +77,8 @@ pub struct Capability {
     pub version: String,
     /// URL to the JSON Schema for this capability.
     pub schema_url: String,
-    /// Parent capability names this extends. None for root capabilities.
+    /// Alternative parent capability paths. During composition, only parents in
+    /// the active capability set are traversed. None for root capabilities.
     pub extends: Option<Vec<String>>,
 }
 
@@ -249,8 +250,17 @@ fn parse_capabilities_object(caps: &Value) -> Result<Vec<Capability>, ComposeErr
             .ok_or_else(|| ComposeError::InvalidCapability {
                 name: name.clone(),
                 message: "missing version field".to_string(),
-            })?
-            .to_string();
+            })?;
+        if !is_valid_version(version) {
+            return Err(ComposeError::InvalidCapability {
+                name: name.clone(),
+                message: format!(
+                    "invalid version \"{}\" (expected a valid YYYY-MM-DD date)",
+                    version
+                ),
+            });
+        }
+        let version = version.to_string();
 
         let schema_url = entry
             .get("schema")
@@ -397,12 +407,16 @@ pub fn check_version_constraints(
     violations
 }
 
-/// Compose schema from capability declarations.
+/// Compose a schema from an already-negotiated active capability set.
 ///
-/// 1. Finds root capability (no extends)
-/// 2. Validates graph connectivity
-/// 3. Fetches schemas and extracts $defs[root] entries
+/// 1. Finds the single root capability (no extends)
+/// 2. Validates that every extension has at least one active path to the root
+/// 3. Fetches schemas and extracts each extension's $defs[root] entry, falling
+///    back to $defs[parent] when exactly one active declared parent has one
 /// 4. Composes using allOf
+///
+/// An extension's `extends` entries are alternative paths. Parents absent from
+/// the active set are ignored as long as another active path reaches the root.
 pub fn compose_schema(
     capabilities: &[Capability],
     schema_base: &SchemaBaseConfig,
@@ -447,21 +461,9 @@ pub fn compose_schema(
         }
     };
 
-    // Validate graph: all extends references must exist in capabilities
-    for cap in capabilities {
-        if let Some(parents) = &cap.extends {
-            for parent in parents {
-                if !cap_map.contains_key(parent.as_str()) {
-                    return Err(ComposeError::UnknownParent {
-                        extension: cap.name.clone(),
-                        parent: parent.clone(),
-                    });
-                }
-            }
-        }
-    }
-
-    // Validate graph connectivity: all extensions must reach root
+    // Validate active-graph connectivity: every extension needs at least one
+    // declared parent path that transitively reaches the root. Absent alternative
+    // parents are ignored by reaches_root.
     for cap in capabilities {
         if cap.extends.is_some() && !reaches_root(cap, &cap_map, &root.name) {
             return Err(ComposeError::OrphanExtension {
@@ -501,7 +503,8 @@ pub fn compose_schema(
     })?;
     let container = is_container_schema(&root_schema);
 
-    // Compose: for each extension, extract its self-contained `$defs[root.name]`.
+    // Compose: for each extension, extract its self-contained `$defs[root.name]`
+    // (or `$defs[parent]` when exactly one active declared parent has an entry).
     let mut ext_defs = Vec::new();
 
     for ext in &extensions {
@@ -525,7 +528,7 @@ pub fn compose_schema(
             });
         }
 
-        // Extract $defs[root.name] and inline any internal refs
+        // Extract the extension's contribution and inline any internal refs
         let defs = ext_schema
             .get("$defs")
             .ok_or_else(|| ComposeError::MissingDefEntry {
@@ -533,16 +536,12 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
-        let ext_def = defs
-            .get(&root.name)
-            .ok_or_else(|| ComposeError::MissingDefEntry {
-                extension: ext.name.clone(),
-                expected_key: root.name.clone(),
-            })?;
+        let ext_def = select_extension_def(ext, defs, &root.name, &cap_map)?;
 
-        // Inline internal #/$defs/... refs so the extracted def is self-contained
+        // Anchor any root-local refs the bundler retained (recursion), so the
+        // extracted def stays correct outside its source document.
         let mut inlined = ext_def.clone();
-        inline_internal_refs(&mut inlined, defs);
+        anchor_extracted_def(&mut inlined, &ext_schema, &ext.name)?;
 
         ext_defs.push(inlined);
     }
@@ -655,68 +654,82 @@ fn compose_container(
     Ok(result)
 }
 
-/// Inline internal `#/$defs/...` refs from the parent schema.
+/// Select the `$defs` entry an extension contributes to the root.
 ///
-/// When extracting a single definition from a schema, that definition may have
-/// internal refs to other definitions in the same schema. This function
-/// recursively inlines those refs so the extracted definition is self-contained.
-///
-/// # Arguments
-/// * `value` - The value to process (modified in place)
-/// * `defs` - The `$defs` object to resolve refs against
-fn inline_internal_refs(value: &mut Value, defs: &Value) {
-    inline_internal_refs_inner(value, defs, &mut HashSet::new());
-}
+/// The root key always wins. Without it, an extension of an extension may key
+/// its contribution on a declared parent, but only when exactly one active
+/// declared parent has an entry; inactive parents are ignored. Entries for two
+/// or more active parents are ambiguous and rejected regardless of declaration
+/// order, so the author must supply a root-keyed entry to choose.
+fn select_extension_def<'a>(
+    ext: &Capability,
+    defs: &'a Value,
+    root_name: &str,
+    cap_map: &HashMap<&str, &Capability>,
+) -> Result<&'a Value, ComposeError> {
+    if let Some(def) = defs.get(root_name) {
+        return Ok(def);
+    }
 
-fn inline_internal_refs_inner(value: &mut Value, defs: &Value, visited: &mut HashSet<String>) {
-    match value {
-        Value::Object(obj) => {
-            // Check if this object has an internal $ref
-            if let Some(ref_val) = obj.get("$ref").and_then(|v| v.as_str()) {
-                // Only handle internal refs to $defs (not self-root "#" refs)
-                if let Some(def_name) = ref_val.strip_prefix("#/$defs/") {
-                    // Guard against circular refs
-                    if visited.contains(def_name) {
-                        return;
-                    }
+    let parents: BTreeSet<&str> = ext
+        .extends
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|parent| cap_map.contains_key(parent) && defs.get(*parent).is_some())
+        .collect();
 
-                    // Look up the definition
-                    if let Some(def) = defs.get(def_name) {
-                        visited.insert(def_name.to_string());
-
-                        // Clone and recursively inline
-                        let mut inlined = def.clone();
-                        inline_internal_refs_inner(&mut inlined, defs, visited);
-
-                        visited.remove(def_name);
-
-                        // Replace the $ref object with the inlined definition
-                        obj.remove("$ref");
-                        if let Value::Object(def_obj) = inlined {
-                            for (k, v) in def_obj {
-                                obj.entry(k).or_insert(v);
-                            }
-                        }
-                        return;
-                    }
-                }
-            }
-
-            // Recurse into all values
-            for v in obj.values_mut() {
-                inline_internal_refs_inner(v, defs, visited);
-            }
-        }
-        Value::Array(arr) => {
-            for item in arr {
-                inline_internal_refs_inner(item, defs, visited);
-            }
-        }
-        _ => {}
+    match parents.len() {
+        0 => Err(ComposeError::MissingDefEntry {
+            extension: ext.name.clone(),
+            expected_key: root_name.to_string(),
+        }),
+        1 => Ok(&defs[parents.into_iter().next().unwrap()]),
+        _ => Err(ComposeError::AmbiguousParentDefs {
+            extension: ext.name.clone(),
+            root: root_name.to_string(),
+            parents: parents.into_iter().collect::<Vec<_>>().join(", "),
+        }),
     }
 }
 
-/// Check if a capability transitively reaches the root via extends chain.
+/// Make an extracted `$defs` contribution self-contained.
+///
+/// Extension schemas arrive here already bundled, so every acyclic ref is
+/// materialized; what can remain are the retained root-local refs the
+/// bundler keeps for recursion (`#`, `#/$defs/<x>`). The extracted subtree
+/// loses its source document entirely, so *every* root-local ref qualifies
+/// for anchoring — unlike `--def` selection, which carries the source defs
+/// along. Embedded under the extension's capability name.
+fn anchor_extracted_def(
+    subtree: &mut Value,
+    source_doc: &Value,
+    extension_name: &str,
+) -> Result<(), ComposeError> {
+    crate::loader::anchor_to_source(
+        subtree,
+        source_doc,
+        &format!("urn:ucp-schema:extracted:{extension_name}"),
+        extension_name,
+        |r| r.starts_with('#'),
+    )
+    .map(|_| ())
+    .map_err(|message| ComposeError::MissingDefEntry {
+        extension: extension_name.to_string(),
+        expected_key: message,
+    })
+}
+
+/// Check whether any alternative parent path reaches the root through the active set.
+///
+/// Parent names absent from `cap_map` are ignored, and cycles terminate via `visited`.
+///
+/// Ignoring absent parents means a misspelled parent name is indistinguishable
+/// from one that is simply not active in this composition. That is inherent,
+/// not a gap to close: UCP capability names are openly extensible, so there is
+/// no closed set to check a name against. A typo alongside a reachable parent
+/// is ignored; a typo that is the only declared parent still fails, as
+/// `OrphanExtension`.
 fn reaches_root(cap: &Capability, cap_map: &HashMap<&str, &Capability>, root_name: &str) -> bool {
     let mut visited = HashSet::new();
     let mut queue = vec![cap];
@@ -1004,6 +1017,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_capabilities_rejects_invalid_version() {
+        let caps = json!({
+            "dev.ucp.shopping.checkout": [{
+                "version": "not-a-date",
+                "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+            }]
+        });
+
+        let err = parse_capabilities_object(&caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::InvalidCapability { name, message }
+                if name == "dev.ucp.shopping.checkout"
+                    && message.contains("valid YYYY-MM-DD date")
+        ));
+    }
+
+    #[test]
     fn parse_capabilities_with_extension() {
         let caps = json!({
             "dev.ucp.shopping.checkout": [{
@@ -1283,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn compose_unknown_parent_error() {
+    fn compose_orphan_extension_error() {
         let checkout = Capability {
             name: "dev.ucp.shopping.checkout".to_string(),
             version: "2026-01-11".to_string(),
@@ -1299,7 +1330,12 @@ mod tests {
 
         let config = SchemaBaseConfig::default();
         let result = compose_schema(&[checkout, discount], &config);
-        assert!(matches!(result, Err(ComposeError::UnknownParent { .. })));
+        assert!(matches!(
+            result,
+            Err(ComposeError::OrphanExtension { extension, root })
+                if extension == "dev.ucp.shopping.discount"
+                    && root == "dev.ucp.shopping.checkout"
+        ));
     }
 
     #[test]
@@ -1414,6 +1450,42 @@ mod tests {
         .collect();
 
         // discount extends nonexistent, which doesn't connect to checkout
+        assert!(!reaches_root(
+            &discount,
+            &cap_map,
+            "dev.ucp.shopping.checkout"
+        ));
+    }
+
+    #[test]
+    fn reaches_root_terminates_on_cycle() {
+        let checkout = Capability {
+            name: "dev.ucp.shopping.checkout".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "checkout.json".to_string(),
+            extends: None,
+        };
+        let discount = Capability {
+            name: "dev.ucp.shopping.discount".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "discount.json".to_string(),
+            extends: Some(vec!["com.example.loyalty".to_string()]),
+        };
+        let loyalty = Capability {
+            name: "com.example.loyalty".to_string(),
+            version: "2026-01-11".to_string(),
+            schema_url: "loyalty.json".to_string(),
+            extends: Some(vec!["dev.ucp.shopping.discount".to_string()]),
+        };
+
+        let cap_map: HashMap<&str, &Capability> = vec![
+            ("dev.ucp.shopping.checkout", &checkout),
+            ("dev.ucp.shopping.discount", &discount),
+            ("com.example.loyalty", &loyalty),
+        ]
+        .into_iter()
+        .collect();
+
         assert!(!reaches_root(
             &discount,
             &cap_map,

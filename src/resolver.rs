@@ -44,12 +44,21 @@ fn close_additional_properties(value: &mut Value) {
 ///
 /// `in_composition_branch` is true when processing direct children of allOf/anyOf/oneOf.
 /// We skip setting additionalProperties on these because each branch is validated
-/// independently and doesn't see properties from sibling branches.
+/// independently and doesn't see properties from sibling branches. An explicit
+/// `additionalProperties: true` on a composition parent or branch is removed,
+/// however, so it cannot mark every unknown property as evaluated and bypass
+/// `unevaluatedProperties: false`.
 fn close_additional_properties_inner(value: &mut Value, in_composition_branch: bool) {
     if let Value::Object(map) = value {
         // Check if this schema uses composition keywords
         let has_composition =
             map.contains_key("allOf") || map.contains_key("anyOf") || map.contains_key("oneOf");
+
+        if (in_composition_branch || has_composition)
+            && matches!(map.get("additionalProperties"), Some(Value::Bool(true)))
+        {
+            map.remove("additionalProperties");
+        }
 
         // Check if this is an object schema (has "type": "object" or has "properties")
         let is_object_schema = map
@@ -272,7 +281,20 @@ fn resolve_object(
 ) -> Result<Value, ResolveError> {
     let mut result = Map::new();
 
-    // Track required array modifications
+    // Track required array modifications.
+    //
+    // `required` is only rewritten when it is well formed, that is an array of
+    // strings. A `required` that is any other shape is not a JSON Schema
+    // keyword we can reason about, so it is passed through untouched below
+    // rather than being replaced with an empty array. Replacing it silently
+    // discarded the constraint and left a schema that a validator would have
+    // rejected looking valid, and it also rewrote the unrelated boolean
+    // `required` that OpenAPI and OpenRPC service definitions carry.
+    let well_formed_required = map.get("required").is_none_or(|v| {
+        v.as_array()
+            .is_some_and(|arr| arr.iter().all(|e| e.is_string()))
+    });
+
     let original_required: Vec<String> = map
         .get("required")
         .and_then(|v| v.as_array())
@@ -334,6 +356,11 @@ fn resolve_object(
                 // Will be handled at the end after processing properties
                 continue;
             }
+            "default" | "const" | "examples" | "enum" => {
+                // These keywords hold JSON instance data, not child schemas.
+                // Preserve business fields that happen to share UCP annotation names.
+                result.insert(key.clone(), value.clone());
+            }
             _ => {
                 // Other keys - recurse if object/array, otherwise copy
                 let resolved = resolve_value(value, options, &child_path)?;
@@ -343,7 +370,11 @@ fn resolve_object(
     }
 
     // Add updated required array if non-empty or if original existed
-    if !new_required.is_empty() || map.contains_key("required") {
+    if !well_formed_required {
+        if let Some(value) = map.get("required") {
+            result.insert("required".to_string(), value.clone());
+        }
+    } else if !new_required.is_empty() || map.contains_key("required") {
         result.insert(
             "required".to_string(),
             Value::Array(new_required.into_iter().map(Value::String).collect()),
@@ -613,13 +644,48 @@ fn inject_annotations(
     Ok(branch)
 }
 
-/// Validate that allOf branches don't declare contradictory types on the same property.
+/// Return the JSON instance types accepted by a `type` keyword.
 ///
-/// Only checks string-form `"type"` values. Array-form types (e.g. `["string", "null"]`)
-/// are intentionally skipped — they're rare and the semantic comparison is non-trivial.
+/// `number` includes integer instances. Invalid type expressions are left for
+/// JSON Schema validation rather than treated as conflicts here.
+fn accepted_json_types(value: &Value) -> Option<std::collections::HashSet<&'static str>> {
+    fn insert_type(value: &str, types: &mut std::collections::HashSet<&'static str>) -> Option<()> {
+        let value = match value {
+            "null" => "null",
+            "boolean" => "boolean",
+            "object" => "object",
+            "array" => "array",
+            "number" => "number",
+            "integer" => "integer",
+            "string" => "string",
+            _ => return None,
+        };
+        types.insert(value);
+        if value == "number" {
+            types.insert("integer");
+        }
+        Some(())
+    }
+
+    let mut types = std::collections::HashSet::new();
+    match value {
+        Value::String(value) => insert_type(value, &mut types)?,
+        Value::Array(values) if !values.is_empty() => {
+            for value in values {
+                insert_type(value.as_str()?, &mut types)?;
+            }
+        }
+        _ => return None,
+    }
+    Some(types)
+}
+
+/// Validate that allOf branches don't declare disjoint types on the same property.
 fn validate_allof_types(branches: &[Value], path: &str) -> Result<(), ResolveError> {
-    let mut prop_types: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
+    let mut prop_types: std::collections::HashMap<
+        String,
+        (std::collections::HashSet<&'static str>, String),
+    > = std::collections::HashMap::new();
     for branch in branches {
         let props = branch
             .as_object()
@@ -628,18 +694,24 @@ fn validate_allof_types(branches: &[Value], path: &str) -> Result<(), ResolveErr
         if let Some(props) = props {
             for (name, prop) in props {
                 if let Some(type_val) = prop.as_object().and_then(|p| p.get("type")) {
-                    if let Some(type_str) = type_val.as_str() {
-                        if let Some(existing) = prop_types.get(name) {
-                            if existing != type_str {
-                                return Err(ResolveError::TypeConflict {
-                                    path: format!("{}/properties/{}", path, name),
-                                    base_type: existing.clone(),
-                                    ext_type: type_str.to_string(),
-                                });
-                            }
-                        } else {
-                            prop_types.insert(name.clone(), type_str.to_string());
+                    let Some(types) = accepted_json_types(type_val) else {
+                        continue;
+                    };
+                    let display = type_val
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| type_val.to_string());
+                    if let Some((accepted, base_type)) = prop_types.get_mut(name) {
+                        accepted.retain(|value| types.contains(value));
+                        if accepted.is_empty() {
+                            return Err(ResolveError::TypeConflict {
+                                path: format!("{}/properties/{}", path, name),
+                                base_type: base_type.clone(),
+                                ext_type: display,
+                            });
                         }
+                    } else {
+                        prop_types.insert(name.clone(), (types, display));
                     }
                 }
             }
@@ -653,9 +725,15 @@ fn strip_annotations_recursive(value: &Value) -> Value {
         Value::Object(map) => {
             let mut result = Map::new();
             for (k, v) in map {
-                if !UCP_ANNOTATIONS.contains(&k.as_str()) {
-                    result.insert(k.clone(), strip_annotations_recursive(v));
+                if UCP_ANNOTATIONS.contains(&k.as_str()) {
+                    continue;
                 }
+                let value = if matches!(k.as_str(), "default" | "const" | "examples" | "enum") {
+                    v.clone()
+                } else {
+                    strip_annotations_recursive(v)
+                };
+                result.insert(k.clone(), value);
             }
             Value::Object(result)
         }
@@ -883,6 +961,53 @@ mod tests {
         let required = result["required"].as_array().unwrap();
         assert!(!required.contains(&json!("id")));
         assert!(required.contains(&json!("name")));
+    }
+
+    #[test]
+    fn resolve_preserves_a_non_array_required() {
+        // A `required` that is not an array of strings is not a JSON Schema
+        // keyword this resolver can rewrite. It must survive untouched so the
+        // validator sees the authored value and rejects the schema, rather
+        // than being replaced with an empty array that silently drops the
+        // constraint and reports the schema as usable.
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": "name"
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!("name"));
+    }
+
+    #[test]
+    fn resolve_preserves_a_boolean_required() {
+        // OpenAPI and OpenRPC parameter objects carry a boolean `required`.
+        // Those documents are resolved too, and the flag must not be rewritten
+        // into an empty array.
+        let schema = json!({
+            "name": "checkout",
+            "required": true,
+            "schema": { "type": "object" }
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!(true));
+    }
+
+    #[test]
+    fn resolve_preserves_required_with_a_non_string_element() {
+        let schema = json!({
+            "type": "object",
+            "properties": { "name": { "type": "string" } },
+            "required": ["name", 1]
+        });
+        let options = ResolveOptions::new(Direction::Request, "create");
+        let result = resolve(&schema, &options).unwrap();
+
+        assert_eq!(result["required"], json!(["name", 1]));
     }
 
     #[test]

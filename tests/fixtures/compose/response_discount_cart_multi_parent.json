@@ -1,0 +1,19 @@
+{
+  "ucp": {
+    "capabilities": {
+      "dev.ucp.shopping.cart": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/cart.json"
+        }
+      ],
+      "dev.ucp.shopping.discount": [
+        {
+          "version": "2026-01-11",
+          "schema": "https://ucp.dev/schemas/shopping/discount.json",
+          "extends": ["dev.ucp.shopping.cart", "dev.ucp.shopping.checkout"]
+        }
+      ]
+    }
+  }
+}
