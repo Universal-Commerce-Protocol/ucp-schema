@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::loader::{load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
+use crate::loader::{collect_json_files, load_schema, navigate_fragment, INSTANCE_DATA_KEYWORDS};
 use crate::types::{
     is_valid_schema_transition, is_valid_version, json_type_name, VersionConstraint, Visibility,
     UCP_ANNOTATIONS, VALID_OPERATIONS,
@@ -78,7 +78,7 @@ impl LintResult {
 /// If `strict` is true, warnings are treated as errors.
 /// Returns aggregated results for all files.
 pub fn lint(path: &Path, strict: bool) -> LintResult {
-    let files = collect_schema_files(path);
+    let files = collect_json_files(path);
     let mut results = Vec::new();
     let mut total_errors = 0;
     let mut total_warnings = 0;
@@ -279,8 +279,33 @@ fn check_examples(
                 }
             }
             for (key, child) in map {
+                // These keywords hold JSON instance data, not child schemas.
+                if matches!(
+                    key.as_str(),
+                    "default" | "const" | "examples" | "example" | "enum"
+                ) {
+                    continue;
+                }
                 let child_path = pointer_path(path, key);
-                check_examples(child, root, file, &child_path, diagnostics);
+                if matches!(
+                    key.as_str(),
+                    "properties"
+                        | "patternProperties"
+                        | "$defs"
+                        | "definitions"
+                        | "dependentSchemas"
+                ) {
+                    // Values in schema maps are always schemas, even when their
+                    // property names collide with instance-data keywords above.
+                    if let Value::Object(schemas) = child {
+                        for (name, schema) in schemas {
+                            let schema_path = pointer_path(&child_path, name);
+                            check_examples(schema, root, file, &schema_path, diagnostics);
+                        }
+                    }
+                } else {
+                    check_examples(child, root, file, &child_path, diagnostics);
+                }
             }
         }
         Value::Array(items) => {
@@ -845,36 +870,6 @@ fn check_requires(schema: &Value, file: &Path, diagnostics: &mut Vec<Diagnostic>
     }
 }
 
-/// Collect all .json files in a path (file or directory).
-fn collect_schema_files(path: &Path) -> Vec<PathBuf> {
-    if path.is_file() {
-        if path.extension().map(|e| e == "json").unwrap_or(false) {
-            return vec![path.to_path_buf()];
-        }
-        return vec![];
-    }
-
-    let mut files = Vec::new();
-    collect_files_recursive(path, &mut files);
-    files.sort();
-    files
-}
-
-fn collect_files_recursive(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_files_recursive(&path, files);
-        } else if path.extension().map(|e| e == "json").unwrap_or(false) {
-            files.push(path);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1158,6 +1153,74 @@ mod tests {
             .find(|d| d.code == "E002")
             .unwrap_or_else(|| panic!("missing E002: {:?}", result.diagnostics));
         assert_eq!(diagnostic.path, "/properties/ref~1a~0b");
+    }
+
+    #[test]
+    fn lint_does_not_check_examples_inside_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "default": {{ "type": "string", "examples": [123] }},
+            "const": {{ "type": "string", "examples": [123] }},
+            "examples": [{{ "type": "string", "examples": [123] }}],
+            "example": {{ "type": "string", "examples": [123] }},
+            "enum": [{{ "type": "string", "examples": [123] }}]
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        assert_eq!(result.status, FileStatus::Ok);
+        assert!(
+            !result.diagnostics.iter().any(|d| d.code == "E008"),
+            "instance data should not produce E008: {:?}",
+            result.diagnostics
+        );
+    }
+
+    #[test]
+    fn lint_property_names_that_collide_with_instance_keywords() {
+        let mut file = NamedTempFile::new().unwrap();
+        writeln!(
+            file,
+            r#"{{
+            "$id": "https://example.com/test.json",
+            "type": "object",
+            "properties": {{
+                "default": {{ "type": "string", "examples": [123] }},
+                "const": {{ "type": "string", "examples": [123] }},
+                "examples": {{ "type": "string", "examples": [123] }},
+                "example": {{ "type": "string", "examples": [123] }},
+                "enum": {{ "type": "string", "examples": [123] }}
+            }},
+            "dependentSchemas": {{
+                "default": {{ "type": "string", "examples": [123] }}
+            }}
+        }}"#
+        )
+        .unwrap();
+
+        let result = lint_file(file.path(), file.path().parent().unwrap());
+        let paths: Vec<_> = result
+            .diagnostics
+            .iter()
+            .filter(|d| d.code == "E008")
+            .map(|d| d.path.as_str())
+            .collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/properties/default/examples/0",
+                "/properties/const/examples/0",
+                "/properties/examples/examples/0",
+                "/properties/example/examples/0",
+                "/properties/enum/examples/0",
+                "/dependentSchemas/default/examples/0",
+            ]
+        );
     }
 
     #[test]

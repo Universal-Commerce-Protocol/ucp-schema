@@ -125,9 +125,18 @@ pub fn is_valid_version(s: &str) -> bool {
     }) {
         return false;
     }
+    let year: u16 = s[..4].parse().unwrap_or(0);
     let month: u8 = s[5..7].parse().unwrap_or(0);
     let day: u8 = s[8..10].parse().unwrap_or(0);
-    (1..=12).contains(&month) && (1..=31).contains(&day)
+    let leap_year = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day)
 }
 
 /// Version range: minimum (required) and optional maximum, both inclusive.
@@ -143,6 +152,15 @@ pub struct VersionConstraint {
 impl VersionConstraint {
     /// Check if a version satisfies this constraint.
     pub fn satisfied_by(&self, version: &str) -> bool {
+        if !is_valid_version(version)
+            || !is_valid_version(&self.min)
+            || self
+                .max
+                .as_deref()
+                .is_some_and(|max| !is_valid_version(max))
+        {
+            return false;
+        }
         if version < self.min.as_str() {
             return false;
         }
@@ -368,6 +386,12 @@ mod tests {
         assert!(!is_valid_version("2026-00-15"));
         assert!(!is_valid_version("2026-06-00"));
         assert!(!is_valid_version("9999-99-99"));
+        assert!(!is_valid_version("2026-02-29"));
+        assert!(!is_valid_version("2026-02-31"));
+        assert!(!is_valid_version("2026-04-31"));
+        assert!(is_valid_version("2024-02-29"));
+        assert!(is_valid_version("2000-02-29"));
+        assert!(!is_valid_version("1900-02-29"));
     }
 
     #[test]
@@ -380,6 +404,8 @@ mod tests {
         assert!(min_only.satisfied_by("2026-01-23")); // inclusive
         assert!(min_only.satisfied_by("2026-06-01"));
         assert!(min_only.satisfied_by("2099-12-31"));
+        assert!(!min_only.satisfied_by("not-a-date"));
+        assert!(!min_only.satisfied_by("2026-02-31"));
 
         let range = VersionConstraint {
             min: "2026-01-23".into(),

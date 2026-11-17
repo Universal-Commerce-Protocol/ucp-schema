@@ -54,15 +54,21 @@
 //! { "ucp_request": { "create": "omit", "update": "required" } }
 //! ```
 
+pub mod codegen;
 mod compose;
 mod error;
 mod linter;
 mod loader;
 mod namespace;
+pub mod openapi;
 mod resolver;
 mod types;
 mod validator;
 
+pub use codegen::{
+    compile_types, generate_types, parse_profile_source, CodegenError, CompiledTypes,
+    GenerateTypesOptions, ParsedProfile, RestServiceBinding, TypesBundleDoc,
+};
 pub use compose::{
     capability_short_name, check_version_constraints, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
@@ -76,6 +82,7 @@ pub use loader::{
     load_schema_str, navigate_fragment,
 };
 pub use namespace::{reverse_labels, validate_binding, BindingError};
+pub use openapi::{generate_openapi, rewrite_defs_to_component_schemas, GenerateOpenApiOptions};
 pub use resolver::{resolve, strip_annotations};
 pub use types::{Direction, Requires, ResolveOptions, VersionConstraint, Visibility};
 pub use validator::{select_operation_schema, validate, validate_against_schema};

@@ -38,14 +38,14 @@
 //! the payload being the raw checkout object. Use `--profile` CLI flag to
 //! simulate this pattern.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use serde_json::{json, Value};
 
 use crate::error::ComposeError;
 use crate::loader::{bundle_refs, bundle_refs_with_url_mapping, is_url, load_schema};
-use crate::types::{Direction, Requires, VersionConstraint};
+use crate::types::{is_valid_version, Direction, Requires, VersionConstraint};
 
 #[cfg(feature = "remote")]
 use crate::loader::{bundle_refs_remote, load_schema_url};
@@ -250,8 +250,17 @@ fn parse_capabilities_object(caps: &Value) -> Result<Vec<Capability>, ComposeErr
             .ok_or_else(|| ComposeError::InvalidCapability {
                 name: name.clone(),
                 message: "missing version field".to_string(),
-            })?
-            .to_string();
+            })?;
+        if !is_valid_version(version) {
+            return Err(ComposeError::InvalidCapability {
+                name: name.clone(),
+                message: format!(
+                    "invalid version \"{}\" (expected a valid YYYY-MM-DD date)",
+                    version
+                ),
+            });
+        }
+        let version = version.to_string();
 
         let schema_url = entry
             .get("schema")
@@ -402,7 +411,8 @@ pub fn check_version_constraints(
 ///
 /// 1. Finds the single root capability (no extends)
 /// 2. Validates that every extension has at least one active path to the root
-/// 3. Fetches schemas and extracts $defs[root] entries
+/// 3. Fetches schemas and extracts each extension's $defs[root] entry, falling
+///    back to $defs[parent] when exactly one active declared parent has one
 /// 4. Composes using allOf
 ///
 /// An extension's `extends` entries are alternative paths. Parents absent from
@@ -493,7 +503,8 @@ pub fn compose_schema(
     })?;
     let container = is_container_schema(&root_schema);
 
-    // Compose: for each extension, extract its self-contained `$defs[root.name]`.
+    // Compose: for each extension, extract its self-contained `$defs[root.name]`
+    // (or `$defs[parent]` when exactly one active declared parent has an entry).
     let mut ext_defs = Vec::new();
 
     for ext in &extensions {
@@ -517,7 +528,7 @@ pub fn compose_schema(
             });
         }
 
-        // Extract $defs[root.name] and inline any internal refs
+        // Extract the extension's contribution and inline any internal refs
         let defs = ext_schema
             .get("$defs")
             .ok_or_else(|| ComposeError::MissingDefEntry {
@@ -525,12 +536,7 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
-        let ext_def = defs
-            .get(&root.name)
-            .ok_or_else(|| ComposeError::MissingDefEntry {
-                extension: ext.name.clone(),
-                expected_key: root.name.clone(),
-            })?;
+        let ext_def = select_extension_def(ext, defs, &root.name, &cap_map)?;
 
         // Anchor any root-local refs the bundler retained (recursion), so the
         // extracted def stays correct outside its source document.
@@ -646,6 +652,45 @@ fn compose_container(
         .expect("container root is an object")
         .insert("$defs".to_string(), Value::Object(merged_defs));
     Ok(result)
+}
+
+/// Select the `$defs` entry an extension contributes to the root.
+///
+/// The root key always wins. Without it, an extension of an extension may key
+/// its contribution on a declared parent, but only when exactly one active
+/// declared parent has an entry; inactive parents are ignored. Entries for two
+/// or more active parents are ambiguous and rejected regardless of declaration
+/// order, so the author must supply a root-keyed entry to choose.
+fn select_extension_def<'a>(
+    ext: &Capability,
+    defs: &'a Value,
+    root_name: &str,
+    cap_map: &HashMap<&str, &Capability>,
+) -> Result<&'a Value, ComposeError> {
+    if let Some(def) = defs.get(root_name) {
+        return Ok(def);
+    }
+
+    let parents: BTreeSet<&str> = ext
+        .extends
+        .iter()
+        .flatten()
+        .map(String::as_str)
+        .filter(|parent| cap_map.contains_key(parent) && defs.get(*parent).is_some())
+        .collect();
+
+    match parents.len() {
+        0 => Err(ComposeError::MissingDefEntry {
+            extension: ext.name.clone(),
+            expected_key: root_name.to_string(),
+        }),
+        1 => Ok(&defs[parents.into_iter().next().unwrap()]),
+        _ => Err(ComposeError::AmbiguousParentDefs {
+            extension: ext.name.clone(),
+            root: root_name.to_string(),
+            parents: parents.into_iter().collect::<Vec<_>>().join(", "),
+        }),
+    }
 }
 
 /// Make an extracted `$defs` contribution self-contained.
@@ -969,6 +1014,24 @@ mod tests {
         assert_eq!(result[0].name, "dev.ucp.shopping.checkout");
         assert_eq!(result[0].version, "2026-01-11");
         assert!(result[0].extends.is_none());
+    }
+
+    #[test]
+    fn parse_capabilities_rejects_invalid_version() {
+        let caps = json!({
+            "dev.ucp.shopping.checkout": [{
+                "version": "not-a-date",
+                "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+            }]
+        });
+
+        let err = parse_capabilities_object(&caps).unwrap_err();
+        assert!(matches!(
+            err,
+            ComposeError::InvalidCapability { name, message }
+                if name == "dev.ucp.shopping.checkout"
+                    && message.contains("valid YYYY-MM-DD date")
+        ));
     }
 
     #[test]

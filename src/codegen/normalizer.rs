@@ -1,0 +1,2882 @@
+//! Naming, UCP keyword stripping, `#/$defs/` reference rewriting, base normalization,
+//! directional slicing, and `$ref` alignment for code generation.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde_json::{Map, Value};
+
+use crate::compose::capability_short_name;
+use crate::error::ResolveError;
+use crate::loader::{for_each_schema_object, for_each_schema_object_mut, INSTANCE_DATA_KEYWORDS};
+use crate::resolver::resolve;
+use crate::types::{is_valid_version, Direction, ResolveOptions, UCP_ANNOTATIONS};
+
+/// Convert a snake_case, kebab-case, dotted, or reverse-domain identifier into PascalCase.
+pub fn to_pascal_case(s: &str) -> String {
+    if !s.contains(['_', '-', ' ', '/', '.']) && s.starts_with(|c: char| c.is_ascii_uppercase()) {
+        return s.to_string();
+    }
+
+    let base = if is_reverse_domain_name(s) {
+        capability_short_name(s)
+    } else {
+        s.to_string()
+    };
+
+    base.split(['_', '-', ' ', '/', '.'])
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            let mixed = part.chars().any(|c| c.is_ascii_uppercase())
+                && part.chars().any(|c| c.is_ascii_lowercase());
+            let mut chars = part.chars();
+            let Some(first) = chars.next() else {
+                return String::new();
+            };
+            let rest = if mixed {
+                chars.as_str().to_string()
+            } else {
+                chars.as_str().to_ascii_lowercase()
+            };
+            format!("{}{rest}", first.to_ascii_uppercase())
+        })
+        .collect()
+}
+
+/// Returns `true` when `s` contains at least 3 dot-separated segments where every segment
+/// is non-empty ASCII alphanumeric, `_`, or `-` (excluding `.json` filenames).
+pub fn is_reverse_domain_name(s: &str) -> bool {
+    if s.ends_with(".json") {
+        return false;
+    }
+    let parts: Vec<&str> = s.split('.').collect();
+    parts.len() >= 3
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        })
+}
+
+/// Returns `true` when a `$defs` key name is generic and must be qualified with its parent
+/// schema name when hoisted into the shared `#/$defs/` namespace.
+pub fn is_generic_def_name(name: &str) -> bool {
+    const GENERIC: &str = "base|Base|entity|Entity|platform_schema|PlatformSchema|business_schema|BusinessSchema|response_schema|ResponseSchema|request|Request|response|Response|error|Error|config|Config|endpoint|Endpoint|quantity|Quantity";
+    !name.is_empty() && GENERIC.split('|').any(|g| g == name)
+}
+
+/// Qualify a hoisted `$defs` entry name with `parent_pascal` when `def_key` is generic
+/// or represents a container operation definition.
+pub fn qualify_def_name(parent_pascal: &str, def_key: &str) -> String {
+    let def_pascal = to_pascal_case(def_key);
+    if is_generic_def_name(def_key) || is_generic_def_name(&def_pascal) {
+        if parent_pascal.is_empty() || def_pascal.starts_with(parent_pascal) {
+            def_pascal
+        } else {
+            format!("{parent_pascal}{def_pascal}")
+        }
+    } else if def_key.ends_with("_request") || def_key.ends_with("_response") {
+        qualify_container_op_name(parent_pascal, def_key)
+    } else {
+        def_pascal
+    }
+}
+
+/// Qualify a container schema operation definition key (`{op}_{direction}`) with the
+/// container schema's domain prefix (e.g. `("CatalogSearch", "search_request")` -> `"CatalogSearchRequest"`).
+pub fn qualify_container_op_name(stem_pascal: &str, op_key: &str) -> String {
+    let op_pascal = to_pascal_case(op_key);
+    if stem_pascal.is_empty() || op_pascal.starts_with(stem_pascal) {
+        return op_pascal;
+    }
+    let prefix = match stem_pascal.rfind(|c: char| c.is_ascii_uppercase()) {
+        Some(idx) if idx > 0 => &stem_pascal[..idx],
+        _ => stem_pascal,
+    };
+    if op_pascal.starts_with(prefix) {
+        op_pascal
+    } else {
+        format!("{prefix}{op_pascal}")
+    }
+}
+
+/// Resolve a `$ref` string (`#`, `#/$defs/<key>`, `<file>#/$defs/<key>`, or `<file>.json`)
+/// to its canonical PascalCase `$defs` key name.
+pub fn ref_to_def_name(ref_str: &str, parent_name: Option<&str>) -> String {
+    if ref_str == "#" || ref_str == "#/" {
+        return parent_name.map_or_else(|| "Self".to_string(), to_pascal_case);
+    }
+    if let Some(def_key) = ref_str
+        .strip_prefix("#/$defs/")
+        .or_else(|| ref_str.strip_prefix("#/definitions/"))
+    {
+        if def_key.starts_with(|c: char| c.is_ascii_uppercase()) {
+            return def_key.to_string();
+        }
+        let parent_pascal = parent_name.map(to_pascal_case).unwrap_or_default();
+        return qualify_def_name(&parent_pascal, def_key);
+    }
+    if let Some((file_part, def_key)) = ref_str
+        .split_once("#/$defs/")
+        .or_else(|| ref_str.split_once("#/definitions/"))
+    {
+        return qualify_def_name(&file_stem_to_pascal(file_part), def_key);
+    }
+    file_stem_to_pascal(ref_str.split('#').next().unwrap_or(ref_str))
+}
+
+/// Strip UCP-specific authoring keywords and root metadata from a schema AST while
+/// preserving instance-data payloads (`const`, `enum`, `default`, `examples`).
+pub fn strip_ucp_keywords(value: &mut Value) {
+    if let Some(root) = value.as_object_mut() {
+        if root
+            .get("version")
+            .and_then(Value::as_str)
+            .is_some_and(is_valid_version)
+        {
+            root.remove("version");
+        }
+        root.remove("requires");
+        root.remove("embedded");
+    }
+
+    for_each_schema_object_mut(value, &mut |obj| {
+        for key in UCP_ANNOTATIONS {
+            obj.remove(*key);
+        }
+        if obj
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(is_reverse_domain_name)
+        {
+            obj.remove("name");
+        }
+        for key in ["$schema", "$id"] {
+            if obj.get(key).is_some_and(Value::is_string) {
+                obj.remove(key);
+            }
+        }
+        obj.remove("x-ucp-schema-transition");
+        if obj.contains_key("$ref") {
+            obj.remove("type");
+        }
+        if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
+            for branch in all_of.iter_mut().filter_map(Value::as_object_mut) {
+                branch.remove("title");
+            }
+        }
+    });
+
+    if let Some(root) = value.as_object_mut() {
+        clean_vacuous_anyof(root);
+        prune_dangling_required(root, &BTreeSet::new(), false);
+    }
+}
+
+/// Rewrite all schema-position `$ref` pointers in `value` to `#/$defs/<PascalName>`.
+pub fn rewrite_refs_to_defs(value: &mut Value, current_def: &str, parent_name: Option<&str>) {
+    let effective_parent = parent_name.unwrap_or(current_def);
+    for_each_schema_object_mut(value, &mut |obj| {
+        let Some(Value::String(ref_str)) = obj.get("$ref") else {
+            return;
+        };
+        let target = ref_to_def_name(ref_str, Some(effective_parent));
+        obj.insert(
+            "$ref".to_string(),
+            Value::String(format!("#/$defs/{target}")),
+        );
+    });
+}
+
+/// Distribute top-level `properties`, `required`, `additionalProperties`, and parent `$ref`
+/// `allOf` branches into `anyOf` branches when at least one `anyOf` branch specifies `required`
+/// without `properties` (e.g., `ValueConstraint`, `StayCreateRequest`, `StayUpdateRequest`).
+pub fn distribute_properties_in_bare_anyof(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            for (k, child) in obj.iter_mut() {
+                if !INSTANCE_DATA_KEYWORDS.contains(&k.as_str()) {
+                    distribute_properties_in_bare_anyof(child);
+                }
+            }
+            distribute_bare_anyof_on_object(obj);
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                distribute_properties_in_bare_anyof(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Normalize 2-element `oneOf` unions of a scalar/ref schema `S` and `{"type": "array", "items": S}`
+/// (such as `CapabilityBase.properties.extends`) into `anyOf: [S, {"type": "array", "items": S}]`.
+pub fn normalize_scalar_or_array_unions(value: &mut Value) {
+    for_each_schema_object_mut(value, &mut |obj| {
+        let Some(Value::Array(one_of)) = obj.get("oneOf") else {
+            return;
+        };
+        if one_of.len() != 2 {
+            return;
+        }
+        let is_arr0 = one_of[0].get("type").and_then(Value::as_str) == Some("array");
+        let is_arr1 = one_of[1].get("type").and_then(Value::as_str) == Some("array");
+        if !(is_arr0 ^ is_arr1) {
+            return;
+        }
+        let (scalar_b, array_b) = if is_arr1 {
+            (&one_of[0], &one_of[1])
+        } else {
+            (&one_of[1], &one_of[0])
+        };
+        let Some(items) = array_b.get("items") else {
+            return;
+        };
+        let matches = scalar_b == items
+            || (scalar_b.get("$ref").is_some() && scalar_b.get("$ref") == items.get("$ref"))
+            || (scalar_b.get("type").is_some() && scalar_b.get("type") == items.get("type"));
+        if !matches {
+            return;
+        }
+        let any_of = Value::Array(vec![scalar_b.clone(), array_b.clone()]);
+        obj.remove("oneOf");
+        obj.insert("anyOf".to_string(), any_of);
+    });
+}
+
+/// Attach `"default": V` and infer `"type"` on schema objects that define a primitive `"const": V`
+/// or single-element `"enum": [V]` without `"default"`, skipping `if`, `then`, `else`, `not`,
+/// `contains`, `propertyNames`, and `INSTANCE_DATA_KEYWORDS` subtrees.
+pub fn attach_const_defaults(value: &mut Value) {
+    match value {
+        Value::Object(obj) => {
+            attach_default_if_const(obj);
+
+            for (key, child) in obj.iter_mut() {
+                if ["if", "then", "else", "not", "contains", "propertyNames"]
+                    .contains(&key.as_str())
+                    || INSTANCE_DATA_KEYWORDS.contains(&key.as_str())
+                {
+                    continue;
+                }
+                if [
+                    "properties",
+                    "$defs",
+                    "patternProperties",
+                    "dependentSchemas",
+                ]
+                .contains(&key.as_str())
+                {
+                    if let Value::Object(prop_map) = child {
+                        for prop_schema in prop_map.values_mut() {
+                            attach_const_defaults(prop_schema);
+                        }
+                        continue;
+                    }
+                }
+                attach_const_defaults(child);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                attach_const_defaults(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn attach_default_if_const(obj: &mut Map<String, Value>) {
+    let val = obj.get("const").cloned().or_else(|| {
+        let arr = obj.get("enum")?.as_array()?;
+        (arr.len() == 1).then(|| arr[0].clone())
+    });
+    let Some(val) = val else {
+        return;
+    };
+    let ty = match &val {
+        Value::String(_) => "string",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::Bool(_) => "boolean",
+        _ => return,
+    };
+    obj.entry("default".to_string()).or_insert(val);
+    obj.entry("type".to_string())
+        .or_insert_with(|| Value::String(ty.to_string()));
+}
+
+/// Flatten single-object inheritance and extension `allOf` compositions in `defs` (as well as
+/// `items.allOf` on array schemas and validation-only `contains` `allOf` branches on array roots)
+/// into flat `"type": "object"` schemas while preserving conditional `if`/`then` union blocks.
+pub fn flatten_object_allof(defs: &mut BTreeMap<String, Value>) {
+    for schema_val in defs.values_mut() {
+        normalize_presence_if_then_to_dependent_required(schema_val);
+        let Some(obj) = schema_val.as_object_mut() else {
+            continue;
+        };
+        if obj.get("type").and_then(Value::as_str) != Some("array") {
+            continue;
+        }
+        let Some(Value::Array(all_of)) = obj.get_mut("allOf") else {
+            continue;
+        };
+        all_of.retain(|b| !b.as_object().is_some_and(|m| m.contains_key("contains")));
+        if all_of.is_empty() {
+            obj.remove("allOf");
+        }
+    }
+
+    loop {
+        let snapshot = defs.clone();
+        let mut changed = false;
+        for schema_val in defs.values_mut() {
+            if flatten_single_object_allof(schema_val, &snapshot) {
+                normalize_presence_if_then_to_dependent_required(schema_val);
+                changed = true;
+            }
+            if let Some(Value::Object(props)) = schema_val
+                .as_object_mut()
+                .and_then(|o| o.get_mut("properties"))
+            {
+                for prop_val in props.values_mut() {
+                    if has_hybrid_ref_and_inline_allof(prop_val)
+                        && flatten_single_object_allof(prop_val, &snapshot)
+                    {
+                        normalize_presence_if_then_to_dependent_required(prop_val);
+                        changed = true;
+                    }
+                }
+            }
+            if schema_val.get("type").and_then(Value::as_str) != Some("array") {
+                continue;
+            }
+            let Some(items_val) = schema_val.get_mut("items") else {
+                continue;
+            };
+            if flatten_single_object_allof(items_val, &snapshot) {
+                normalize_presence_if_then_to_dependent_required(items_val);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// Assign deterministic, parent-qualified PascalCase `"title"` values to nested inline object
+/// schemas (`properties`, `items`, `anyOf`/`oneOf` branches, `additionalProperties`) across `defs`
+/// so downstream code generators never emit colliding or numbered class names.
+pub fn qualify_inline_object_titles(defs: &mut BTreeMap<String, Value>) {
+    let mut used_titles: BTreeSet<String> = defs.keys().cloned().collect();
+    for (def_name, schema_val) in defs.iter_mut() {
+        qualify_schema_node(schema_val, def_name, true, &mut used_titles);
+    }
+}
+
+/// Normalizes DTO openness and string format collisions across all schema objects
+/// in a `$defs` entry prior to union property distribution and `allOf` flattening.
+///
+/// 1. When a schema object has `"pattern"` alongside a non-string-mapped `"format"`
+///    (`obj.get("format").and_then(Value::as_str)` matching `"date-time" | "date" |
+///    "time" | "duration" | "uuid" | "ipv4" | "ipv6"`), removes `"pattern"` so
+///    downstream generators (`datamodel-code-generator --field-constraints`) emit
+///    native temporal/UUID/IP types without invalid `Field(pattern=...)` constraints.
+///    String-mapped formats (`"uri"`, `"uri-reference"`, `"iri"`, `"email"`,
+///    `"idn-email"`, `"hostname"`) retain `"pattern"` unchanged.
+/// 2. When a schema object has `"additionalProperties": false` (`Value::Bool(false)`)
+///    and at least one `required` property, replaces it with `Value::Bool(true)` so
+///    Tier 1 wire DTOs uphold tolerant-reader deserialization across top-level
+///    definitions and nested `anyOf`/`allOf` branches while closed grammar nodes with
+///    no `required` properties (e.g. `ConstraintExpression`) remain strict.
+///    Schema-valued `"additionalProperties": { ... }` map definitions are preserved.
+pub fn normalize_dto_openness_and_formats(value: &mut Value) {
+    for_each_schema_object_mut(value, &mut |obj| {
+        if matches!(
+            obj.get("format").and_then(Value::as_str),
+            Some("date-time" | "date" | "time" | "duration" | "uuid" | "ipv4" | "ipv6")
+        ) {
+            obj.remove("pattern");
+        }
+        if obj.get("additionalProperties") == Some(&Value::Bool(false))
+            && obj
+                .get("required")
+                .and_then(Value::as_array)
+                .is_some_and(|req| !req.is_empty())
+        {
+            obj.insert("additionalProperties".to_string(), Value::Bool(true));
+        }
+    });
+}
+
+/// Normalize a single `$defs` entry by stripping UCP authoring keywords, normalizing DTO
+/// openness and non-string-mapped format patterns, distributing bare `anyOf` properties,
+/// normalizing scalar-or-array unions, rewriting `$ref` pointers to `#/$defs/<PascalName>`,
+/// attaching `const` defaults, synchronizing `"title"` to `current_def`, and setting
+/// `"additionalProperties": true` on object schemas that omit `"additionalProperties"`
+/// to preserve UCP's open-world property semantics.
+pub fn normalize_def_schema(schema: &Value, current_def: &str, parent_name: Option<&str>) -> Value {
+    let mut val = schema.clone();
+    strip_ucp_keywords(&mut val);
+    normalize_dto_openness_and_formats(&mut val);
+    distribute_properties_in_bare_anyof(&mut val);
+    normalize_scalar_or_array_unions(&mut val);
+    rewrite_refs_to_defs(&mut val, current_def, parent_name);
+    attach_const_defaults(&mut val);
+    let Some(obj) = val.as_object_mut() else {
+        return val;
+    };
+    obj.insert("title".to_string(), Value::String(current_def.to_string()));
+    let is_object =
+        obj.get("type").and_then(Value::as_str) == Some("object") || obj.contains_key("properties");
+    if is_object && !obj.contains_key("additionalProperties") {
+        obj.insert("additionalProperties".to_string(), Value::Bool(true));
+    }
+    val
+}
+
+/// Returns `true` when `schema` contains any `ucp_request` or `ucp_response` annotation
+/// in schema position (ignoring instance data inside `const`, `enum`, `default`, `examples`),
+/// unless `schema` is a response-only capability envelope (`properties.ucp.$ref` points to a
+/// `response_*_schema` without `ucp_request`).
+pub fn has_directional_annotations(schema: &Value) -> bool {
+    if let Some(ucp_prop) = schema
+        .get("properties")
+        .and_then(|p| p.get("ucp"))
+        .and_then(Value::as_object)
+    {
+        if !ucp_prop.contains_key("ucp_request")
+            && ucp_prop
+                .get("$ref")
+                .and_then(Value::as_str)
+                .is_some_and(|r| r.contains("response_") || r.starts_with("#/$defs/Response"))
+        {
+            return false;
+        }
+    }
+    let mut found = false;
+    for_each_schema_object(schema, &mut |obj| {
+        if UCP_ANNOTATIONS.iter().any(|k| obj.contains_key(*k)) {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Returns `true` when `schema` supports the `"complete"` request operation via a `"complete"`
+/// entry in a `ucp_request` annotation object.
+pub fn schema_supports_complete(schema: &Value) -> bool {
+    let mut found = false;
+    for_each_schema_object(schema, &mut |obj| {
+        if obj
+            .get("ucp_request")
+            .and_then(Value::as_object)
+            .is_some_and(|req_map| req_map.contains_key("complete"))
+        {
+            found = true;
+        }
+    });
+    found
+}
+
+/// Slice a UCP-annotated schema into directional request and response schemas:
+/// `<BaseName>CreateRequest`, `<BaseName>UpdateRequest`, optional `<BaseName>CompleteRequest`
+/// (when `schema_supports_complete(raw_schema)` is `true`), and `<BaseName>` (`Response, "read"`).
+///
+/// Note: Unlike container operation definitions (`$defs.<op>_request` / `$defs.<op>_response`),
+/// which represent explicit RPC messages and are always emitted even when parameterless,
+/// `slice_directional_schemas` also runs on nested sub-object value types (e.g.
+/// `FulfillmentAvailableMethod`, `TimeInterval`) that mark every field `"ucp_request": "omit"`
+/// because the sub-object is server-computed / response-only. Request slices where all fields
+/// were omitted are skipped so response-only sub-objects do not emit unreferenced `*Request` types.
+pub fn slice_directional_schemas(
+    raw_schema: &Value,
+    base_name: &str,
+) -> Result<Vec<(String, Value)>, ResolveError> {
+    let mut out = Vec::new();
+    let supports_complete = schema_supports_complete(raw_schema);
+
+    let mut req_ops = vec![("CreateRequest", "create"), ("UpdateRequest", "update")];
+    if supports_complete {
+        req_ops.push(("CompleteRequest", "complete"));
+    }
+
+    for (suffix, op) in req_ops {
+        let resolved = resolve(raw_schema, &ResolveOptions::new(Direction::Request, op))?;
+        let slice_name = format!("{base_name}{suffix}");
+        let mut normalized = normalize_def_schema(&resolved, &slice_name, Some(base_name));
+        if is_non_empty_request_slice(&normalized) {
+            update_request_slice_metadata(&mut normalized, &slice_name, base_name, op);
+            out.push((slice_name, normalized));
+        }
+    }
+
+    let resp_resolved = resolve(
+        raw_schema,
+        &ResolveOptions::new(Direction::Response, "read"),
+    )?;
+    let resp_normalized = normalize_def_schema(&resp_resolved, base_name, Some(base_name));
+    out.push((base_name.to_string(), resp_normalized));
+
+    Ok(out)
+}
+
+/// Rewrite `#/$defs/<Target>` references inside a directional request schema slice
+/// (`<Name>CreateRequest`, `<Name>UpdateRequest`, `<Name>CompleteRequest`) to point to
+/// `#/$defs/<Target><suffix>` when `<Target><suffix>` is in `known_defs`, falling back to
+/// the base `#/$defs/<Target>` type otherwise.
+pub fn align_directional_refs(schema_val: &mut Value, suffix: &str, known_defs: &BTreeSet<String>) {
+    for_each_schema_object_mut(schema_val, &mut |obj| {
+        let Some(Value::String(ref_str)) = obj.get("$ref") else {
+            return;
+        };
+        let Some(target) = ref_str.strip_prefix("#/$defs/") else {
+            return;
+        };
+
+        let candidate = format!("{target}{suffix}");
+        if known_defs.contains(&candidate) {
+            obj.insert(
+                "$ref".to_string(),
+                Value::String(format!("#/$defs/{candidate}")),
+            );
+        }
+    });
+}
+
+fn is_non_empty_request_slice(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    let has_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let has_composition = ["allOf", "oneOf", "anyOf"].iter().any(|k| {
+        obj.get(*k)
+            .and_then(Value::as_array)
+            .is_some_and(|a| a.iter().any(is_non_empty_request_slice))
+    });
+    let has_ref = obj.get("$ref").is_some_and(Value::is_string);
+    has_props || has_composition || has_ref
+}
+
+pub(crate) fn update_request_slice_metadata(
+    slice_val: &mut Value,
+    slice_name: &str,
+    base_name: &str,
+    op: &str,
+) {
+    let Some(obj) = slice_val.as_object_mut() else {
+        return;
+    };
+    obj.insert("title".to_string(), Value::String(slice_name.to_string()));
+    let prefix = match op {
+        "create" => format!("Request payload to create a new {base_name}."),
+        "update" => format!("Request payload to update an existing {base_name}."),
+        "complete" => format!("Request payload to complete a {base_name}."),
+        _ => format!("Request payload for {base_name}."),
+    };
+    let new_desc = match obj.get("description").and_then(Value::as_str) {
+        Some(existing) if !existing.is_empty() => format!("{prefix} {existing}"),
+        _ => prefix,
+    };
+    obj.insert("description".to_string(), Value::String(new_desc));
+}
+
+fn file_stem_to_pascal(path_or_url: &str) -> String {
+    let filename = path_or_url.rsplit('/').next().unwrap_or(path_or_url);
+    let stem = filename
+        .strip_suffix(".schema.json")
+        .or_else(|| filename.strip_suffix(".json"))
+        .unwrap_or(filename);
+    to_pascal_case(stem)
+}
+
+fn inspect_allof_props(obj: &Map<String, Value>, props: &mut BTreeSet<String>) -> (bool, bool) {
+    let mut has_props = false;
+    if let Some(Value::Object(map)) = obj.get("properties") {
+        props.extend(map.keys().cloned());
+        has_props = true;
+    }
+    let mut has_ref = obj.get("$ref").is_some_and(Value::is_string);
+    if let Some(Value::Array(all_of)) = obj.get("allOf") {
+        for branch in all_of.iter().filter_map(Value::as_object) {
+            let (bp, br) = inspect_allof_props(branch, props);
+            has_props |= bp;
+            has_ref |= br;
+        }
+    }
+    (has_props, has_ref)
+}
+
+fn prune_dangling_required(
+    obj: &mut Map<String, Value>,
+    inherited_props: &BTreeSet<String>,
+    inherited_has_ref: bool,
+) {
+    let mut effective_props = inherited_props.clone();
+    let (local_has_props, local_has_ref) = inspect_allof_props(obj, &mut effective_props);
+    let effective_has_ref = inherited_has_ref || local_has_ref;
+
+    if let Some(Value::Array(reqs)) = obj.get_mut("required") {
+        if local_has_props && !effective_has_ref {
+            reqs.retain(|v| v.as_str().is_some_and(|k| effective_props.contains(k)));
+        }
+        if reqs.is_empty() {
+            obj.remove("required");
+        }
+    }
+
+    for key in ["allOf", "anyOf", "oneOf"] {
+        let Some(Value::Array(arr)) = obj.get_mut(key) else {
+            continue;
+        };
+        for branch in arr.iter_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(branch, &effective_props, effective_has_ref);
+        }
+    }
+    for key in ["if", "then", "else", "not"] {
+        if let Some(child) = obj.get_mut(key).and_then(Value::as_object_mut) {
+            prune_dangling_required(child, &effective_props, effective_has_ref);
+        }
+    }
+    if let Some(Value::Object(dep_schemas)) = obj.get_mut("dependentSchemas") {
+        for child in dep_schemas.values_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &effective_props, effective_has_ref);
+        }
+    }
+
+    let empty_props = BTreeSet::new();
+    for key in ["properties", "patternProperties", "$defs", "definitions"] {
+        let Some(Value::Object(map)) = obj.get_mut(key) else {
+            continue;
+        };
+        for child in map.values_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
+    }
+    for key in [
+        "additionalProperties",
+        "unevaluatedProperties",
+        "items",
+        "contains",
+        "propertyNames",
+    ] {
+        if let Some(child) = obj.get_mut(key).and_then(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
+    }
+    if let Some(Value::Array(prefix_items)) = obj.get_mut("prefixItems") {
+        for child in prefix_items.iter_mut().filter_map(Value::as_object_mut) {
+            prune_dangling_required(child, &empty_props, false);
+        }
+    }
+}
+
+fn prune_empty_prop_stubs(obj: &mut Map<String, Value>) {
+    let Some(Value::Object(props)) = obj.get_mut("properties") else {
+        return;
+    };
+    for prop_obj in props.values_mut().filter_map(Value::as_object_mut) {
+        prune_empty_prop_stubs(prop_obj);
+    }
+    props.retain(|_, v| v.as_object().is_none_or(|m| !m.is_empty()));
+    if props.is_empty() {
+        obj.remove("properties");
+    }
+}
+
+fn clean_vacuous_anyof(obj: &mut Map<String, Value>) {
+    if !obj.get("anyOf").is_some_and(Value::is_array) {
+        return;
+    }
+    let parent_req: BTreeSet<String> = obj
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(String::from)
+        .collect();
+    let Some(Value::Array(any_of)) = obj.get_mut("anyOf") else {
+        return;
+    };
+    for branch in any_of.iter_mut().filter_map(Value::as_object_mut) {
+        prune_empty_prop_stubs(branch);
+    }
+    let is_tautological = any_of.iter().any(|b| {
+        b.as_object().is_some_and(|m| {
+            m.keys().all(|k| k == "required")
+                && m.get("required")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .all(|r| r.as_str().is_some_and(|s| parent_req.contains(s)))
+        })
+    });
+    if is_tautological {
+        obj.remove("anyOf");
+    }
+}
+
+fn distribute_bare_anyof_on_object(obj: &mut Map<String, Value>) {
+    let has_bare_required_branch = obj
+        .get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter().any(|b| {
+                b.as_object()
+                    .is_some_and(|m| m.contains_key("required") && !m.contains_key("properties"))
+            })
+        });
+    if !has_bare_required_branch {
+        return;
+    }
+
+    let has_top_props = obj
+        .get("properties")
+        .and_then(Value::as_object)
+        .is_some_and(|m| !m.is_empty());
+    let has_parent_refs = obj
+        .get("allOf")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|b| b.get("$ref").is_some_and(Value::is_string))
+        });
+    if !(has_top_props || has_parent_refs) {
+        return;
+    }
+
+    distribute_props_into_anyof(obj);
+}
+
+fn distribute_props_into_anyof(obj: &mut Map<String, Value>) {
+    let parent_props = obj
+        .remove("properties")
+        .and_then(|v| match v {
+            Value::Object(m) => Some(m),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let parent_reqs = obj
+        .remove("required")
+        .and_then(|v| match v {
+            Value::Array(a) => Some(a),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let add_props = obj
+        .remove("additionalProperties")
+        .unwrap_or(Value::Bool(true));
+    obj.remove("type");
+
+    let mut parent_ref_branches = Vec::new();
+    if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
+        let mut kept = Vec::new();
+        for branch in std::mem::take(all_of) {
+            if branch.get("$ref").is_some_and(Value::is_string) {
+                parent_ref_branches.push(branch);
+            } else {
+                kept.push(branch);
+            }
+        }
+        if kept.is_empty() {
+            obj.remove("allOf");
+        } else {
+            *all_of = kept;
+        }
+    }
+
+    let Some(Value::Array(any_of)) = obj.get_mut("anyOf") else {
+        return;
+    };
+    for branch in any_of.iter_mut() {
+        let Some(branch_obj) = branch.as_object_mut() else {
+            continue;
+        };
+        branch_obj.insert("type".to_string(), Value::String("object".to_string()));
+        branch_obj
+            .entry("additionalProperties".to_string())
+            .or_insert_with(|| add_props.clone());
+
+        if !parent_ref_branches.is_empty() {
+            let branch_all_of = branch_obj
+                .entry("allOf".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            if let Value::Array(arr) = branch_all_of {
+                let mut prepended = parent_ref_branches.clone();
+                for existing in std::mem::take(arr) {
+                    if !prepended.contains(&existing) {
+                        prepended.push(existing);
+                    }
+                }
+                *arr = prepended;
+            }
+        }
+
+        let mut combined_reqs = parent_reqs.clone();
+        if let Some(Value::Array(branch_reqs)) = branch_obj.remove("required") {
+            for req in branch_reqs {
+                if !combined_reqs.contains(&req) {
+                    combined_reqs.push(req);
+                }
+            }
+        }
+        if !combined_reqs.is_empty() {
+            branch_obj.insert("required".to_string(), Value::Array(combined_reqs));
+        }
+
+        let mut combined_props = parent_props.clone();
+        if let Some(Value::Object(branch_props)) = branch_obj.remove("properties") {
+            for (k, v) in branch_props {
+                if let Some(base_prop) = combined_props.get_mut(&k) {
+                    merge_schema_property(base_prop, &v);
+                } else {
+                    combined_props.insert(k, v);
+                }
+            }
+        }
+        if !combined_props.is_empty() {
+            branch_obj.insert("properties".to_string(), Value::Object(combined_props));
+        }
+        attach_const_defaults(branch);
+    }
+}
+
+fn has_hybrid_ref_and_inline_allof(val: &Value) -> bool {
+    let Some(all_of) = val.get("allOf").and_then(Value::as_array) else {
+        return false;
+    };
+    let has_ref = all_of
+        .iter()
+        .any(|b| b.get("$ref").is_some_and(Value::is_string));
+    let has_non_ref =
+        all_of.iter().any(|b| b.get("$ref").is_none()) || val.get("properties").is_some();
+    has_ref && has_non_ref
+}
+
+fn normalize_presence_if_then_to_dependent_required(schema_val: &mut Value) {
+    for_each_schema_object_mut(schema_val, &mut |obj| {
+        if !obj.contains_key("else") {
+            if let (Some(if_val), Some(then_val)) = (obj.get("if"), obj.get("then")) {
+                if let Some(dep_map) = extract_presence_if_then_dependent_required(if_val, then_val)
+                {
+                    obj.remove("if");
+                    obj.remove("then");
+                    merge_dependent_required_map(obj, &dep_map);
+                }
+            }
+        }
+        let mut extracted_from_allof = Vec::new();
+        if let Some(Value::Array(all_of)) = obj.get_mut("allOf") {
+            all_of.retain(|branch| {
+                let Some(b_obj) = branch.as_object() else {
+                    return true;
+                };
+                if !b_obj
+                    .keys()
+                    .all(|k| matches!(k.as_str(), "if" | "then" | "title" | "description"))
+                {
+                    return true;
+                }
+                let (Some(if_val), Some(then_val)) = (b_obj.get("if"), b_obj.get("then")) else {
+                    return true;
+                };
+                if let Some(dep_map) = extract_presence_if_then_dependent_required(if_val, then_val)
+                {
+                    extracted_from_allof.push(dep_map);
+                    false
+                } else {
+                    true
+                }
+            });
+            if all_of.is_empty() {
+                obj.remove("allOf");
+            }
+        }
+        for dep_map in extracted_from_allof {
+            merge_dependent_required_map(obj, &dep_map);
+        }
+    });
+}
+
+fn extract_presence_if_then_dependent_required(
+    if_val: &Value,
+    then_val: &Value,
+) -> Option<BTreeMap<String, Vec<String>>> {
+    let if_obj = if_val.as_object()?;
+    let then_obj = then_val.as_object()?;
+    if !then_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "required" | "title" | "description"))
+    {
+        return None;
+    }
+    let then_reqs: Vec<String> = then_obj
+        .get("required")?
+        .as_array()?
+        .iter()
+        .map(|v| v.as_str().map(String::from))
+        .collect::<Option<Vec<_>>>()?;
+    if then_reqs.is_empty() {
+        return None;
+    }
+
+    let triggers: Vec<String> = if if_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "required" | "title" | "description"))
+    {
+        let reqs = if_obj.get("required")?.as_array()?;
+        if reqs.len() != 1 {
+            return None;
+        }
+        vec![reqs[0].as_str()?.to_string()]
+    } else if if_obj
+        .keys()
+        .all(|k| matches!(k.as_str(), "anyOf" | "title" | "description"))
+    {
+        let branches = if_obj.get("anyOf")?.as_array()?;
+        if branches.is_empty() {
+            return None;
+        }
+        let mut out = Vec::with_capacity(branches.len());
+        for b in branches {
+            let b_obj = b.as_object()?;
+            if !b_obj.keys().all(|k| k == "required") {
+                return None;
+            }
+            let reqs = b_obj.get("required")?.as_array()?;
+            if reqs.len() != 1 {
+                return None;
+            }
+            out.push(reqs[0].as_str()?.to_string());
+        }
+        out
+    } else {
+        return None;
+    };
+
+    let mut out = BTreeMap::new();
+    for trigger in triggers {
+        let deps: Vec<String> = then_reqs
+            .iter()
+            .filter(|r| **r != trigger)
+            .cloned()
+            .collect();
+        if !deps.is_empty() {
+            out.insert(trigger, deps);
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+fn merge_dependent_required_map(
+    obj: &mut Map<String, Value>,
+    dep_map: &BTreeMap<String, Vec<String>>,
+) {
+    if dep_map.is_empty() {
+        return;
+    }
+    let dep_obj = obj
+        .entry("dependentRequired".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("dependentRequired is an object");
+    for (trigger, deps) in dep_map {
+        let arr = dep_obj
+            .entry(trigger.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut()
+            .expect("dependentRequired entry is an array");
+        for dep in deps {
+            let val = Value::String(dep.clone());
+            if !arr.contains(&val) {
+                arr.push(val);
+            }
+        }
+    }
+}
+
+fn is_inline_allof_branch_flattenable(branch_obj: &Map<String, Value>) -> bool {
+    ![
+        "$ref",
+        "if",
+        "then",
+        "else",
+        "anyOf",
+        "oneOf",
+        "allOf",
+        "contains",
+        "not",
+        "dependentSchemas",
+        "patternProperties",
+        "unevaluatedProperties",
+    ]
+    .iter()
+    .any(|k| branch_obj.contains_key(*k))
+        && branch_obj
+            .get("additionalProperties")
+            .is_none_or(|v| v == &Value::Bool(true))
+}
+
+fn apply_merged_object_fields(
+    obj: &mut Map<String, Value>,
+    mut merged_props: Map<String, Value>,
+    mut merged_reqs: Vec<Value>,
+    merged_dep_req: &BTreeMap<String, Vec<String>>,
+    merged_constraints: Map<String, Value>,
+) {
+    if let Some(Value::Object(own_props)) = obj.remove("properties") {
+        for (k, v) in own_props {
+            let Some(existing) = merged_props.get_mut(&k) else {
+                merged_props.insert(k, v);
+                continue;
+            };
+            merge_schema_property(existing, &v);
+        }
+    }
+    if let Some(Value::Array(own_reqs)) = obj.remove("required") {
+        for req in own_reqs {
+            if !merged_reqs.contains(&req) {
+                merged_reqs.push(req);
+            }
+        }
+    }
+    merge_dependent_required_map(obj, merged_dep_req);
+    for (k, v) in merged_constraints {
+        obj.entry(k).or_insert(v);
+    }
+    if !merged_props.is_empty() {
+        obj.insert("properties".to_string(), Value::Object(merged_props));
+    }
+    if !merged_reqs.is_empty() {
+        obj.insert("required".to_string(), Value::Array(merged_reqs));
+    }
+}
+
+/// Fold flattenable inline `allOf` object branches into `target`'s top-level object fields
+/// while preserving `$ref`, conditional, union, applicator, and closed-object branches in `allOf`.
+pub(crate) fn fold_inline_allof_branches(target: &mut Value) {
+    let Some(obj) = target.as_object_mut() else {
+        return;
+    };
+    let Some(Value::Array(all_of)) = obj.get("allOf").cloned() else {
+        return;
+    };
+
+    let mut merged_props = Map::new();
+    let mut merged_reqs: Vec<Value> = Vec::new();
+    let mut merged_dep_req: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut merged_constraints = Map::new();
+    let mut kept_all_of: Vec<Value> = Vec::new();
+    let mut any_flattened = false;
+
+    for branch in all_of {
+        let Some(branch_obj) = branch
+            .as_object()
+            .filter(|b| is_inline_allof_branch_flattenable(b))
+        else {
+            kept_all_of.push(branch);
+            continue;
+        };
+        merge_props_and_reqs_from_object(
+            branch_obj,
+            &mut merged_props,
+            &mut merged_reqs,
+            &mut merged_dep_req,
+            &mut merged_constraints,
+        );
+        any_flattened = true;
+    }
+
+    if !any_flattened {
+        return;
+    }
+
+    apply_merged_object_fields(
+        obj,
+        merged_props,
+        merged_reqs,
+        &merged_dep_req,
+        merged_constraints,
+    );
+    if kept_all_of.is_empty() {
+        obj.remove("allOf");
+    } else {
+        obj.insert("allOf".to_string(), Value::Array(kept_all_of));
+    }
+}
+
+fn flatten_single_object_allof(
+    target: &mut Value,
+    defs_snapshot: &BTreeMap<String, Value>,
+) -> bool {
+    let Some(obj) = target.as_object_mut() else {
+        return false;
+    };
+    let Some(Value::Array(all_of)) = obj.get("allOf").cloned() else {
+        return false;
+    };
+
+    let mut merged_props = Map::new();
+    let mut merged_reqs: Vec<Value> = Vec::new();
+    let mut merged_dep_req: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut merged_constraints = Map::new();
+    let mut kept_all_of: Vec<Value> = Vec::new();
+    let mut any_flattened = false;
+
+    for branch in all_of {
+        if let Some(ref_name) = branch
+            .get("$ref")
+            .and_then(Value::as_str)
+            .and_then(|r| r.strip_prefix("#/$defs/"))
+        {
+            if let Some(base_obj) = defs_snapshot
+                .get(ref_name)
+                .and_then(Value::as_object)
+                .filter(|b| is_flattenable_base_object(b))
+            {
+                merge_props_and_reqs_from_object(
+                    base_obj,
+                    &mut merged_props,
+                    &mut merged_reqs,
+                    &mut merged_dep_req,
+                    &mut merged_constraints,
+                );
+                let mut base_cond = Map::new();
+                for cond_key in ["if", "then", "else"] {
+                    if let Some(cond_val) = base_obj.get(cond_key) {
+                        base_cond.insert(cond_key.to_string(), cond_val.clone());
+                    }
+                }
+                if !base_cond.is_empty() {
+                    if ["if", "then", "else"].iter().any(|k| obj.contains_key(*k)) {
+                        let cond_branch = Value::Object(base_cond);
+                        if !kept_all_of.contains(&cond_branch) {
+                            kept_all_of.push(cond_branch);
+                        }
+                    } else {
+                        obj.extend(base_cond);
+                    }
+                }
+                if let Some(Value::Array(base_all_of)) = base_obj.get("allOf") {
+                    for cond in base_all_of {
+                        if !kept_all_of.contains(cond) {
+                            kept_all_of.push(cond.clone());
+                        }
+                    }
+                }
+                any_flattened = true;
+                continue;
+            }
+            kept_all_of.push(branch);
+            continue;
+        }
+
+        if let Some(branch_obj) = branch
+            .as_object()
+            .filter(|b| is_inline_allof_branch_flattenable(b))
+        {
+            merge_props_and_reqs_from_object(
+                branch_obj,
+                &mut merged_props,
+                &mut merged_reqs,
+                &mut merged_dep_req,
+                &mut merged_constraints,
+            );
+            any_flattened = true;
+            continue;
+        }
+        kept_all_of.push(branch);
+    }
+
+    if !any_flattened {
+        return false;
+    }
+
+    let promoted_anyof = if kept_all_of.len() == 1 && !obj.contains_key("anyOf") {
+        kept_all_of[0]
+            .as_object()
+            .filter(|b| b.contains_key("anyOf") && b.keys().all(|k| k == "anyOf" || k == "type"))
+            .and_then(|b| b.get("anyOf").cloned())
+    } else {
+        None
+    };
+    if let Some(any_of_val) = promoted_anyof {
+        kept_all_of.clear();
+        obj.insert("anyOf".to_string(), any_of_val);
+    }
+
+    if !obj.contains_key("anyOf") && !obj.contains_key("oneOf") {
+        obj.insert("type".to_string(), Value::String("object".to_string()));
+        obj.entry("additionalProperties".to_string())
+            .or_insert(Value::Bool(true));
+    }
+    apply_merged_object_fields(
+        obj,
+        merged_props,
+        merged_reqs,
+        &merged_dep_req,
+        merged_constraints,
+    );
+    if kept_all_of.is_empty() {
+        obj.remove("allOf");
+    } else {
+        obj.insert("allOf".to_string(), Value::Array(kept_all_of));
+    }
+    if obj.contains_key("anyOf") && obj.contains_key("properties") {
+        distribute_props_into_anyof(obj);
+    }
+    true
+}
+
+fn is_flattenable_base_object(base_obj: &Map<String, Value>) -> bool {
+    let is_obj = base_obj.get("type").and_then(Value::as_str) == Some("object")
+        || base_obj.contains_key("properties");
+    if !is_obj {
+        return false;
+    }
+    if [
+        "anyOf",
+        "oneOf",
+        "$ref",
+        "not",
+        "dependentSchemas",
+        "patternProperties",
+        "unevaluatedProperties",
+    ]
+    .iter()
+    .any(|k| base_obj.contains_key(*k))
+        || base_obj
+            .get("additionalProperties")
+            .is_some_and(|v| v != &Value::Bool(true))
+    {
+        return false;
+    }
+    if base_obj
+        .get("then")
+        .and_then(Value::as_object)
+        .is_some_and(|t| t.contains_key("$ref"))
+    {
+        return false;
+    }
+    let Some(Value::Array(all_of)) = base_obj.get("allOf") else {
+        return true;
+    };
+    all_of.iter().all(|b| {
+        b.get("if").is_some()
+            && !b
+                .get("then")
+                .and_then(Value::as_object)
+                .is_some_and(|t| t.contains_key("$ref"))
+    })
+}
+
+fn merge_props_and_reqs_from_object(
+    source: &Map<String, Value>,
+    merged_props: &mut Map<String, Value>,
+    merged_reqs: &mut Vec<Value>,
+    merged_dep_req: &mut BTreeMap<String, Vec<String>>,
+    merged_constraints: &mut Map<String, Value>,
+) {
+    if let Some(Value::Object(props)) = source.get("properties") {
+        for (k, v) in props {
+            if let Some(existing) = merged_props.get_mut(k) {
+                merge_schema_property(existing, v);
+            } else {
+                merged_props.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    if let Some(Value::Array(reqs)) = source.get("required") {
+        for req in reqs {
+            if !merged_reqs.contains(req) {
+                merged_reqs.push(req.clone());
+            }
+        }
+    }
+    if let Some(Value::Object(dep_obj)) = source.get("dependentRequired") {
+        for (trigger, deps_val) in dep_obj {
+            if let Some(deps_arr) = deps_val.as_array() {
+                let entry = merged_dep_req.entry(trigger.clone()).or_default();
+                for dep in deps_arr.iter().filter_map(Value::as_str) {
+                    let dep_str = dep.to_string();
+                    if !entry.contains(&dep_str) {
+                        entry.push(dep_str);
+                    }
+                }
+            }
+        }
+    }
+    for key in ["minProperties", "maxProperties", "propertyNames"] {
+        if let Some(val) = source.get(key) {
+            merged_constraints.insert(key.to_string(), val.clone());
+        }
+    }
+}
+
+pub(crate) fn merge_schema_property(base_prop: &mut Value, override_prop: &Value) {
+    const REF_SIBLING_KEYS: &[&str] = &[
+        "description",
+        "default",
+        "examples",
+        "deprecated",
+        "readOnly",
+        "writeOnly",
+        "ucp_request",
+        "ucp_response",
+        "x-ucp-schema-transition",
+    ];
+    let (Some(base_obj), Some(override_obj)) =
+        (base_prop.as_object_mut(), override_prop.as_object())
+    else {
+        *base_prop = override_prop.clone();
+        return;
+    };
+    let replace_preserving_siblings =
+        |base_obj: &mut Map<String, Value>, override_obj: &Map<String, Value>| {
+            let mut merged = override_obj.clone();
+            for &key in REF_SIBLING_KEYS {
+                if let Some(base_val) = base_obj.get(key) {
+                    merged
+                        .entry(key.to_string())
+                        .or_insert_with(|| base_val.clone());
+                }
+            }
+            *base_obj = merged;
+        };
+    if override_obj.contains_key("$ref") {
+        replace_preserving_siblings(base_obj, override_obj);
+        return;
+    }
+    if base_obj.contains_key("$ref") {
+        if ["const", "enum", "type"]
+            .iter()
+            .any(|k| override_obj.contains_key(*k))
+        {
+            replace_preserving_siblings(base_obj, override_obj);
+        } else {
+            for &key in REF_SIBLING_KEYS {
+                if let Some(val) = override_obj.get(key) {
+                    base_obj.insert(key.to_string(), val.clone());
+                }
+            }
+        }
+        return;
+    }
+    if override_obj.contains_key("const") {
+        base_obj.remove("enum");
+    }
+    if override_obj.contains_key("type") || override_obj.contains_key("properties") {
+        base_obj.remove("oneOf");
+        base_obj.remove("anyOf");
+    }
+    for (k, v) in override_obj {
+        if let Some(existing) = base_obj.get_mut(k) {
+            if existing.is_object() && v.is_object() {
+                merge_schema_property(existing, v);
+                continue;
+            }
+        }
+        base_obj.insert(k.clone(), v.clone());
+    }
+}
+
+fn stamp_inline_object_title_and_defaults(node: &mut Value, title: &str) {
+    if let Some(obj) = node.as_object_mut() {
+        obj.insert("title".to_string(), Value::String(title.to_string()));
+        obj.entry("type".to_string())
+            .or_insert_with(|| Value::String("object".to_string()));
+        obj.entry("additionalProperties".to_string())
+            .or_insert(Value::Bool(true));
+    }
+}
+
+fn qualify_schema_node(
+    node: &mut Value,
+    parent_title: &str,
+    is_root: bool,
+    used_titles: &mut BTreeSet<String>,
+) {
+    let Some(obj) = node.as_object_mut() else {
+        return;
+    };
+
+    if is_root && obj.get("type").and_then(Value::as_str) == Some("array") {
+        if let Some(items) = obj.get_mut("items") {
+            let item_title = format!("{parent_title}Item");
+            if is_inline_object_with_props(items) {
+                stamp_inline_object_title_and_defaults(items, &item_title);
+                used_titles.insert(item_title.clone());
+            }
+            qualify_schema_node(items, &item_title, false, used_titles);
+        }
+    }
+
+    if let Some(Value::Object(props)) = obj.get_mut("properties") {
+        for (prop_name, prop_schema) in props.iter_mut() {
+            let prop_pascal = to_pascal_case(prop_name);
+            let prop_title = append_pascal_suffix(parent_title, &prop_pascal);
+            if is_inline_object_with_props(prop_schema) {
+                stamp_inline_object_title_and_defaults(prop_schema, &prop_title);
+                used_titles.insert(prop_title.clone());
+                qualify_schema_node(prop_schema, &prop_title, false, used_titles);
+                continue;
+            }
+
+            let is_array = prop_schema.get("type").and_then(Value::as_str) == Some("array")
+                || prop_schema.get("items").is_some();
+            if is_array {
+                let singular_pascal = singularize_pascal(&prop_pascal);
+                let item_title = append_pascal_suffix(parent_title, &singular_pascal);
+                if let Some(items) = prop_schema.get_mut("items") {
+                    if is_inline_object_with_props(items) {
+                        stamp_inline_object_title_and_defaults(items, &item_title);
+                        used_titles.insert(item_title.clone());
+                        qualify_schema_node(items, &item_title, false, used_titles);
+                    } else if is_constrained_inline_scalar(items)
+                        && used_titles.contains(&singular_pascal)
+                    {
+                        if let Some(items_obj) = items.as_object_mut() {
+                            items_obj
+                                .insert("title".to_string(), Value::String(item_title.clone()));
+                        }
+                        used_titles.insert(item_title);
+                    } else {
+                        qualify_schema_node(items, &item_title, false, used_titles);
+                    }
+                }
+                continue;
+            }
+
+            qualify_schema_node(prop_schema, &prop_title, false, used_titles);
+        }
+    }
+
+    for key in ["anyOf", "oneOf"] {
+        let Some(Value::Array(branches)) = obj.get_mut(key) else {
+            continue;
+        };
+        let common_req = common_required_across_branches(branches);
+        for (idx, branch) in branches.iter_mut().enumerate() {
+            if !is_inline_object_with_props(branch) {
+                qualify_schema_node(branch, parent_title, false, used_titles);
+                continue;
+            }
+            let branch_title =
+                derive_branch_title(parent_title, branch, &common_req, idx, used_titles);
+            stamp_inline_object_title_and_defaults(branch, &branch_title);
+            used_titles.insert(branch_title.clone());
+            qualify_schema_node(branch, &branch_title, false, used_titles);
+        }
+    }
+
+    if let Some(add_props) = obj.get_mut("additionalProperties") {
+        if add_props.is_object() {
+            let ap_title = format!("{parent_title}Value");
+            if is_inline_object_with_props(add_props) {
+                stamp_inline_object_title_and_defaults(add_props, &ap_title);
+                used_titles.insert(ap_title.clone());
+            }
+            qualify_schema_node(add_props, &ap_title, false, used_titles);
+        }
+    }
+}
+
+fn is_inline_object_with_props(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    !obj.contains_key("$ref")
+        && obj
+            .get("properties")
+            .and_then(Value::as_object)
+            .is_some_and(|p| !p.is_empty())
+}
+
+fn is_constrained_inline_scalar(val: &Value) -> bool {
+    let Some(obj) = val.as_object() else {
+        return false;
+    };
+    !obj.contains_key("$ref")
+        && !obj.contains_key("properties")
+        && [
+            "minLength",
+            "maxLength",
+            "pattern",
+            "minimum",
+            "maximum",
+            "enum",
+        ]
+        .iter()
+        .any(|k| obj.contains_key(*k))
+}
+
+fn common_required_across_branches(branches: &[Value]) -> BTreeSet<String> {
+    let req_sets: Vec<BTreeSet<String>> = branches
+        .iter()
+        .filter(|b| is_inline_object_with_props(b))
+        .map(|b| {
+            b.get("required")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .collect();
+    let Some((first, rest)) = req_sets.split_first() else {
+        return BTreeSet::new();
+    };
+    if rest.is_empty() {
+        return BTreeSet::new();
+    }
+    first
+        .iter()
+        .filter(|k| rest.iter().all(|s| s.contains(*k)))
+        .cloned()
+        .collect()
+}
+
+fn derive_branch_title(
+    parent_title: &str,
+    branch: &Value,
+    common_req: &BTreeSet<String>,
+    idx: usize,
+    used_titles: &BTreeSet<String>,
+) -> String {
+    let mut candidates = Vec::new();
+    if let Some(props) = branch.get("properties").and_then(Value::as_object) {
+        for preferred in ["transport", "type", "kind", "role", "method"] {
+            if let Some(tag) = props
+                .get(preferred)
+                .and_then(|v| v.get("const"))
+                .and_then(Value::as_str)
+            {
+                candidates.push(to_pascal_case(tag));
+            }
+        }
+        for (k, v) in props {
+            if k == "jsonrpc" {
+                continue;
+            }
+            if let Some(tag) = v.get("const").and_then(Value::as_str) {
+                candidates.push(to_pascal_case(tag));
+            }
+        }
+    }
+    if let Some(reqs) = branch.get("required").and_then(Value::as_array) {
+        for r in reqs.iter().filter_map(Value::as_str) {
+            if !common_req.contains(r) {
+                candidates.push(to_pascal_case(r));
+            }
+        }
+        for r in reqs.iter().filter_map(Value::as_str) {
+            if common_req.contains(r) {
+                candidates.push(to_pascal_case(r));
+            }
+        }
+    }
+    for suffix in candidates {
+        let title = append_pascal_suffix(parent_title, &suffix);
+        if !used_titles.contains(&title) {
+            return title;
+        }
+    }
+    append_pascal_suffix(parent_title, &format!("Variant{}", idx + 1))
+}
+
+fn singularize_pascal(s: &str) -> String {
+    let last_word = s
+        .rfind(|c: char| c.is_ascii_uppercase())
+        .map_or(s, |idx| &s[idx..]);
+    if s.ends_with("ss")
+        || s.ends_with("us")
+        || s.ends_with("is")
+        || s.ends_with("os")
+        || matches!(
+            last_word,
+            "Status"
+                | "Series"
+                | "Species"
+                | "Basis"
+                | "Analysis"
+                | "Diagnosis"
+                | "Synopsis"
+                | "Thesis"
+                | "Crisis"
+                | "Axis"
+                | "Alias"
+                | "Address"
+                | "Process"
+                | "Access"
+                | "Success"
+                | "Progress"
+                | "Details"
+                | "Hours"
+                | "Ages"
+                | "Params"
+                | "Goods"
+                | "Means"
+                | "Customs"
+                | "News"
+                | "Headquarters"
+                | "Analytics"
+                | "Logistics"
+                | "Statistics"
+                | "Metrics"
+                | "Mathematics"
+                | "Physics"
+                | "Economics"
+                | "Politics"
+                | "Ethics"
+        )
+    {
+        return s.to_string();
+    }
+    if s.ends_with("ies") && s.len() > 3 {
+        return format!("{}y", &s[..s.len() - 3]);
+    }
+    for suffix in [
+        "sses", "uses", "iases", "yses", "xes", "zes", "ches", "shes",
+    ] {
+        if s.ends_with(suffix) && s.len() > suffix.len() {
+            return s[..s.len() - 2].to_string();
+        }
+    }
+    if s.ends_with('s') && s.len() > 1 {
+        return s[..s.len() - 1].to_string();
+    }
+    s.to_string()
+}
+
+fn append_pascal_suffix(parent: &str, suffix: &str) -> String {
+    let parent_last_word = parent
+        .rfind(|c: char| c.is_ascii_uppercase())
+        .map_or(parent, |idx| &parent[idx..]);
+    let suffix_second_upper = suffix
+        .char_indices()
+        .skip(1)
+        .find(|(_, c)| c.is_ascii_uppercase())
+        .map(|(idx, _)| idx);
+    if let Some(second_idx) = suffix_second_upper {
+        let suffix_first_word = &suffix[..second_idx];
+        if suffix_first_word == parent_last_word {
+            return format!("{parent}{}", &suffix[second_idx..]);
+        }
+    }
+    format!("{parent}{suffix}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn to_pascal_case_converts_snake_kebab_and_reverse_domain() {
+        assert_eq!(to_pascal_case("checkout"), "Checkout");
+        assert_eq!(to_pascal_case("line_item"), "LineItem");
+        assert_eq!(to_pascal_case("order-line-item"), "OrderLineItem");
+        assert_eq!(to_pascal_case("dev.ucp.shopping.checkout"), "Checkout");
+        assert_eq!(
+            to_pascal_case("dev.ucp.shopping.buyer_consent"),
+            "BuyerConsent"
+        );
+        assert_eq!(
+            to_pascal_case("checkout.complete_request"),
+            "CheckoutCompleteRequest"
+        );
+        assert_eq!(to_pascal_case("PlatformSchema"), "PlatformSchema");
+        assert_eq!(to_pascal_case("a_b"), "AB");
+        assert_eq!(to_pascal_case("AB"), "AB");
+        assert_eq!(to_pascal_case("v1_v2"), "V1V2");
+        assert_eq!(to_pascal_case("V1V2"), "V1V2");
+    }
+
+    #[test]
+    fn is_reverse_domain_name_identifies_capability_names() {
+        assert!(is_reverse_domain_name("dev.ucp.shopping.checkout"));
+        assert!(is_reverse_domain_name("dev.shopify.catalog"));
+        assert!(is_reverse_domain_name("dev.ucp.shopping.catalog.search"));
+        assert!(!is_reverse_domain_name("checkout"));
+        assert!(!is_reverse_domain_name("shopping.checkout"));
+        assert!(!is_reverse_domain_name("rest.openapi.json"));
+        assert!(!is_reverse_domain_name(
+            "https://ucp.dev/schemas/checkout.json"
+        ));
+    }
+
+    #[test]
+    fn is_generic_def_name_matches_spec_list() {
+        for generic in [
+            "Base",
+            "base",
+            "Entity",
+            "entity",
+            "PlatformSchema",
+            "platform_schema",
+            "BusinessSchema",
+            "business_schema",
+            "ResponseSchema",
+            "response_schema",
+            "Request",
+            "request",
+            "Response",
+            "response",
+            "Error",
+            "error",
+            "Config",
+            "config",
+            "Endpoint",
+            "endpoint",
+            "Quantity",
+            "quantity",
+        ] {
+            assert!(
+                is_generic_def_name(generic),
+                "expected {generic} to be generic"
+            );
+        }
+        assert!(!is_generic_def_name("jwk_public_key"));
+        assert!(!is_generic_def_name("lookup_variant"));
+        assert!(!is_generic_def_name("discounts_object"));
+    }
+
+    #[test]
+    fn qualify_def_name_qualifies_generic_and_preserves_specific_names() {
+        assert_eq!(
+            qualify_def_name("Capability", "platform_schema"),
+            "CapabilityPlatformSchema"
+        );
+        assert_eq!(
+            qualify_def_name("OrderLineItem", "quantity"),
+            "OrderLineItemQuantity"
+        );
+        assert_eq!(
+            qualify_def_name("Pagination", "request"),
+            "PaginationRequest"
+        );
+        assert_eq!(
+            qualify_def_name("Permalink", "endpoint"),
+            "PermalinkEndpoint"
+        );
+        assert_eq!(qualify_def_name("Permalink", "config"), "PermalinkConfig");
+        assert_eq!(
+            qualify_def_name("CatalogLookup", "lookup_variant"),
+            "LookupVariant"
+        );
+        assert_eq!(
+            qualify_def_name("Profile", "jwk_public_key"),
+            "JwkPublicKey"
+        );
+        assert_eq!(
+            qualify_def_name("CatalogSearch", "search_request"),
+            "CatalogSearchRequest"
+        );
+        assert_eq!(
+            qualify_def_name("OrderManage", "cancel_request"),
+            "OrderCancelRequest"
+        );
+    }
+
+    #[test]
+    fn qualify_container_op_name_handles_shared_and_distinct_prefixes() {
+        assert_eq!(
+            qualify_container_op_name("CatalogSearch", "search_request"),
+            "CatalogSearchRequest"
+        );
+        assert_eq!(
+            qualify_container_op_name("CatalogSearch", "search_response"),
+            "CatalogSearchResponse"
+        );
+        assert_eq!(
+            qualify_container_op_name("CatalogLookup", "lookup_request"),
+            "CatalogLookupRequest"
+        );
+        assert_eq!(
+            qualify_container_op_name("CatalogLookup", "get_product_request"),
+            "CatalogGetProductRequest"
+        );
+        assert_eq!(
+            qualify_container_op_name("CatalogLookup", "get_product_response"),
+            "CatalogGetProductResponse"
+        );
+        assert_eq!(
+            qualify_container_op_name("LocationSearch", "location_search_request"),
+            "LocationSearchRequest"
+        );
+        assert_eq!(
+            qualify_container_op_name("LocationSearch", "search_request"),
+            "LocationSearchRequest"
+        );
+    }
+
+    #[test]
+    fn ref_to_def_name_resolves_self_internal_and_external_refs() {
+        assert_eq!(
+            ref_to_def_name("#", Some("PaymentInstrument")),
+            "PaymentInstrument"
+        );
+        assert_eq!(
+            ref_to_def_name("#/", Some("PaymentInstrument")),
+            "PaymentInstrument"
+        );
+        assert_eq!(ref_to_def_name("#/", None), "Self");
+        assert_eq!(
+            ref_to_def_name("#/$defs/base", Some("Profile")),
+            "ProfileBase"
+        );
+        assert_eq!(
+            ref_to_def_name("#/$defs/Quantity", Some("Checkout")),
+            "Quantity"
+        );
+        assert_eq!(
+            ref_to_def_name("#/$defs/jwk_public_key", Some("Profile")),
+            "JwkPublicKey"
+        );
+        assert_eq!(
+            ref_to_def_name("../capability.json#/$defs/platform_schema", Some("Order")),
+            "CapabilityPlatformSchema"
+        );
+        assert_eq!(
+            ref_to_def_name(
+                "../common/types/pagination.json#/$defs/request",
+                Some("CatalogSearch")
+            ),
+            "PaginationRequest"
+        );
+        assert_eq!(
+            ref_to_def_name(
+                "catalog_lookup.json#/$defs/get_product_response",
+                Some("Fulfillment")
+            ),
+            "CatalogGetProductResponse"
+        );
+        assert_eq!(
+            ref_to_def_name("types/line_item.json", Some("Checkout")),
+            "LineItem"
+        );
+        assert_eq!(
+            ref_to_def_name(
+                "https://ucp.dev/draft/schemas/common/types/error_response.json",
+                None
+            ),
+            "ErrorResponse"
+        );
+    }
+
+    #[test]
+    fn strip_ucp_keywords_removes_annotations_and_preserves_instance_data() {
+        let mut schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "$id": "https://ucp.dev/schemas/shopping/checkout.json",
+            "name": "dev.ucp.shopping.checkout",
+            "version": "2026-01-11",
+            "requires": { "protocol": { "min": "2026-01-11" } },
+            "embedded": { "methods": {} },
+            "type": "object",
+            "x-ucp-schema-transition": { "from": "optional", "to": "omit" },
+            "required": ["id", "omitted_field"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": "omit",
+                    "ucp_response": "required",
+                    "default": {
+                        "ucp_request": "keep_inside_default",
+                        "$schema": "keep_inside_default"
+                    }
+                },
+                "name": {
+                    "type": "string"
+                },
+                "title": {
+                    "type": "string"
+                }
+            },
+            "allOf": [
+                {
+                    "title": "EC keys carry crv, x, y",
+                    "if": { "properties": { "name": { "const": "EC" } } },
+                    "then": { "required": ["id"] }
+                }
+            ]
+        });
+
+        strip_ucp_keywords(&mut schema);
+
+        assert!(schema.get("$schema").is_none());
+        assert!(schema.get("$id").is_none());
+        assert!(schema.get("name").is_none());
+        assert!(schema.get("version").is_none());
+        assert!(schema.get("requires").is_none());
+        assert!(schema.get("embedded").is_none());
+        assert!(schema.get("x-ucp-schema-transition").is_none());
+        assert_eq!(schema["required"], json!(["id"]));
+        assert!(schema["properties"]["id"].get("ucp_request").is_none());
+        assert!(schema["properties"]["id"].get("ucp_response").is_none());
+        assert_eq!(
+            schema["properties"]["id"]["default"]["ucp_request"],
+            "keep_inside_default"
+        );
+        assert!(schema["properties"].get("name").is_some());
+        assert!(schema["properties"].get("title").is_some());
+        assert!(schema["allOf"][0].get("title").is_none());
+    }
+
+    #[test]
+    fn strip_ucp_keywords_preserves_required_when_ref_present_and_removes_empty_required() {
+        let mut with_ref = json!({
+            "type": "object",
+            "allOf": [{ "allOf": [{ "$ref": "#/$defs/Base" }] }],
+            "properties": {
+                "own_field": { "type": "string" }
+            },
+            "required": ["own_field", "inherited_field"]
+        });
+        strip_ucp_keywords(&mut with_ref);
+        assert_eq!(
+            with_ref["required"],
+            json!(["own_field", "inherited_field"])
+        );
+
+        let mut with_nested_allof_props = json!({
+            "allOf": [
+                {
+                    "allOf": [
+                        { "properties": { "nested_prop": { "type": "string" } } }
+                    ]
+                }
+            ],
+            "required": ["nested_prop", "omitted_prop"],
+            "anyOf": [
+                { "required": ["eq"] },
+                { "required": ["in"] }
+            ]
+        });
+        strip_ucp_keywords(&mut with_nested_allof_props);
+        assert_eq!(with_nested_allof_props["required"], json!(["nested_prop"]));
+        assert_eq!(
+            with_nested_allof_props["anyOf"][0]["required"],
+            json!(["eq"])
+        );
+
+        let mut empty_req = json!({
+            "type": "object",
+            "properties": {},
+            "required": ["omitted_field"]
+        });
+        strip_ucp_keywords(&mut empty_req);
+        assert!(empty_req.get("required").is_none());
+
+        // Nested object schemas (inside properties and items) prune dangling required entries
+        let mut nested_dangling = json!({
+            "type": "object",
+            "properties": {
+                "child": {
+                    "type": "object",
+                    "properties": {
+                        "kept": { "type": "string" }
+                    },
+                    "required": ["kept", "omitted_child_prop"]
+                },
+                "list": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {},
+                        "required": ["all_omitted"]
+                    }
+                }
+            }
+        });
+        strip_ucp_keywords(&mut nested_dangling);
+        assert_eq!(
+            nested_dangling["properties"]["child"]["required"],
+            json!(["kept"])
+        );
+        assert!(nested_dangling["properties"]["list"]["items"]
+            .get("required")
+            .is_none());
+
+        // Nested anyOf inside allOf (ServicePlatformSchema pattern) preserves inherited required fields
+        let mut service_platform = json!({
+            "allOf": [
+                { "$ref": "#/$defs/ServiceBase" },
+                {
+                    "anyOf": [
+                        {
+                            "properties": { "transport": { "const": "rest" } },
+                            "required": ["schema"]
+                        }
+                    ]
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut service_platform);
+        assert_eq!(
+            service_platform["allOf"][1]["anyOf"][0]["required"],
+            json!(["schema"])
+        );
+
+        // Redundant "type" alongside "$ref" (MembershipReward pattern) is removed
+        let mut ref_with_type = json!({
+            "type": "object",
+            "properties": {
+                "currency": {
+                    "type": "object",
+                    "$ref": "#/$defs/RewardCurrency",
+                    "description": "Currency."
+                }
+            }
+        });
+        strip_ucp_keywords(&mut ref_with_type);
+        assert!(ref_with_type["properties"]["currency"]
+            .get("type")
+            .is_none());
+
+        // Vacuous {} property stubs in anyOf (Stay response & StayCreateRequest patterns) are pruned
+        let mut stay_resp = json!({
+            "type": "object",
+            "required": ["id", "accommodation_type", "rate_plan"],
+            "anyOf": [
+                { "properties": { "id": { "ucp_request": { "create": "required" } } } },
+                {
+                    "required": ["accommodation_type", "rate_plan"],
+                    "properties": {
+                        "accommodation_type": {
+                            "properties": { "id": { "ucp_request": { "create": "required" } } }
+                        }
+                    }
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut stay_resp);
+        assert!(stay_resp.get("anyOf").is_none());
+
+        let mut stay_req = json!({
+            "type": "object",
+            "required": ["stay_dates"],
+            "anyOf": [
+                {
+                    "properties": { "id": {} },
+                    "required": ["id"]
+                },
+                {
+                    "properties": {
+                        "accommodation_type": {
+                            "properties": { "id": {} },
+                            "required": ["id"]
+                        }
+                    },
+                    "required": ["accommodation_type"]
+                }
+            ]
+        });
+        strip_ucp_keywords(&mut stay_req);
+        assert_eq!(
+            stay_req["anyOf"],
+            json!([
+                { "required": ["id"] },
+                {
+                    "properties": {
+                        "accommodation_type": { "required": ["id"] }
+                    },
+                    "required": ["accommodation_type"]
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn rewrite_refs_to_defs_rewrites_schema_refs_and_skips_instance_data() {
+        let mut schema = json!({
+            "type": "object",
+            "allOf": [
+                { "$ref": "../capability.json#/$defs/platform_schema" },
+                { "$ref": "#/$defs/base" },
+                { "$ref": "#/$defs/jwk_public_key" }
+            ],
+            "properties": {
+                "parent": { "$ref": "#" },
+                "root_ptr": { "$ref": "#/" },
+                "item": { "$ref": "types/line_item.json" },
+                "qty": { "$ref": "types/quantity.json" },
+                "example_payload": {
+                    "type": "object",
+                    "examples": [
+                        { "$ref": "should/not/be/rewritten.json" }
+                    ],
+                    "const": { "$ref": "#" }
+                }
+            }
+        });
+
+        rewrite_refs_to_defs(&mut schema, "Profile", Some("Profile"));
+
+        assert_eq!(
+            schema["allOf"][0]["$ref"],
+            "#/$defs/CapabilityPlatformSchema"
+        );
+        assert_eq!(schema["allOf"][1]["$ref"], "#/$defs/ProfileBase");
+        assert_eq!(schema["allOf"][2]["$ref"], "#/$defs/JwkPublicKey");
+        assert_eq!(schema["properties"]["parent"]["$ref"], "#/$defs/Profile");
+        assert_eq!(schema["properties"]["root_ptr"]["$ref"], "#/$defs/Profile");
+        assert_eq!(schema["properties"]["item"]["$ref"], "#/$defs/LineItem");
+        assert_eq!(schema["properties"]["qty"]["$ref"], "#/$defs/Quantity");
+        assert_eq!(
+            schema["properties"]["example_payload"]["examples"][0]["$ref"],
+            "should/not/be/rewritten.json"
+        );
+        assert_eq!(
+            schema["properties"]["example_payload"]["const"]["$ref"],
+            "#"
+        );
+
+        // Idempotence check: running a second time preserves already-rewritten refs (including #/$defs/Quantity)
+        let once = schema.clone();
+        rewrite_refs_to_defs(&mut schema, "Profile", Some("Profile"));
+        assert_eq!(schema, once);
+    }
+
+    #[test]
+    fn normalize_def_schema_strips_rewrites_and_defaults_additional_properties() {
+        let raw_obj = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Buyer Object",
+            "name": "dev.ucp.shopping.buyer",
+            "version": "2026-01-11",
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "ucp_request": "omit" },
+                "address": { "$ref": "types/postal_address.json" }
+            }
+        });
+
+        let normalized = normalize_def_schema(&raw_obj, "Buyer", Some("Buyer"));
+        assert!(normalized.get("$schema").is_none());
+        assert!(normalized.get("name").is_none());
+        assert!(normalized.get("version").is_none());
+        assert_eq!(normalized["title"], "Buyer");
+        assert!(normalized["properties"]["id"].get("ucp_request").is_none());
+        assert_eq!(
+            normalized["properties"]["address"]["$ref"],
+            "#/$defs/PostalAddress"
+        );
+        assert_eq!(normalized["additionalProperties"], Value::Bool(true));
+
+        // Boolean additionalProperties: false is rewritten to true (root and nested)
+        // when at least one required property is present, while objects without
+        // required properties and schema-valued map additionalProperties are preserved
+        let closed_obj = json!({
+            "type": "object",
+            "required": ["code"],
+            "additionalProperties": false,
+            "properties": {
+                "code": { "type": "string" },
+                "open_at": { "type": "string", "format": "date-time", "pattern": "^\\d{4}" },
+                "endpoint": { "type": "string", "format": "uri", "pattern": "^https://" },
+                "nested_union": {
+                    "anyOf": [
+                        { "type": "object", "required": ["code"], "additionalProperties": false },
+                        { "type": "object", "required": ["open_at"], "additionalProperties": false }
+                    ]
+                }
+            }
+        });
+        let normalized_closed = normalize_def_schema(&closed_obj, "Closed", None);
+        assert_eq!(normalized_closed["title"], "Closed");
+        assert_eq!(normalized_closed["additionalProperties"], Value::Bool(true));
+        assert_eq!(
+            normalized_closed["properties"]["nested_union"]["anyOf"][0]["additionalProperties"],
+            Value::Bool(true)
+        );
+        assert!(normalized_closed["properties"]["open_at"]
+            .get("pattern")
+            .is_none());
+        assert_eq!(
+            normalized_closed["properties"]["endpoint"]["pattern"],
+            "^https://"
+        );
+
+        let strict_unrequired = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": { "eq": { "type": "string" } }
+        });
+        let normalized_strict = normalize_def_schema(&strict_unrequired, "StrictGrammar", None);
+        assert_eq!(
+            normalized_strict["additionalProperties"],
+            Value::Bool(false)
+        );
+
+        let map_obj = json!({ "type": "object", "additionalProperties": { "type": "string" } });
+        let normalized_map = normalize_def_schema(&map_obj, "StringMap", None);
+        assert_eq!(
+            normalized_map["additionalProperties"],
+            json!({ "type": "string" })
+        );
+
+        // Schema with properties but no explicit "type": "object" receives additionalProperties: true
+        let implicit_obj = json!({
+            "properties": { "name": { "type": "string" } }
+        });
+        let normalized_implicit = normalize_def_schema(&implicit_obj, "Implicit", None);
+        assert_eq!(normalized_implicit["title"], "Implicit");
+        assert_eq!(
+            normalized_implicit["additionalProperties"],
+            Value::Bool(true)
+        );
+
+        // Non-object schemas do not receive additionalProperties, but still synchronize title
+        let string_schema = json!({
+            "type": "string",
+            "enum": ["pending", "completed"]
+        });
+        let normalized_str = normalize_def_schema(&string_schema, "Status", None);
+        assert_eq!(normalized_str["title"], "Status");
+        assert!(normalized_str.get("additionalProperties").is_none());
+    }
+
+    #[test]
+    fn has_directional_annotations_and_schema_supports_complete_skip_instance_data() {
+        let plain = json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "default": {
+                        "ucp_request": { "complete": "required" }
+                    }
+                }
+            }
+        });
+        assert!(!has_directional_annotations(&plain));
+        assert!(!schema_supports_complete(&plain));
+
+        let with_req = json!({
+            "type": "object",
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": { "create": "omit", "update": "required" }
+                }
+            }
+        });
+        assert!(has_directional_annotations(&with_req));
+        assert!(!schema_supports_complete(&with_req));
+
+        let with_complete_req = json!({
+            "type": "object",
+            "properties": {
+                "payment": {
+                    "type": "string",
+                    "ucp_request": { "complete": "required" }
+                }
+            }
+        });
+        assert!(has_directional_annotations(&with_complete_req));
+        assert!(schema_supports_complete(&with_complete_req));
+
+        let response_only_order = json!({
+            "type": "object",
+            "properties": {
+                "ucp": { "$ref": "../ucp.json#/$defs/response_order_schema" },
+                "currency": { "type": "string", "ucp_request": "omit" }
+            }
+        });
+        assert!(!has_directional_annotations(&response_only_order));
+    }
+
+    #[test]
+    fn slice_directional_schemas_emits_request_and_response_slices_and_omits_empty_requests() {
+        let checkout_schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "title": "Checkout",
+            "description": "Checkout session.",
+            "type": "object",
+            "required": ["id", "line_items"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": {
+                        "create": "omit",
+                        "update": "required",
+                        "complete": "omit"
+                    }
+                },
+                "line_items": {
+                    "type": "array",
+                    "items": { "$ref": "types/line_item.json" },
+                    "ucp_request": {
+                        "create": "required",
+                        "update": "optional",
+                        "complete": "omit"
+                    }
+                },
+                "payment_token": {
+                    "type": "string",
+                    "ucp_request": {
+                        "create": "omit",
+                        "update": "omit",
+                        "complete": "required"
+                    },
+                    "ucp_response": "omit"
+                }
+            }
+        });
+
+        let slices = slice_directional_schemas(&checkout_schema, "Checkout").unwrap();
+        let names: Vec<&str> = slices.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "CheckoutCreateRequest",
+                "CheckoutUpdateRequest",
+                "CheckoutCompleteRequest",
+                "Checkout"
+            ]
+        );
+
+        let create_slice = &slices[0].1;
+        assert_eq!(create_slice["title"], "CheckoutCreateRequest");
+        assert_eq!(
+            create_slice["description"],
+            "Request payload to create a new Checkout. Checkout session."
+        );
+        assert!(create_slice["properties"].get("id").is_none());
+        assert_eq!(
+            create_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItem"
+        );
+        assert_eq!(create_slice["required"], json!(["line_items"]));
+        assert_eq!(create_slice["additionalProperties"], Value::Bool(true));
+
+        let update_slice = &slices[1].1;
+        assert_eq!(update_slice["title"], "CheckoutUpdateRequest");
+        assert_eq!(
+            update_slice["description"],
+            "Request payload to update an existing Checkout. Checkout session."
+        );
+        assert_eq!(update_slice["required"], json!(["id"]));
+
+        let complete_slice = &slices[2].1;
+        assert_eq!(complete_slice["title"], "CheckoutCompleteRequest");
+        assert_eq!(
+            complete_slice["description"],
+            "Request payload to complete a Checkout. Checkout session."
+        );
+        assert_eq!(complete_slice["required"], json!(["payment_token"]));
+
+        let resp_slice = &slices[3].1;
+        assert_eq!(resp_slice["title"], "Checkout");
+        assert_eq!(resp_slice["description"], "Checkout session.");
+        assert!(resp_slice["properties"].get("payment_token").is_none());
+        assert_eq!(resp_slice["required"], json!(["id", "line_items"]));
+
+        // Schema where all properties are omitted on requests omits request slices
+        let response_only = json!({
+            "title": "Adjustment",
+            "type": "object",
+            "required": ["id"],
+            "properties": {
+                "id": {
+                    "type": "string",
+                    "ucp_request": "omit"
+                }
+            }
+        });
+        let ro_slices = slice_directional_schemas(&response_only, "Adjustment").unwrap();
+        assert_eq!(ro_slices.len(), 1);
+        assert_eq!(ro_slices[0].0, "Adjustment");
+
+        // Schema with all properties omitted and only if/then validation in allOf omits request slices
+        let total_like = json!({
+            "title": "Total",
+            "type": "object",
+            "required": ["type", "amount"],
+            "properties": {
+                "type": { "type": "string", "ucp_request": "omit" },
+                "amount": { "type": "integer", "ucp_request": "omit" }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "discount" } } },
+                    "then": { "properties": { "amount": { "exclusiveMaximum": 0 } } }
+                }
+            ]
+        });
+        let total_slices = slice_directional_schemas(&total_like, "Total").unwrap();
+        assert_eq!(total_slices.len(), 1);
+        assert_eq!(total_slices[0].0, "Total");
+
+        // Array schema with only contains validation in allOf omits request slices
+        let totals_like = json!({
+            "title": "Totals",
+            "type": "array",
+            "items": {
+                "allOf": [
+                    { "$ref": "total.json" },
+                    {
+                        "type": "object",
+                        "properties": {
+                            "type": { "ucp_request": "omit" }
+                        }
+                    }
+                ]
+            },
+            "allOf": [
+                { "contains": { "properties": { "type": { "const": "total" } } } }
+            ]
+        });
+        let totals_slices = slice_directional_schemas(&totals_like, "Totals").unwrap();
+        assert_eq!(totals_slices.len(), 1);
+        assert_eq!(totals_slices[0].0, "Totals");
+
+        // Schema without description receives default request description without trailing space,
+        // and internal #/$defs/base is qualified with base_name ("ItemBase"), not slice_name
+        let no_desc = json!({
+            "type": "object",
+            "properties": {
+                "base_info": {
+                    "$ref": "#/$defs/base",
+                    "ucp_request": { "create": "required", "update": "omit" }
+                }
+            }
+        });
+        let nd_slices = slice_directional_schemas(&no_desc, "Item").unwrap();
+        assert_eq!(
+            nd_slices[0].1["description"],
+            "Request payload to create a new Item."
+        );
+        assert_eq!(
+            nd_slices[0].1["properties"]["base_info"]["$ref"],
+            "#/$defs/ItemBase"
+        );
+    }
+
+    #[test]
+    fn align_directional_refs_rewrites_known_targets_and_falls_back_to_base_type() {
+        let known_defs: BTreeSet<String> = [
+            "LineItem",
+            "LineItemCreateRequest",
+            "LineItemUpdateRequest",
+            "Fulfillment",
+            "FulfillmentCreateRequest",
+            "FulfillmentUpdateRequest",
+            "FulfillmentCompleteRequest",
+            "Money",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+
+        let base_slice = json!({
+            "type": "object",
+            "properties": {
+                "line_items": {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/LineItem" }
+                },
+                "fulfillment": { "$ref": "#/$defs/Fulfillment" },
+                "total": { "$ref": "#/$defs/Money" },
+                "example": {
+                    "type": "object",
+                    "default": { "$ref": "#/$defs/LineItem" }
+                }
+            }
+        });
+
+        let mut create_slice = base_slice.clone();
+        align_directional_refs(&mut create_slice, "CreateRequest", &known_defs);
+        assert_eq!(
+            create_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItemCreateRequest"
+        );
+        assert_eq!(
+            create_slice["properties"]["fulfillment"]["$ref"],
+            "#/$defs/FulfillmentCreateRequest"
+        );
+        assert_eq!(create_slice["properties"]["total"]["$ref"], "#/$defs/Money");
+        assert_eq!(
+            create_slice["properties"]["example"]["default"]["$ref"],
+            "#/$defs/LineItem"
+        );
+
+        let mut complete_slice = base_slice;
+        align_directional_refs(&mut complete_slice, "CompleteRequest", &known_defs);
+        // LineItem has no CompleteRequest, so it falls back to the base LineItem type
+        assert_eq!(
+            complete_slice["properties"]["line_items"]["items"]["$ref"],
+            "#/$defs/LineItem"
+        );
+        // Fulfillment has FulfillmentCompleteRequest, so it uses the direct match
+        assert_eq!(
+            complete_slice["properties"]["fulfillment"]["$ref"],
+            "#/$defs/FulfillmentCompleteRequest"
+        );
+        assert_eq!(
+            complete_slice["properties"]["total"]["$ref"],
+            "#/$defs/Money"
+        );
+    }
+
+    #[test]
+    fn distribute_properties_in_bare_anyof_preserves_ref_isolation_and_parent_refs() {
+        let mut stay_req = json!({
+            "type": "object",
+            "required": ["stay_dates"],
+            "allOf": [{ "$ref": "#/$defs/AccommodationContext" }],
+            "properties": {
+                "id": { "type": "string" },
+                "stay_dates": { "$ref": "#/$defs/DateInterval" },
+                "accommodation_type": { "$ref": "#/$defs/AccommodationTypeCreateRequest" },
+                "rate_plan": { "$ref": "#/$defs/RatePlanCreateRequest" }
+            },
+            "anyOf": [
+                { "required": ["id"] },
+                {
+                    "required": ["accommodation_type", "rate_plan"],
+                    "properties": {
+                        "accommodation_type": { "required": ["id"] },
+                        "rate_plan": { "required": ["id"] }
+                    }
+                }
+            ]
+        });
+
+        distribute_properties_in_bare_anyof(&mut stay_req);
+
+        assert!(stay_req.get("properties").is_none());
+        assert!(stay_req.get("type").is_none());
+        assert!(stay_req.get("allOf").is_none());
+
+        let b0 = &stay_req["anyOf"][0];
+        assert_eq!(b0["type"], "object");
+        assert_eq!(b0["required"], json!(["stay_dates", "id"]));
+        assert_eq!(
+            b0["allOf"],
+            json!([{ "$ref": "#/$defs/AccommodationContext" }])
+        );
+
+        let b1 = &stay_req["anyOf"][1];
+        assert_eq!(
+            b1["required"],
+            json!(["stay_dates", "accommodation_type", "rate_plan"])
+        );
+        // Base $ref property is kept isolated without sibling "required" keys (invariant C6)
+        assert_eq!(
+            b1["properties"]["accommodation_type"],
+            json!({ "$ref": "#/$defs/AccommodationTypeCreateRequest" })
+        );
+    }
+
+    #[test]
+    fn normalize_scalar_or_array_unions_and_attach_const_defaults_handle_guards() {
+        let mut schema = json!({
+            "type": "object",
+            "properties": {
+                "extends": {
+                    "oneOf": [
+                        { "$ref": "#/$defs/ReverseDomainName" },
+                        {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/ReverseDomainName" },
+                            "minItems": 1
+                        }
+                    ],
+                    "description": "Parent capabilities."
+                },
+                "status": { "const": "success" },
+                "retry_count": { "const": 3 },
+                "ratio": { "const": 1.5 },
+                "const": {},
+                "enum": { "type": "array" },
+                "open_type": {
+                    "type": "string",
+                    "not": { "enum": ["only_one"] }
+                }
+            },
+            "allOf": [
+                {
+                    "if": { "properties": { "status": { "const": "error" } } },
+                    "then": { "properties": { "code": { "const": 400 } } }
+                }
+            ]
+        });
+
+        normalize_scalar_or_array_unions(&mut schema);
+        attach_const_defaults(&mut schema);
+
+        assert!(schema["properties"]["extends"].get("oneOf").is_none());
+        assert_eq!(
+            schema["properties"]["extends"]["anyOf"],
+            json!([
+                { "$ref": "#/$defs/ReverseDomainName" },
+                {
+                    "type": "array",
+                    "items": { "$ref": "#/$defs/ReverseDomainName" },
+                    "minItems": 1
+                }
+            ])
+        );
+
+        assert_eq!(
+            schema["properties"]["status"],
+            json!({ "type": "string", "const": "success", "default": "success" })
+        );
+        assert_eq!(
+            schema["properties"]["retry_count"],
+            json!({ "type": "integer", "const": 3, "default": 3 })
+        );
+        assert_eq!(
+            schema["properties"]["ratio"],
+            json!({ "type": "number", "const": 1.5, "default": 1.5 })
+        );
+        assert_eq!(schema["properties"]["const"], json!({}));
+        assert!(schema["properties"]["open_type"]["not"]
+            .get("default")
+            .is_none());
+        assert!(schema["allOf"][0]["if"]["properties"]["status"]
+            .get("default")
+            .is_none());
+        assert!(schema["allOf"][0]["then"]["properties"]["code"]
+            .get("default")
+            .is_none());
+    }
+
+    #[test]
+    fn flatten_object_allof_flattens_inheritance_and_array_items_while_preserving_if_then() {
+        let mut defs = BTreeMap::from([
+            (
+                "Total".to_string(),
+                json!({
+                    "title": "Total",
+                    "type": "object",
+                    "required": ["type", "amount"],
+                    "properties": {
+                        "type": { "type": "string" },
+                        "amount": { "$ref": "#/$defs/SignedAmount" }
+                    },
+                    "allOf": [
+                        {
+                            "if": { "properties": { "type": { "const": "discount" } } },
+                            "then": { "properties": { "amount": { "exclusiveMaximum": 0 } } }
+                        }
+                    ],
+                    "additionalProperties": true
+                }),
+            ),
+            (
+                "Totals".to_string(),
+                json!({
+                    "title": "Totals",
+                    "type": "array",
+                    "items": {
+                        "allOf": [
+                            { "$ref": "#/$defs/Total" },
+                            {
+                                "type": "object",
+                                "properties": { "lines": { "type": "array" } }
+                            }
+                        ]
+                    },
+                    "allOf": [
+                        { "contains": { "properties": { "type": { "const": "total" } } } }
+                    ]
+                }),
+            ),
+            (
+                "UnionParent".to_string(),
+                json!({
+                    "title": "UnionParent",
+                    "type": "object",
+                    "properties": { "type": { "type": "string" } },
+                    "allOf": [
+                        {
+                            "if": { "properties": { "type": { "const": "a" } } },
+                            "then": { "$ref": "#/$defs/VariantA" }
+                        }
+                    ]
+                }),
+            ),
+            (
+                "SubtypeChild".to_string(),
+                json!({
+                    "title": "SubtypeChild",
+                    "allOf": [
+                        { "$ref": "#/$defs/UnionParent" },
+                        {
+                            "type": "object",
+                            "required": ["code"],
+                            "properties": { "code": { "type": "string" } }
+                        }
+                    ]
+                }),
+            ),
+            (
+                "Location".to_string(),
+                json!({
+                    "title": "Location",
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" },
+                        "latitude": { "type": "number" },
+                        "longitude": { "type": "number" }
+                    },
+                    "if": {
+                        "anyOf": [
+                            { "required": ["latitude"] },
+                            { "required": ["longitude"] }
+                        ]
+                    },
+                    "then": {
+                        "required": ["latitude", "longitude"]
+                    }
+                }),
+            ),
+            (
+                "LookupLocation".to_string(),
+                json!({
+                    "title": "LookupLocation",
+                    "allOf": [
+                        { "$ref": "#/$defs/Location" },
+                        { "required": ["name"] }
+                    ]
+                }),
+            ),
+        ]);
+
+        flatten_object_allof(&mut defs);
+
+        assert!(defs["Totals"].get("allOf").is_none());
+        assert_eq!(defs["Totals"]["items"]["type"], "object");
+        assert!(defs["Totals"]["items"]["properties"]
+            .get("amount")
+            .is_some());
+        assert!(defs["Totals"]["items"]["properties"].get("lines").is_some());
+        assert_eq!(
+            defs["Totals"]["items"]["allOf"].as_array().unwrap().len(),
+            1
+        );
+
+        // UnionParent has then.$ref, so SubtypeChild keeps $ref to UnionParent in allOf while inline branch flattens
+        assert_eq!(
+            defs["SubtypeChild"]["allOf"],
+            json!([{ "$ref": "#/$defs/UnionParent" }])
+        );
+        assert_eq!(
+            defs["SubtypeChild"]["properties"]["code"],
+            json!({ "type": "string" })
+        );
+
+        // Presence-only if/then on Location becomes dependentRequired and propagates to LookupLocation
+        assert!(defs["Location"].get("if").is_none());
+        assert!(defs["Location"].get("then").is_none());
+        assert_eq!(
+            defs["Location"]["dependentRequired"],
+            json!({
+                "latitude": ["longitude"],
+                "longitude": ["latitude"]
+            })
+        );
+        assert_eq!(
+            defs["LookupLocation"]["dependentRequired"],
+            json!({
+                "latitude": ["longitude"],
+                "longitude": ["latitude"]
+            })
+        );
+
+        // Verify singularize_pascal exclusions and silent-'e' -ses plurals
+        assert_eq!(singularize_pascal("Series"), "Series");
+        assert_eq!(singularize_pascal("TimeSeries"), "TimeSeries");
+        assert_eq!(singularize_pascal("Species"), "Species");
+        assert_eq!(singularize_pascal("Address"), "Address");
+        assert_eq!(singularize_pascal("Addresses"), "Address");
+        assert_eq!(singularize_pascal("Statuses"), "Status");
+        assert_eq!(singularize_pascal("Purchases"), "Purchase");
+        assert_eq!(singularize_pascal("Releases"), "Release");
+        assert_eq!(singularize_pascal("Licenses"), "License");
+        assert_eq!(singularize_pascal("Cases"), "Case");
+        assert_eq!(singularize_pascal("Categories"), "Category");
+        assert_eq!(singularize_pascal("LineItems"), "LineItem");
+
+        // Verify root-level `if` with properties/ref is kept by `is_non_empty_request_slice`,
+        // while pure `if`/`then` or `contains` constraints return false
+        assert!(is_non_empty_request_slice(&json!({
+            "allOf": [{ "$ref": "#/$defs/LocationSummaryCreateRequest" }],
+            "if": { "required": ["hours"] },
+            "then": { "required": ["timezone"] }
+        })));
+        assert!(!is_non_empty_request_slice(&json!({
+            "allOf": [
+                {
+                    "if": { "properties": { "type": { "const": "discount" } } },
+                    "then": { "properties": { "amount": { "exclusiveMaximum": 0 } } }
+                }
+            ]
+        })));
+
+        // Verify inline `not` branch in `allOf` is preserved by `flatten_object_allof`
+        let mut with_not = BTreeMap::from([(
+            "MutuallyExclusive".to_string(),
+            json!({
+                "title": "MutuallyExclusive",
+                "allOf": [
+                    {
+                        "type": "object",
+                        "properties": { "a": { "type": "string" }, "b": { "type": "string" } }
+                    },
+                    { "not": { "required": ["a", "b"] } }
+                ]
+            }),
+        )]);
+        flatten_object_allof(&mut with_not);
+        assert_eq!(
+            with_not["MutuallyExclusive"]["allOf"],
+            json!([{ "not": { "required": ["a", "b"] } }])
+        );
+
+        // Verify `qualify_inline_object_titles` avoids duplicate branch titles using `used_titles`
+        let mut multi_branch = BTreeMap::from([(
+            "Selector".to_string(),
+            json!({
+                "title": "Selector",
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["id", "alpha"],
+                        "properties": { "id": { "type": "string" }, "alpha": { "type": "string" } }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["id", "beta"],
+                        "properties": { "id": { "type": "string" }, "beta": { "type": "string" } }
+                    },
+                    {
+                        "type": "object",
+                        "required": ["code"],
+                        "properties": { "code": { "type": "string" } }
+                    }
+                ]
+            }),
+        )]);
+        qualify_inline_object_titles(&mut multi_branch);
+        assert_eq!(multi_branch["Selector"]["anyOf"][0]["title"], "SelectorId");
+        assert_eq!(
+            multi_branch["Selector"]["anyOf"][1]["title"],
+            "SelectorBeta"
+        );
+        assert_eq!(
+            multi_branch["Selector"]["anyOf"][2]["title"],
+            "SelectorCode"
+        );
+    }
+}
