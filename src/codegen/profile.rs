@@ -8,7 +8,8 @@ use serde_json::Value;
 use url::Url;
 
 use crate::codegen::reachability::{
-    collect_active_external_refs, compute_inactive_local_defs, normalize_lexical_path, LoadedSchema,
+    collect_active_external_refs, compute_inactive_local_defs, normalize_lexical_path,
+    referenced_def_key, select_extension_contributions, LoadedSchema,
 };
 use crate::codegen::CodegenError;
 use crate::compose::{extract_capabilities, verify_bindings, Capability, SchemaBaseConfig};
@@ -159,6 +160,9 @@ impl ProfileCrawler {
         self.record_local_schema_root(&canonical, &schema, resolved_owner.as_deref(), version);
         let idx = self.items.len();
         let mut item = LoadedSchema::from_file(&canonical, schema);
+        if item.is_extension {
+            item.selected_extension_defs = Some(BTreeMap::new());
+        }
         item.owner_namespace = resolved_owner;
         self.items.push(item);
         self.sources.push(canonical.clone());
@@ -304,6 +308,8 @@ pub(crate) fn load_and_compute_profile_closure(
         }
     }
 
+    select_extension_contributions(&mut crawler.items, &raw_active_caps, &raw_active_exts)?;
+
     let mut seeded_ucp_indices = BTreeSet::new();
     while let Some(idx) = crawler.queue.pop_front() {
         let base_source = crawler.sources[idx].clone();
@@ -349,6 +355,13 @@ pub(crate) fn load_and_compute_profile_closure(
                 target_owner.as_deref(),
                 target_version.as_deref(),
             )?;
+            if referenced_def_key(&ref_str).is_some_and(|key| {
+                crawler.items[target_idx]
+                    .referenced_local_defs
+                    .insert(key.to_string())
+            }) {
+                crawler.queue.push_back(target_idx);
+            }
             if is_url(file_part) {
                 crawler.items[target_idx]
                     .resolved_urls

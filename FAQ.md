@@ -97,7 +97,7 @@ Sending `{ "name": "foo", "id": "123" }` for a request fails. The `id` field was
 
 ## How do I write an extension schema?
 
-**Extensions must define their additions in `$defs[root_capability_name]`.** Composition happens at validation time. Each extension owns its additions but references the base it extends.
+**Direct extensions normally define their additions in `$defs[root_capability_name]`; transitive extensions may key on their declared parent.** Composition happens at validation time. Each extension owns its additions but references the base it extends.
 
 If `dev.ucp.shopping.checkout` is the root capability, your extension schema should look like:
 
@@ -130,6 +130,8 @@ The validator:
 An extension of an extension (for example, one that extends `dev.ucp.shopping.catalog.feed`, which itself extends `dev.ucp.common.feed`) may key its additions on the parent it extends rather than the root. The additions are still composed onto the root, so they use the root's shape: for a container root, the operation or shape keys the root defines. The root key always wins when present. Without it, exactly one active declared parent may have an entry: inactive parents are ignored, and entries for two or more active parents are rejected as ambiguous regardless of declaration order, so add a root-keyed entry to choose the contribution.
 
 If the capability is a **container** (see below), repeat the base's operation keys instead: `$defs[root_name]` is itself `{ "$defs": { "<op>_<direction>": ... } }`, and the tool merges one shape at a time.
+
+`generate-types` applies the same root-first, unambiguous active-parent selection to extensions of extensions. Select the parent as well as the child: it is not activated by a schema file or `$ref`. Profiles use declared `extends` edges; directory mode infers them from reverse-domain `$defs` keys. This selection also scopes helper/external-ref crawling, so an overridden parent entry cannot leak its helper types into the SDK bundle. See [Static Type Generation](./README.md#static-type-generation) for multi-root and named-container guidance.
 
 ---
 

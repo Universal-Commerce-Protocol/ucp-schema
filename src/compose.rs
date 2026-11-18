@@ -536,14 +536,23 @@ pub fn compose_schema(
                 expected_key: root.name.clone(),
             })?;
 
-        let ext_def = select_extension_def(ext, defs, &root.name, &cap_map)?;
+        let (selected_key, ext_def) = select_extension_def(
+            &ext.name,
+            defs,
+            &root.name,
+            ext.extends
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .filter(|parent| cap_map.contains_key(parent)),
+        )?;
 
         // Anchor any root-local refs the bundler retained (recursion), so the
         // extracted def stays correct outside its source document.
         let mut inlined = ext_def.clone();
         anchor_extracted_def(&mut inlined, &ext_schema, &ext.name)?;
 
-        ext_defs.push(inlined);
+        ext_defs.push((selected_key, inlined));
     }
 
     // Composition follows the same single-object vs container split: a
@@ -551,9 +560,10 @@ pub fn compose_schema(
     // per operation shape. Both use `allOf`, and in both the base is included
     // because each extension re-`$ref`s it.
     if container {
-        compose_container(&root_schema, &extensions, &ext_defs, &root.name)
+        compose_container(&root_schema, &extensions, &ext_defs)
     } else {
-        Ok(json!({ "allOf": ext_defs }))
+        let contributions: Vec<Value> = ext_defs.into_iter().map(|(_, def)| def).collect();
+        Ok(json!({ "allOf": contributions }))
     }
 }
 
@@ -598,8 +608,7 @@ pub fn is_container_schema(schema: &Value) -> bool {
 fn compose_container(
     root_schema: &Value,
     extensions: &[&Capability],
-    ext_defs: &[Value],
-    capability: &str,
+    ext_defs: &[(String, Value)],
 ) -> Result<Value, ComposeError> {
     // Seed with the base container's $defs (operation shapes + helper defs).
     let mut merged_defs: serde_json::Map<String, Value> = root_schema
@@ -612,15 +621,15 @@ fn compose_container(
     let mut order: Vec<String> = Vec::new();
     let mut per_op: HashMap<String, Vec<Value>> = HashMap::new();
 
-    for (ext, inlined) in extensions.iter().zip(ext_defs.iter()) {
-        // A container extension's $defs[<capability>] must itself be a container:
+    for (ext, (selected_key, inlined)) in extensions.iter().zip(ext_defs.iter()) {
+        // A container extension's selected $defs entry must itself be a container:
         // { "$defs": { "<op>_<direction>": <shape>, ... } } mirroring the base.
         let nested = inlined
             .get("$defs")
             .and_then(|d| d.as_object())
             .ok_or_else(|| ComposeError::ContainerExtensionShape {
                 extension: ext.name.clone(),
-                capability: capability.to_string(),
+                capability: selected_key.clone(),
             })?;
 
         for (op_key, shape) in nested {
@@ -660,33 +669,35 @@ fn compose_container(
 /// its contribution on a declared parent, but only when exactly one active
 /// declared parent has an entry; inactive parents are ignored. Entries for two
 /// or more active parents are ambiguous and rejected regardless of declaration
-/// order, so the author must supply a root-keyed entry to choose.
-fn select_extension_def<'a>(
-    ext: &Capability,
+/// order, so the author must supply a root-keyed entry to choose. Returns that
+/// selected key alongside its schema, so diagnostics identify the actual entry.
+/// Callers supply only parents in their active capability set.
+pub(crate) fn select_extension_def<'a>(
+    extension_name: &str,
     defs: &'a Value,
     root_name: &str,
-    cap_map: &HashMap<&str, &Capability>,
-) -> Result<&'a Value, ComposeError> {
+    active_parents: impl IntoIterator<Item = &'a str>,
+) -> Result<(String, &'a Value), ComposeError> {
     if let Some(def) = defs.get(root_name) {
-        return Ok(def);
+        return Ok((root_name.to_string(), def));
     }
 
-    let parents: BTreeSet<&str> = ext
-        .extends
-        .iter()
-        .flatten()
-        .map(String::as_str)
-        .filter(|parent| cap_map.contains_key(parent) && defs.get(*parent).is_some())
+    let parents: BTreeSet<&str> = active_parents
+        .into_iter()
+        .filter(|parent| defs.get(*parent).is_some())
         .collect();
 
     match parents.len() {
         0 => Err(ComposeError::MissingDefEntry {
-            extension: ext.name.clone(),
+            extension: extension_name.to_string(),
             expected_key: root_name.to_string(),
         }),
-        1 => Ok(&defs[parents.into_iter().next().unwrap()]),
+        1 => {
+            let parent = parents.into_iter().next().unwrap();
+            Ok((parent.to_string(), &defs[parent]))
+        }
         _ => Err(ComposeError::AmbiguousParentDefs {
-            extension: ext.name.clone(),
+            extension: extension_name.to_string(),
             root: root_name.to_string(),
             parents: parents.into_iter().collect::<Vec<_>>().join(", "),
         }),

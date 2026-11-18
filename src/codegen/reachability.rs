@@ -29,6 +29,13 @@ pub(crate) struct LoadedSchema {
     pub owner_namespace: Option<String>,
     pub resolved_urls: BTreeSet<String>,
     pub declared_extends: Option<BTreeSet<String>>,
+    /// Stage 1 selection shared by the crawl, hoisting and composition. Maps each
+    /// reachable active SDK root to its selected contribution key in this file.
+    pub selected_extension_defs: Option<BTreeMap<String, String>>,
+    /// Stage 2 names for original and extension-introduced container shapes.
+    pub container_def_names: BTreeMap<String, String>,
+    /// Explicit external fragment dependencies, independent of graph activation.
+    pub referenced_local_defs: BTreeSet<String>,
     pub is_extension: bool,
     pub is_container: bool,
     pub is_capability: bool,
@@ -72,6 +79,9 @@ impl LoadedSchema {
             owner_namespace: None,
             resolved_urls: BTreeSet::new(),
             declared_extends: None,
+            selected_extension_defs: None,
+            container_def_names: BTreeMap::new(),
+            referenced_local_defs: BTreeSet::new(),
             is_extension,
             is_container,
             is_capability,
@@ -85,6 +95,150 @@ impl LoadedSchema {
             .as_ref()
             .is_none_or(|ext| ext.contains(cap_name))
     }
+
+    /// Profiles declare graph edges explicitly. Directory mode infers edges
+    /// from contribution keys, never from a referenced file or an inactive item.
+    fn parent_names(&self) -> BTreeSet<&str> {
+        if let Some(parents) = &self.declared_extends {
+            return parents.iter().map(String::as_str).collect();
+        }
+        self.schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|defs| defs.keys())
+            .filter(|key| is_reverse_domain_name(key) && self.name.as_deref() != Some(key.as_str()))
+            .map(String::as_str)
+            .collect()
+    }
+}
+
+/// Resolve the active extension graph once, before examining any contribution
+/// refs. The fixed point supports multiple SDK roots and cycles with a root
+/// exit, but cannot connect an extension through a schema merely loaded by $ref.
+pub(super) fn select_extension_contributions(
+    loaded: &mut [LoadedSchema],
+    active_caps: &BTreeSet<usize>,
+    active_exts: &BTreeSet<usize>,
+) -> Result<(), CodegenError> {
+    let active_by_name: BTreeMap<&str, usize> = active_caps
+        .union(active_exts)
+        .filter_map(|&idx| loaded[idx].name.as_deref().map(|name| (name, idx)))
+        .collect();
+    let parents: BTreeMap<usize, BTreeSet<&str>> = active_exts
+        .iter()
+        .map(|&idx| {
+            (
+                idx,
+                loaded[idx]
+                    .parent_names()
+                    .into_iter()
+                    .filter(|name| active_by_name.contains_key(name))
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut roots_by_item: BTreeMap<usize, BTreeSet<&str>> = active_caps
+        .iter()
+        .map(|&idx| (idx, loaded[idx].name.as_deref().into_iter().collect()))
+        .collect();
+    loop {
+        let mut changed = false;
+        for (&idx, names) in &parents {
+            let roots: BTreeSet<&str> = names
+                .iter()
+                .filter_map(|name| active_by_name.get(name))
+                .filter_map(|parent| roots_by_item.get(parent))
+                .flatten()
+                .copied()
+                .collect();
+            let entry = roots_by_item.entry(idx).or_default();
+            let before = entry.len();
+            entry.extend(roots);
+            changed |= before != entry.len();
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut selections = BTreeMap::new();
+    for &idx in active_exts {
+        let item = &loaded[idx];
+        let extension_parents: BTreeSet<&str> = parents[&idx]
+            .iter()
+            .copied()
+            .filter(|parent| active_exts.contains(&active_by_name[parent]))
+            .collect();
+        let mut by_root = BTreeMap::new();
+        for &root in roots_by_item.get(&idx).into_iter().flatten() {
+            let defs = item.schema.get("$defs").unwrap_or(&Value::Null);
+            // A multi-root SDK may declare a direct extension for several roots
+            // but supply only some root entries. Preserve that legacy sparse
+            // behavior; another SDK root is never a transitive parent fallback.
+            if defs.get(root).is_none() && extension_parents.is_empty() {
+                continue;
+            }
+            let (key, _) = crate::compose::select_extension_def(
+                item.name.as_deref().unwrap_or(&item.stem),
+                defs,
+                root,
+                extension_parents.iter().copied(),
+            )?;
+            by_root.insert(root.to_string(), key);
+        }
+        selections.insert(idx, by_root);
+    }
+    // Even a referenced, inactive extension must not acquire active graph edges.
+    for (idx, item) in loaded.iter_mut().enumerate() {
+        if item.is_extension {
+            item.selected_extension_defs = Some(selections.remove(&idx).unwrap_or_default());
+        }
+    }
+    Ok(())
+}
+
+/// Deterministic parent-before-child order for a particular root. A cycle's
+/// back-edge is ignored; every connected active extension is merged once.
+pub(super) fn ordered_extensions<'a>(
+    loaded: &'a [LoadedSchema],
+    active_exts: &BTreeSet<usize>,
+    root: &str,
+) -> Vec<(usize, &'a str)> {
+    let eligible: BTreeMap<&str, usize> = active_exts
+        .iter()
+        .filter_map(|&idx| {
+            let item = &loaded[idx];
+            item.selected_extension_defs.as_ref()?.get(root)?;
+            Some((item.name.as_deref().unwrap_or(&item.stem), idx))
+        })
+        .collect();
+    fn visit<'a>(
+        idx: usize,
+        loaded: &'a [LoadedSchema],
+        eligible: &BTreeMap<&str, usize>,
+        root: &str,
+        visited: &mut BTreeSet<usize>,
+        out: &mut Vec<(usize, &'a str)>,
+    ) {
+        if !visited.insert(idx) {
+            return;
+        }
+        for parent in loaded[idx].parent_names() {
+            if let Some(&parent_idx) = eligible.get(parent) {
+                visit(parent_idx, loaded, eligible, root, visited, out);
+            }
+        }
+        let key = &loaded[idx].selected_extension_defs.as_ref().unwrap()[root];
+        out.push((idx, key.as_str()));
+    }
+    let mut visited = BTreeSet::new();
+    let mut out = Vec::new();
+    for &idx in active_exts {
+        if eligible.values().any(|&eligible_idx| eligible_idx == idx) {
+            visit(idx, loaded, &eligible, root, &mut visited, &mut out);
+        }
+    }
+    out
 }
 
 pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, CodegenError> {
@@ -170,16 +324,12 @@ pub(super) fn select_active_schemas(
 }
 
 pub(super) fn compute_reachable_closure(
-    loaded: &[LoadedSchema],
+    loaded: &mut [LoadedSchema],
     active_caps: &BTreeSet<usize>,
     active_exts: &BTreeSet<usize>,
     active_capabilities: &BTreeSet<String>,
     include_all: bool,
 ) -> BTreeSet<usize> {
-    if include_all {
-        return (0..loaded.len()).collect();
-    }
-
     let path_to_idx: BTreeMap<PathBuf, usize> = loaded
         .iter()
         .enumerate()
@@ -192,7 +342,7 @@ pub(super) fn compute_reachable_closure(
     for (idx, item) in loaded.iter().enumerate() {
         let is_ambient = AMBIENT_ROOT_STEMS.contains(&item.stem.as_str())
             && (!item.in_types_dir || item.stem == "error_response");
-        if (is_ambient || active_caps.contains(&idx) || active_exts.contains(&idx))
+        if (include_all || is_ambient || active_caps.contains(&idx) || active_exts.contains(&idx))
             && reachable.insert(idx)
         {
             queue.push_back(idx);
@@ -201,7 +351,7 @@ pub(super) fn compute_reachable_closure(
 
     while let Some(idx) = queue.pop_front() {
         let item = &loaded[idx];
-        let Some(parent_dir) = item.path.parent() else {
+        let Some(parent_dir) = item.path.parent().map(Path::to_path_buf) else {
             continue;
         };
         let inactive_locals = compute_inactive_local_defs(item, active_capabilities);
@@ -212,13 +362,24 @@ pub(super) fn compute_reachable_closure(
             }
             let resolved_path = normalize_lexical_path(&parent_dir.join(file_part));
             if let Some(&t_idx) = path_to_idx.get(&resolved_path) {
-                if reachable.insert(t_idx) {
+                let new_dependency = referenced_def_key(&ref_str)
+                    .is_some_and(|key| loaded[t_idx].referenced_local_defs.insert(key.to_string()));
+                if reachable.insert(t_idx) || new_dependency {
                     queue.push_back(t_idx);
                 }
             }
         }
     }
     reachable
+}
+
+pub(super) fn referenced_def_key(reference: &str) -> Option<&str> {
+    reference
+        .split_once("#/$defs/")?
+        .1
+        .split('/')
+        .next()
+        .filter(|key| !key.is_empty())
 }
 
 pub(super) fn compute_inactive_local_defs(
@@ -249,8 +410,13 @@ pub(super) fn compute_inactive_local_defs(
         if !is_reverse_domain_name(k) {
             continue;
         }
+        let selected = item
+            .selected_extension_defs
+            .as_ref()
+            .map(|by_root| by_root.values().any(|selected_key| selected_key == k));
         if item.name.as_deref() == Some(k.as_str())
-            || (active_capabilities.contains(k) && item.extends_capability(k))
+            || selected
+                .unwrap_or_else(|| active_capabilities.contains(k) && item.extends_capability(k))
         {
             active_seeds.push(v);
         } else {
@@ -259,7 +425,17 @@ pub(super) fn compute_inactive_local_defs(
         }
     }
 
-    let used_by_active = transitive_local_def_refs(&active_seeds, defs_obj);
+    for key in &item.referenced_local_defs {
+        if let Some(value) = defs_obj.get(key) {
+            active_seeds.push(value);
+            inactive.remove(key);
+        }
+    }
+    let mut used_by_active = transitive_local_def_refs(&active_seeds, defs_obj);
+    used_by_active.extend(item.referenced_local_defs.iter().cloned());
+    for key in &used_by_active {
+        inactive.remove(key);
+    }
     let used_by_inactive = transitive_local_def_refs(&inactive_seeds, defs_obj);
 
     for (def_key, def_val) in defs_obj {
@@ -367,7 +543,14 @@ fn is_container_capability(schema: &Value, is_extension: bool, in_types_dir: boo
     }
     obj.get("$defs")
         .and_then(Value::as_object)
-        .is_some_and(|defs| defs.keys().any(|k| is_container_op_key(k)))
+        .is_some_and(|defs| {
+            defs.keys().any(|k| is_container_op_key(k))
+                || (schema
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_reverse_domain_name)
+                    && defs.keys().any(|k| !is_reverse_domain_name(k)))
+        })
 }
 
 fn transitive_local_def_refs(seeds: &[&Value], defs_obj: &Map<String, Value>) -> BTreeSet<String> {
@@ -574,7 +757,7 @@ mod tests {
 
     #[test]
     fn compute_reachable_closure_follows_active_refs_and_skips_inactive_extension_refs() {
-        let loaded = vec![
+        let mut loaded = vec![
             LoadedSchema::from_file("/schemas/ucp.json", json!({"type": "object"})),
             LoadedSchema::from_file(
                 "/schemas/shopping/types/service.json",
@@ -612,7 +795,7 @@ mod tests {
         ];
 
         let reachable = compute_reachable_closure(
-            &loaded,
+            &mut loaded,
             &BTreeSet::from([2]),
             &BTreeSet::from([5]),
             &BTreeSet::from([

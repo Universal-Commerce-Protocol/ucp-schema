@@ -593,6 +593,28 @@ How it works:
 The bundled schema is self-contained and validates identically to the
 multi-file original under any Draft 2020-12 validator.
 
+### Static Type Generation
+
+`generate-types` emits a self-contained JSON Schema `$defs` bundle for SDK code generators. Unlike runtime composition, one bundle can include **multiple root capabilities**:
+
+```bash
+ucp-schema generate-types --schema-dir ./schemas \
+  --capability dev.ucp.common.feed \
+  --extension dev.ucp.shopping.catalog.feed \
+  --extension dev.ucp.shopping.ads \
+  --output feed.types.json
+
+ucp-schema generate-types --profile discovery.json --output merchant.types.json
+```
+
+- **Active graph only:** include every parent extension you want to use. A schema present on disk or reached by `$ref` does not activate that parent. Directory mode infers parent edges from reverse-domain `$defs` keys; profile mode uses the declared `extends` edges, even when a schema also defines contributions for other roots.
+- **Transitive selection:** for each reachable active root, its `$defs[root_name]` entry wins. Without it, exactly one active declared extension parent must have an entry. Multiple matching active extension parents are ambiguous, including parents connected to different SDK roots; supply a root-keyed entry for each affected root rather than relying on declaration order. Sparse direct extensions retain legacy behavior: a missing contribution for one SDK root is skipped, never borrowed from another root's entry.
+- **Shared scope:** the selected contributions determine both external-reference reachability and local-helper hoisting. Helpers used only by inactive or overridden contributions are excluded, unless an active schema independently references them. Explicit helper-fragment dependencies retain their local/external closure without activating the owning extension; annotated helpers retain directional request/response slices.
+- **Object and container shapes:** parents compose before children. Operation containers keep their existing naming and legacy `oneOf`/`allOf` support. Named shape containers can introduce shapes such as `record` or `manifest`, including arrays, scalars and unions. Existing names are retained unless a collision requires root qualification (`FeedRecord`, `OtherFeedRecord`); annotated shapes receive directional slices.
+- **Cycles:** traversal terminates and merges each connected active extension once. A disconnected extension cycle does not contribute to any root. For unrelated direct sibling extensions, existing file order is preserved.
+
+Profile input cannot be combined with `--schema-dir`, `--capability`, or `--extension`. With no directory-mode filters, all discovered capabilities and extensions are active.
+
 ### Strict Mode
 
 By default, validation allows unknown fields — payloads may contain fields from capabilities the validator hasn't seen, and forward compatibility requires tolerating them. For closed systems or catching typos, `--strict` injects `additionalProperties: false` into all object schemas:

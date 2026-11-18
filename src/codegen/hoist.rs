@@ -57,13 +57,32 @@ pub(super) fn hoist_defs(
 
     let is_active_source =
         |idx: usize| active_ext_indices.contains(&idx) || active_cap_indices.contains(&idx);
+    let container_shapes = collect_container_shapes(
+        loaded,
+        reachable_indices,
+        active_cap_indices,
+        active_ext_indices,
+    );
     let local_def_renames = compute_collision_renames(
         loaded,
         reachable_indices,
         &inactive_local_defs,
         &standalone_type_names,
         &is_active_source,
+        &container_shapes,
     );
+    for (&idx, keys) in &container_shapes {
+        loaded[idx].container_def_names = keys
+            .iter()
+            .map(|key| {
+                let name = local_def_renames
+                    .get(&(idx, key.clone()))
+                    .cloned()
+                    .unwrap_or_else(|| qualify_def_name(&loaded[idx].stem_pascal, key));
+                (key.clone(), name)
+            })
+            .collect();
+    }
     apply_collision_renames_to_schemas(
         loaded,
         reachable_indices,
@@ -165,14 +184,19 @@ fn classify_local_def(
             LocalDefAction::Skip
         };
     }
+    let reserved_shape = item
+        .container_def_names
+        .get(def_key)
+        .is_some_and(|name| name != &to_pascal_case(def_key));
     if inactive_set.is_some_and(|s| s.contains(def_key))
         || (item.is_container && is_container_op_key(def_key))
-        || is_pure_reexport_def(&item.stem_pascal, def_key, def_val)
+        || (!reserved_shape && is_pure_reexport_def(&item.stem_pascal, def_key, def_val))
     {
         return LocalDefAction::Skip;
     }
     let target_pascal = to_pascal_case(def_key);
     if is_active_source
+        && !reserved_shape
         && is_inplace_overlay(
             item,
             def_key,
@@ -186,7 +210,7 @@ fn classify_local_def(
     LocalDefAction::Hoist(qualify_def_name(&item.stem_pascal, def_key))
 }
 
-fn is_pure_reexport_def(parent_pascal: &str, def_key: &str, def_val: &Value) -> bool {
+pub(super) fn is_pure_reexport_def(parent_pascal: &str, def_key: &str, def_val: &Value) -> bool {
     let Some(obj) = def_val.as_object() else {
         return false;
     };
@@ -242,12 +266,55 @@ fn is_inplace_overlay(
         })
 }
 
+/// Reserve names for shapes introduced by active parents before rewriting any
+/// refs. Otherwise two feed roots could both introduce a global `Record`, or a
+/// child could retain a dangling reference to a parent-introduced root shape.
+fn collect_container_shapes(
+    loaded: &[LoadedSchema],
+    reachable: &BTreeSet<usize>,
+    active_caps: &BTreeSet<usize>,
+    active_exts: &BTreeSet<usize>,
+) -> BTreeMap<usize, BTreeSet<String>> {
+    let mut shapes = BTreeMap::new();
+    for &idx in reachable {
+        let item = &loaded[idx];
+        if !item.is_container {
+            continue;
+        }
+        let mut keys: BTreeSet<String> = item
+            .schema
+            .get("$defs")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|defs| defs.keys())
+            .cloned()
+            .collect();
+        if active_caps.contains(&idx) {
+            if let Some(root) = item.name.as_deref() {
+                for (ext_idx, selected_key) in
+                    crate::codegen::reachability::ordered_extensions(loaded, active_exts, root)
+                {
+                    if let Some(defs) = loaded[ext_idx].schema["$defs"][selected_key]
+                        .get("$defs")
+                        .and_then(Value::as_object)
+                    {
+                        keys.extend(defs.keys().cloned());
+                    }
+                }
+            }
+        }
+        shapes.insert(idx, keys);
+    }
+    shapes
+}
+
 fn compute_collision_renames(
     loaded: &[LoadedSchema],
     reachable_indices: &BTreeSet<usize>,
     inactive_local_defs: &BTreeMap<usize, BTreeSet<String>>,
     standalone_type_names: &BTreeSet<String>,
     is_active_source: &dyn Fn(usize) -> bool,
+    container_shapes: &BTreeMap<usize, BTreeSet<String>>,
 ) -> BTreeMap<(usize, String), String> {
     let mut candidate_counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut entries = Vec::new();
@@ -274,6 +341,21 @@ fn compute_collision_renames(
         }
     }
 
+    for (&idx, keys) in container_shapes {
+        for key in keys {
+            if is_container_op_key(key)
+                || is_reverse_domain_name(key)
+                || entries
+                    .iter()
+                    .any(|(source, raw_key, _)| *source == idx && raw_key == key)
+            {
+                continue;
+            }
+            let default_name = qualify_def_name(&loaded[idx].stem_pascal, key);
+            *candidate_counts.entry(default_name.clone()).or_insert(0) += 1;
+            entries.push((idx, key.clone(), default_name));
+        }
+    }
     let mut renames = BTreeMap::new();
     for (idx, def_key, default_name) in entries {
         let count = candidate_counts.get(&default_name).copied().unwrap_or(0);

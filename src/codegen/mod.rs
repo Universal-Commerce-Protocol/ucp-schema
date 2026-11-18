@@ -21,6 +21,7 @@ use crate::codegen::normalizer::{
 pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
     compute_reachable_closure, load_all_schemas, select_active_schemas,
+    select_extension_contributions,
 };
 use crate::error::{ComposeError, ResolveError};
 use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
@@ -193,14 +194,15 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
                 path: schema_dir.to_path_buf(),
             }));
         }
-        let loaded = load_all_schemas(schema_dir)?;
+        let mut loaded = load_all_schemas(schema_dir)?;
         let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
         let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
         let (active_cap_indices, active_ext_indices, active_capabilities) =
             select_active_schemas(&loaded, cap_queries, ext_queries)?;
+        select_extension_contributions(&mut loaded, &active_cap_indices, &active_ext_indices)?;
         let include_all = cap_queries.is_none() && ext_queries.is_none();
         let reachable_indices = compute_reachable_closure(
-            &loaded,
+            &mut loaded,
             &active_cap_indices,
             &active_ext_indices,
             &active_capabilities,
@@ -230,7 +232,11 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
 
     // Stage 3: Capability & Sub-Type Extension Composition
     let mut inlined_mixin_defs = BTreeSet::new();
-    let (capability_resources, container_schemas) = compose_active_extensions(
+    let compose::ComposedExtensions {
+        capability_resources,
+        container_schemas,
+        sliced_base_names: container_sliced_bases,
+    } = compose_active_extensions(
         &loaded,
         &active_cap_indices,
         &active_ext_indices,
@@ -239,6 +245,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         &mut defs,
         &mut inlined_mixin_defs,
     )?;
+    sliced_base_names.extend(container_sliced_bases);
 
     // Stage 4: Inline Conditional Variant Hoisting
     reify::hoist_inline_conditional_variants(
@@ -272,11 +279,35 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
         .iter()
         .flat_map(|&idx| {
             let stem = &loaded[idx].stem_pascal;
-            [
+            let mut requests: Vec<String> = [
                 format!("{stem}CreateRequest"),
                 format!("{stem}UpdateRequest"),
                 format!("{stem}CompleteRequest"),
             ]
+            .into_iter()
+            .collect();
+            let item = &loaded[idx];
+            if item.is_container
+                && item
+                    .schema
+                    .get("$defs")
+                    .and_then(Value::as_object)
+                    .is_some_and(|defs| {
+                        !defs
+                            .keys()
+                            .any(|key| reachability::is_container_op_key(key))
+                    })
+            {
+                // Arbitrary named container shapes (record/manifest) are SDK
+                // entrypoints too, not unreachable helper request slices.
+                for shape in item.container_def_names.values() {
+                    requests.extend(
+                        ["CreateRequest", "UpdateRequest", "CompleteRequest"]
+                            .map(|suffix| format!("{shape}{suffix}")),
+                    );
+                }
+            }
+            requests
         })
         .collect();
     prune_empty_object_defs(&mut defs, &inlined_mixin_defs, &active_cap_root_requests);
