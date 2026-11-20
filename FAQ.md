@@ -51,13 +51,13 @@ This means you can develop and test third-party extensions locally before publis
 
 **The validator infers direction from payload structure:**
 
-| Payload has        | Detected direction                               |
-| ------------------ | ------------------------------------------------ |
-| `ucp.capabilities` | Response                                         |
-| `meta.profile`     | Request                                          |
-| Neither            | Error (must specify `--request` or `--response`) |
+| Payload has        | Detected direction                                          |
+| ------------------ | ----------------------------------------------------------- |
+| `ucp.capabilities` | Response                                                    |
+| `meta.profile`     | Request                                                     |
+| Neither            | Error on `resolve`; `validate --schema` defaults to request |
 
-This applies to both `validate` and `resolve` when the input is a self-describing payload. When resolving a plain schema file, explicit `--request` or `--response` is required.
+This applies to both `validate` and `resolve` when the input is a self-describing payload. When `validate` uses an explicit `--schema`, payload metadata is not required: if neither direction flag is set, the validator still infers direction from `ucp.capabilities` or `meta.profile` when present, and defaults to request direction otherwise. Pass `--response` when validating a payload without `ucp.capabilities` against a response schema. When resolving a plain schema file, explicit `--request` or `--response` is required.
 
 ---
 
@@ -95,6 +95,20 @@ Sending `{ "name": "foo", "id": "123" }` for a request fails. The `id` field was
 
 ---
 
+## What takes precedence between `ucp_request: omit` and `additionalProperties: false`?
+
+**`additionalProperties: false` decides whether the field is rejected. `omit` only removes it from the schema.**
+
+Schemas are open by default, so an omitted field that is sent anyway is accepted as an additional field:
+
+| Resolved object                        | Field absent | Field present       |
+| -------------------------------------- | ------------ | ------------------- |
+| Open (default)                         | Valid        | Accepted as unknown |
+| Closed (`additionalProperties: false`) | Valid        | Rejected            |
+| `--strict`                             | Valid        | Rejected            |
+
+---
+
 ## How do I write an extension schema?
 
 **Extensions must define their additions in `$defs[root_capability_name]`.** Composition happens at validation time. Each extension owns its additions but references the base it extends.
@@ -124,8 +138,10 @@ If `dev.ucp.shopping.checkout` is the root capability, your extension schema sho
 The validator:
 
 1. Finds the root capability (no `extends`)
-2. Extracts `$defs[root_name]` from each extension
+2. Extracts `$defs[root_name]` from each extension, or `$defs[parent_name]` when the root key is absent and exactly one active declared parent has an entry
 3. Composes them with `allOf`
+
+An extension of an extension (for example, one that extends `dev.ucp.shopping.catalog.feed`, which itself extends `dev.ucp.common.feed`) may key its additions on the parent it extends rather than the root. The additions are still composed onto the root, so they use the root's shape: for a container root, the operation or shape keys the root defines. The root key always wins when present. Without it, exactly one active declared parent may have an entry: inactive parents are ignored, and entries for two or more active parents are rejected as ambiguous regardless of declaration order, so add a root-keyed entry to choose the contribution.
 
 If the capability is a **container** (see below), repeat the base's operation keys instead: `$defs[root_name]` is itself `{ "$defs": { "<op>_<direction>": ... } }`, and the tool merges one shape at a time.
 

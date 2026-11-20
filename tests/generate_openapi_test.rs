@@ -1306,3 +1306,57 @@ fn multi_service_fixture_per_path_servers_shared_gateway_inactive_pruning_and_co
     assert!(matches!(err, CodegenError::ConflictingServicePath { .. }));
     assert_eq!(err.exit_code(), 2);
 }
+
+#[test]
+fn generate_openapi_template_info_with_non_string_title_or_version_falls_back() {
+    let compose_dir = fixture_compose_dir();
+    let checkout_schema = compose_dir.join("schemas/shopping/checkout.json");
+    let base: Value = serde_json::from_str(
+        &std::fs::read_to_string(compose_dir.join("shopping_rest.openapi.json")).unwrap(),
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+
+    for (i, (title, version)) in [
+        (json!(null), json!(null)),
+        (json!(42), json!(1)),
+        (json!("   "), json!(" \t ")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut template = base.clone();
+        template["info"]["title"] = title;
+        template["info"]["version"] = version;
+        let template_path = tmp.path().join(format!("template_{i}.openapi.json"));
+        std::fs::write(&template_path, template.to_string()).unwrap();
+
+        let profile_path = tmp.path().join(format!("profile_{i}.json"));
+        let profile = json!({
+            "ucp": {
+                "version": "2026-01-11",
+                "services": {
+                    "dev.ucp.shopping": [{
+                        "version": "2026-01-11",
+                        "transport": "rest",
+                        "endpoint": "https://merchant.example.com/ucp",
+                        "schema": template_path.to_str().unwrap()
+                    }]
+                },
+                "capabilities": {
+                    "dev.ucp.shopping.checkout": [{
+                        "version": "2026-01-11",
+                        "schema": checkout_schema.to_str().unwrap()
+                    }]
+                }
+            }
+        });
+        std::fs::write(&profile_path, profile.to_string()).unwrap();
+
+        let spec =
+            generate_openapi(&GenerateOpenApiOptions::new(profile_path.to_str().unwrap())).unwrap();
+        assert_openapi_invariants(&spec);
+        assert_eq!(spec["info"]["title"], "UCP REST Service", "case {i}");
+        assert_eq!(spec["info"]["version"], "2026-01-11", "case {i}");
+    }
+}

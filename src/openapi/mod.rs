@@ -346,7 +346,11 @@ fn build_service_info(binding: &RestServiceBinding, root_obj: &Map<String, Value
         return Value::Object(info);
     };
     for (k, v) in src_info {
-        if k == "version" && v.as_str().is_some_and(|s| s.trim().is_empty()) {
+        if k == "version" || k == "title" {
+            let Some(val_str) = v.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            info.insert(k.clone(), Value::String(val_str.to_string()));
             continue;
         }
         info.insert(k.clone(), v.clone());
@@ -908,6 +912,39 @@ mod tests {
         let info = build_service_info(&binding, template_obj.as_object().unwrap());
         assert_eq!(info["title"], "Custom Shopping");
         assert_eq!(info["version"], "2026-08-25");
+
+        // Null and non-string title / version fall back to seeded defaults
+        let template_nulls = json!({
+            "info": {
+                "title": null,
+                "version": null,
+                "description": "Custom Description"
+            }
+        });
+        let info_nulls = build_service_info(&binding, template_nulls.as_object().unwrap());
+        assert_eq!(info_nulls["title"], "UCP REST Service");
+        assert_eq!(info_nulls["version"], "2026-08-25");
+        assert_eq!(info_nulls["description"], "Custom Description");
+
+        let template_numbers = json!({
+            "info": {
+                "title": 42,
+                "version": 1
+            }
+        });
+        let info_nums = build_service_info(&binding, template_numbers.as_object().unwrap());
+        assert_eq!(info_nums["title"], "UCP REST Service");
+        assert_eq!(info_nums["version"], "2026-08-25");
+
+        let template_ws_title = json!({
+            "info": {
+                "title": "   ",
+                "version": "2.0.0"
+            }
+        });
+        let info_ws_title = build_service_info(&binding, template_ws_title.as_object().unwrap());
+        assert_eq!(info_ws_title["title"], "UCP REST Service");
+        assert_eq!(info_ws_title["version"], "2.0.0");
 
         let mut paths = Map::from_iter([
             ("/checkout".to_string(), json!({ "post": {} })),
