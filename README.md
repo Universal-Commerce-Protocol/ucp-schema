@@ -120,14 +120,14 @@ ucp-schema resolve checkout.json --request --op create --bundle --pretty
 
 # Bundle a 3P extension with absolute URL refs (maps URLs to local copies)
 ucp-schema resolve my_extension.json --response --op read --bundle \
-  --schema-remote-base "https://ucp.dev/schemas" \
+  --schema-remote-base "https://ucp.dev/2026-08-25/schemas" \
   --schema-local-base ./local-ucp-schemas
 
 # Bundle a 3P extension with absolute URL refs (fetches from network)
 ucp-schema resolve my_extension.json --response --op read --bundle
 
 # Resolve from URL
-ucp-schema resolve https://ucp.dev/2026-04-08/schemas/shopping/checkout.json --request --op create
+ucp-schema resolve https://ucp.dev/2026-08-25/schemas/shopping/checkout.json --request --op create
 ```
 
 ### `validate` — Validate payload against resolved schema
@@ -376,12 +376,12 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
   "ucp": {
     "capabilities": {
       "dev.ucp.shopping.checkout": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/checkout.json"
+        "version": "2026-08-25",
+        "schema": "https://ucp.dev/2026-08-25/schemas/shopping/checkout.json"
       }],
       "dev.ucp.shopping.discount": [{
-        "version": "2026-01-11",
-        "schema": "https://ucp.dev/schemas/shopping/discount.json",
+        "version": "2026-08-25",
+        "schema": "https://ucp.dev/2026-08-25/schemas/shopping/discount.json",
         "extends": "dev.ucp.shopping.checkout"
       }]
     }
@@ -395,7 +395,7 @@ UCP payloads are self-describing — they embed `ucp.capabilities` metadata decl
 
 1. **Root capability** — one capability has no `extends`, providing the base schema
 2. **Extensions** — capabilities with `extends` add fields to the root
-3. **Merge** — extensions define their additions in `$defs[root_capability_name]`; the tool composes them via `allOf`
+3. **Merge** — extensions define their additions in `$defs[root_capability_name]` (or, for an extension of an extension, `$defs[parent_capability_name]`); the tool composes them via `allOf`
 
 **Graph rules:** composition receives an already-negotiated active capability set with exactly one root (no `extends`). Each extension must have at least one path through active declared parents that transitively reaches that root; absent alternative parents are ignored.
 
@@ -403,11 +403,11 @@ Because absent parents are ignored, a misspelled parent name is indistinguishabl
 
 **Schema authoring for extensions:**
 
-Extension schemas define their additions in `$defs` keyed by the root capability name:
+Extension schemas define their additions in `$defs` keyed by the root capability name. An extension of an extension may instead key on the parent it extends. The root key always takes precedence; without it, exactly one active declared parent may have an entry, and entries for two or more active parents are rejected as ambiguous:
 
 ```json
 {
-  "$id": "https://ucp.dev/schemas/shopping/discount.json",
+  "$id": "https://ucp.dev/2026-08-25/schemas/shopping/discount.json",
   "name": "dev.ucp.shopping.discount",
   "$defs": {
     "dev.ucp.shopping.checkout": {
@@ -485,7 +485,7 @@ ucp-schema validate envelope.json --schema transports/jsonrpc.json --op read --d
 
 ```json
 {
-  "$id": "https://ucp.dev/schemas/shopping/fulfillment.json",
+  "$id": "https://ucp.dev/2026-08-25/schemas/shopping/fulfillment.json",
   "name": "dev.ucp.shopping.fulfillment",
   "$defs": {
     "dev.ucp.shopping.catalog.search": {
