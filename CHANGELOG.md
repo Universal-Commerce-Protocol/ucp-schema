@@ -1,5 +1,18 @@
 # Changelog
 
+## [2.0.1](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v2.0.0...v2.0.1) (2026-11-20)
+
+
+### Bug Fixes
+
+* lint refs and annotations in schemas named with instance keywords ([#91](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/91)) ([0e7145f](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/0e7145ff599f10a2065c3510e5ca42ce1a99d80a))
+* **openapi:** fall back to seeded defaults when template info.version or info.title is not a string ([#99](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/99)) ([65ebc57](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/65ebc5763cef5f849ef99beb6a6ee458731574f7))
+
+
+### Performance Improvements
+
+* **loader:** fetch each remote schema once per composition ([#94](https://github.com/Universal-Commerce-Protocol/ucp-schema/issues/94)) ([f030576](https://github.com/Universal-Commerce-Protocol/ucp-schema/commit/f0305762b37e82c3b73955befc84fbf6d0c3ee0e))
+
 ## [2.0.0](https://github.com/Universal-Commerce-Protocol/ucp-schema/compare/v1.4.1...v2.0.0) (2026-11-13)
 
 
