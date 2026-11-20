@@ -829,6 +829,36 @@ pub(crate) fn for_each_schema_object_mut(
     }
 }
 
+/// [`for_each_schema_object_mut`] restricted to one schema resource: it does
+/// not descend into a sub-schema that declares its own `$id`. Root-local refs
+/// in such an embedded resource resolve against it, not against `schema`.
+/// `is_root` is true for the resource's own root, whose `$id` names it.
+fn for_each_own_schema_object_mut(
+    schema: &mut Value,
+    is_root: bool,
+    f: &mut impl FnMut(&mut Map<String, Value>),
+) {
+    match schema {
+        Value::Object(obj) => {
+            if !is_root && matches!(obj.get("$id"), Some(Value::String(_))) {
+                return;
+            }
+            f(obj);
+            for (key, child) in obj.iter_mut() {
+                if !INSTANCE_DATA_KEYWORDS.contains(&key.as_str()) {
+                    for_each_own_schema_object_mut(child, false, f);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for child in arr.iter_mut() {
+                for_each_own_schema_object_mut(child, false, f);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Immutable twin of [`for_each_schema_object_mut`].
 pub(crate) fn for_each_schema_object(schema: &Value, f: &mut impl FnMut(&Map<String, Value>)) {
     match schema {
@@ -1006,6 +1036,12 @@ fn is_annotation_keyword(keyword: &str) -> bool {
 /// against the copy's base, and pruning them would dangle those. Refs inside
 /// the copy are never rewritten — its `$id` anchors them.
 ///
+/// Only refs of the subtree's own resource are considered. A sub-schema that
+/// declares its own `$id` is an embedded resource (bundling keeps the `$id`
+/// of an inlined recursive schema for exactly this reason): a `#` inside it
+/// already denotes that schema, and anchoring it to the source document
+/// would redirect its recursion to the wrong root.
+///
 /// Dormant (returns `Ok(false)`, subtree untouched) when nothing qualifies:
 /// every shipped UCP schema today. Errors when `$defs/<embed_key>` is
 /// already occupied or not an object.
@@ -1016,23 +1052,14 @@ pub(crate) fn anchor_to_source(
     embed_key: &str,
     qualifies: impl Fn(&str) -> bool,
 ) -> Result<bool, String> {
-    let mut needs_anchor = false;
-    for_each_schema_object(subtree, &mut |obj| {
-        if matches!(obj.get("$ref"), Some(Value::String(r)) if qualifies(r)) {
-            needs_anchor = true;
-        }
-    });
-    if !needs_anchor {
-        return Ok(false);
-    }
-
     let source_uri = source_doc
         .get("$id")
         .and_then(Value::as_str)
         .unwrap_or(fallback_uri)
         .to_string();
 
-    for_each_schema_object_mut(subtree, &mut |obj| {
+    let mut anchored = false;
+    for_each_own_schema_object_mut(subtree, true, &mut |obj| {
         if let Some(Value::String(r)) = obj.get("$ref") {
             if qualifies(r) {
                 let fragment = r.strip_prefix('#').expect("qualifying refs are root-local");
@@ -1042,9 +1069,13 @@ pub(crate) fn anchor_to_source(
                     format!("{source_uri}#{fragment}")
                 };
                 obj.insert("$ref".to_string(), Value::String(target));
+                anchored = true;
             }
         }
     });
+    if !anchored {
+        return Ok(false);
+    }
 
     let mut embedded = source_doc.clone();
     if let Value::Object(doc) = &mut embedded {
@@ -1185,6 +1216,85 @@ mod tests {
             "the source root's required[handler_id] must reach the retained ref"
         );
         assert!(validator.is_valid(&serde_json::json!({ "handler_id": "h1" })));
+    }
+
+    // Bundling keeps the `$id` of an inlined recursive schema so that its `#`
+    // still means that schema. Anchoring must leave such refs alone: sending
+    // them to the source document makes the recursion land on the wrong root.
+    // Asserted as verdicts, with a host ref that does need anchoring alongside.
+    #[test]
+    fn anchoring_leaves_refs_of_embedded_resources_alone() {
+        let source = serde_json::json!({
+            "$id": "https://example.test/container.json",
+            "type": "object",
+            "required": ["marker"]
+        });
+        let mut host = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "own": { "$ref": "#" },
+                "tree": {
+                    "$id": "https://example.test/tree.json",
+                    "type": "object",
+                    "properties": {
+                        "value": { "type": "integer" },
+                        "child": { "$ref": "#" }
+                    },
+                    "additionalProperties": false
+                }
+            }
+        });
+
+        let anchored = anchor_to_source(&mut host, &source, "urn:x", "__ucp_source", |r| {
+            r.starts_with('#') && !r.starts_with("#/$defs/")
+        })
+        .unwrap();
+        assert!(anchored, "the host's own `#` must still be anchored");
+        assert_eq!(
+            host["properties"]["own"]["$ref"],
+            "https://example.test/container.json"
+        );
+        assert_eq!(
+            host["properties"]["tree"]["properties"]["child"]["$ref"], "#",
+            "a ref inside an embedded resource must keep its own base"
+        );
+
+        let validator = jsonschema::validator_for(&host).expect("anchored host must compile");
+        // Recursion stays inside tree.json: a nested node obeys its rules.
+        assert!(validator.is_valid(&serde_json::json!({
+            "tree": { "value": 1, "child": { "value": 2 } }
+        })));
+        assert!(
+            !validator.is_valid(&serde_json::json!({
+                "tree": { "child": { "bogus": true } }
+            })),
+            "a nested node must still be checked against tree.json"
+        );
+        // The host's own ref reaches the source root's constraints.
+        assert!(!validator.is_valid(&serde_json::json!({ "own": {} })));
+        assert!(validator.is_valid(&serde_json::json!({ "own": { "marker": 1 } })));
+    }
+
+    // An embedded resource's refs alone never trigger anchoring.
+    #[test]
+    fn anchoring_stays_dormant_for_refs_of_embedded_resources_only() {
+        let source = serde_json::json!({ "$id": "https://example.test/container.json" });
+        let mut host = serde_json::json!({
+            "properties": {
+                "tree": {
+                    "$id": "https://example.test/tree.json",
+                    "properties": { "child": { "$ref": "#" } }
+                }
+            }
+        });
+        let before = host.clone();
+
+        let anchored = anchor_to_source(&mut host, &source, "urn:x", "__ucp_source", |r| {
+            r.starts_with('#') && !r.starts_with("#/$defs/")
+        })
+        .unwrap();
+        assert!(!anchored);
+        assert_eq!(host, before);
     }
 
     // Anchoring is dormant without a qualifying ref, so a host `$id` that no
