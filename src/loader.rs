@@ -1040,7 +1040,10 @@ fn is_annotation_keyword(keyword: &str) -> bool {
 /// declares its own `$id` is an embedded resource (bundling keeps the `$id`
 /// of an inlined recursive schema for exactly this reason): a `#` inside it
 /// already denotes that schema, and anchoring it to the source document
-/// would redirect its recursion to the wrong root.
+/// would redirect its recursion to the wrong root. The same holds for the
+/// subtree as a whole: when its root declares a `$id` other than the source
+/// document's, the subtree is a resource of its own, not a piece of the
+/// source, and none of its refs are anchored.
 ///
 /// Dormant (returns `Ok(false)`, subtree untouched) when nothing qualifies:
 /// every shipped UCP schema today. Errors when `$defs/<embed_key>` is
@@ -1052,6 +1055,15 @@ pub(crate) fn anchor_to_source(
     embed_key: &str,
     qualifies: impl Fn(&str) -> bool,
 ) -> Result<bool, String> {
+    // A subtree root that names a different resource owns its root-local
+    // refs. A root carrying the source's own `$id` is still the source's
+    // resource and is anchored (and yields that URI below).
+    if let Some(subtree_id) = subtree.get("$id").and_then(Value::as_str) {
+        if source_doc.get("$id").and_then(Value::as_str) != Some(subtree_id) {
+            return Ok(false);
+        }
+    }
+
     let source_uri = source_doc
         .get("$id")
         .and_then(Value::as_str)
@@ -1295,6 +1307,51 @@ mod tests {
         .unwrap();
         assert!(!anchored);
         assert_eq!(host, before);
+    }
+
+    // A subtree whose root is itself an embedded resource (an extracted
+    // extension def that is an inlined recursive schema) keeps its refs: its
+    // `$id` differs from the source's, so its `#` means the subtree.
+    #[test]
+    fn anchoring_stays_dormant_for_a_subtree_that_is_its_own_resource() {
+        let source = serde_json::json!({
+            "$id": "https://example.test/extension.json",
+            "type": "object",
+            "required": ["marker"]
+        });
+        let mut subtree = serde_json::json!({
+            "$id": "https://example.test/tree.json",
+            "type": "object",
+            "properties": {
+                "value": { "type": "integer" },
+                "child": { "$ref": "#" }
+            },
+            "additionalProperties": false
+        });
+        let before = subtree.clone();
+
+        let anchored = anchor_to_source(&mut subtree, &source, "urn:x", "ext", |r| {
+            r.starts_with('#')
+        })
+        .unwrap();
+        assert!(!anchored);
+        assert_eq!(subtree, before);
+
+        // Same when the source declares no `$id` at all.
+        let anonymous = serde_json::json!({ "type": "object", "required": ["marker"] });
+        let anchored = anchor_to_source(&mut subtree, &anonymous, "urn:x", "ext", |r| {
+            r.starts_with('#')
+        })
+        .unwrap();
+        assert!(!anchored);
+        assert_eq!(subtree, before);
+
+        let validator = jsonschema::validator_for(&subtree).expect("subtree must compile");
+        assert!(validator.is_valid(&serde_json::json!({ "value": 1, "child": { "value": 2 } })));
+        assert!(
+            !validator.is_valid(&serde_json::json!({ "child": { "bogus": true } })),
+            "recursion must stay inside the subtree's own resource"
+        );
     }
 
     // Anchoring is dormant without a qualifying ref, so a host `$id` that no
