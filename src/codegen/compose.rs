@@ -5,14 +5,20 @@ use std::path::PathBuf;
 
 use serde_json::{Map, Value};
 
+use crate::codegen::hoist::insert_sliced_or_normalized_def;
 use crate::codegen::normalizer::{
-    is_reverse_domain_name, normalize_def_schema, qualify_container_op_name, qualify_def_name,
-    rewrite_refs_to_defs,
+    is_reverse_domain_name, normalize_def_schema, qualify_def_name, rewrite_refs_to_defs,
 };
-use crate::codegen::reachability::{is_container_op_key, LoadedSchema};
+use crate::codegen::reachability::{is_container_op_key, ordered_extensions, LoadedSchema};
 use crate::codegen::{collision_qualified_name, local_def_ref, CodegenError, SchemaMap};
 use crate::resolver::resolve;
 use crate::types::{Direction, ResolveOptions};
+
+pub(super) struct ComposedExtensions {
+    pub capability_resources: SchemaMap,
+    pub container_schemas: Vec<(PathBuf, Value)>,
+    pub sliced_base_names: BTreeSet<String>,
+}
 
 pub(super) fn compose_active_extensions(
     loaded: &[LoadedSchema],
@@ -22,7 +28,8 @@ pub(super) fn compose_active_extensions(
     root_raw_schemas: &mut SchemaMap,
     defs: &mut SchemaMap,
     inlined_mixin_defs: &mut BTreeSet<String>,
-) -> Result<(SchemaMap, Vec<(PathBuf, Value)>), CodegenError> {
+) -> Result<ComposedExtensions, CodegenError> {
+    let mut sliced_base_names = BTreeSet::new();
     for (target_name, overlay) in pending_overlays {
         modify_target_def(
             &target_name,
@@ -46,19 +53,9 @@ pub(super) fn compose_active_extensions(
             continue;
         };
 
-        for &ext_idx in active_ext_indices {
+        for (ext_idx, selected_key) in ordered_extensions(loaded, active_ext_indices, cap_name) {
             let ext_item = &loaded[ext_idx];
-            if !ext_item.extends_capability(cap_name) {
-                continue;
-            }
-            let Some(ext_block) = ext_item
-                .schema
-                .get("$defs")
-                .and_then(Value::as_object)
-                .and_then(|d| d.get(cap_name))
-            else {
-                continue;
-            };
+            let ext_block = &ext_item.schema["$defs"][selected_key];
             let mut prepared = deref_local_mixin_refs(
                 ext_block,
                 &ext_item.schema,
@@ -106,11 +103,15 @@ pub(super) fn compose_active_extensions(
             defs,
             inlined_mixin_defs,
         )?;
-        hoist_container_operations(cap_item, &composed, defs)?;
+        hoist_container_operations(cap_item, &composed, defs, &mut sliced_base_names)?;
         container_schemas.push((cap_item.path.clone(), composed));
     }
 
-    Ok((capability_resources, container_schemas))
+    Ok(ComposedExtensions {
+        capability_resources,
+        container_schemas,
+        sliced_base_names,
+    })
 }
 
 fn modify_target_def(
@@ -138,31 +139,71 @@ fn deref_local_mixin_refs(
     parent_pascal: &str,
     inlined_mixin_defs: &mut BTreeSet<String>,
 ) -> Value {
-    let mut current = block.clone();
-    let Some(defs_obj) = source_schema.get("$defs").and_then(Value::as_object) else {
-        return current;
-    };
-    let mut inline_one = |node: &mut Value| {
-        let Some(ref_key) = local_def_ref(node) else {
-            return;
-        };
-        if let Some(target) = defs_obj.get(ref_key) {
-            inlined_mixin_defs.insert(qualify_def_name(parent_pascal, ref_key));
-            *node = target.clone();
-        } else if let Some(target) = defs_obj.iter().find_map(|(raw_key, val)| {
-            (!is_reverse_domain_name(raw_key)
-                && collision_qualified_name(parent_pascal, raw_key) == ref_key)
-                .then_some(val)
-        }) {
-            inlined_mixin_defs.insert(ref_key.to_string());
-            *node = target.clone();
+    fn inline_mixin(
+        node: &Value,
+        defs_obj: &Map<String, Value>,
+        parent_pascal: &str,
+        visited: &mut BTreeSet<String>,
+        inlined_mixin_defs: &mut BTreeSet<String>,
+    ) -> Value {
+        let mut current = node.clone();
+        if let Some(ref_key) = local_def_ref(node) {
+            let target = defs_obj
+                .iter()
+                .find(|(key, _)| key.as_str() == ref_key)
+                .or_else(|| {
+                    defs_obj.iter().find(|(raw_key, _)| {
+                        !is_reverse_domain_name(raw_key)
+                            && collision_qualified_name(parent_pascal, raw_key) == ref_key
+                    })
+                });
+            if let Some((raw_key, target)) = target {
+                if visited.insert(raw_key.clone()) {
+                    let pure_reexport =
+                        crate::codegen::hoist::is_pure_reexport_def(parent_pascal, raw_key, target);
+                    // A skipped pure alias is not a hoisted mixin; do not prune
+                    // the standalone definition it references under that name.
+                    if !pure_reexport || raw_key.as_str() != ref_key {
+                        inlined_mixin_defs.insert(qualify_def_name(parent_pascal, ref_key));
+                    }
+                    current =
+                        inline_mixin(target, defs_obj, parent_pascal, visited, inlined_mixin_defs);
+                    visited.remove(raw_key);
+                    // Keep constraints alongside a mixin $ref rather than discarding them.
+                    let mut siblings = node.as_object().cloned().unwrap_or_default();
+                    siblings.remove("$ref");
+                    if !siblings.is_empty() {
+                        let siblings = inline_mixin(
+                            &Value::Object(siblings),
+                            defs_obj,
+                            parent_pascal,
+                            visited,
+                            inlined_mixin_defs,
+                        );
+                        current = serde_json::json!({"allOf": [current, siblings]});
+                    }
+                    return current;
+                }
+            }
         }
-    };
-    inline_one(&mut current);
-    if let Some(arr) = current.get_mut("allOf").and_then(Value::as_array_mut) {
-        arr.iter_mut().for_each(&mut inline_one);
+        if let Some(arr) = current.get_mut("allOf").and_then(Value::as_array_mut) {
+            for branch in arr {
+                *branch =
+                    inline_mixin(branch, defs_obj, parent_pascal, visited, inlined_mixin_defs);
+            }
+        }
+        current
     }
-    current
+    let Some(defs_obj) = source_schema.get("$defs").and_then(Value::as_object) else {
+        return block.clone();
+    };
+    inline_mixin(
+        block,
+        defs_obj,
+        parent_pascal,
+        &mut BTreeSet::new(),
+        inlined_mixin_defs,
+    )
 }
 
 fn merge_extension_into_schema(
@@ -415,19 +456,9 @@ fn compose_container_capability(
         return Ok(composed);
     };
 
-    for &ext_idx in active_ext_indices {
+    for (ext_idx, selected_key) in ordered_extensions(loaded, active_ext_indices, cap_name) {
         let ext_item = &loaded[ext_idx];
-        if !ext_item.extends_capability(cap_name) {
-            continue;
-        }
-        let Some(ext_cap_block) = ext_item
-            .schema
-            .get("$defs")
-            .and_then(Value::as_object)
-            .and_then(|d| d.get(cap_name))
-        else {
-            continue;
-        };
+        let ext_cap_block = &ext_item.schema["$defs"][selected_key];
 
         let op_patches: Vec<(String, &Value)> =
             if let Some(nested_defs) = ext_cap_block.get("$defs").and_then(Value::as_object) {
@@ -446,10 +477,11 @@ fn compose_container_capability(
             };
 
         for (op_key, block) in op_patches {
-            let Some(target_op_schema) = container_defs.get_mut(&op_key) else {
-                continue;
-            };
-            let target_op_name = qualify_container_op_name(&cap_item.stem_pascal, &op_key);
+            let target_op_name = cap_item
+                .container_def_names
+                .get(&op_key)
+                .cloned()
+                .unwrap_or_else(|| qualify_def_name(&cap_item.stem_pascal, &op_key));
             let mut derefed = deref_local_mixin_refs(
                 block,
                 &ext_item.schema,
@@ -457,6 +489,18 @@ fn compose_container_capability(
                 inlined_mixin_defs,
             );
             rewrite_refs_to_defs(&mut derefed, &target_op_name, Some(&ext_item.stem_pascal));
+            if !container_defs.contains_key(&op_key) {
+                // A new shape is a schema, not an object overlay. Keep arrays,
+                // scalars, unions and references intact when introducing it.
+                let shape = if derefed.get("$ref").is_some() {
+                    serde_json::json!({"allOf": [derefed]})
+                } else {
+                    derefed
+                };
+                container_defs.insert(op_key, shape);
+                continue;
+            }
+            let target_op_schema = container_defs.get_mut(&op_key).unwrap();
             merge_extension_into_schema(
                 target_op_schema,
                 &derefed,
@@ -486,21 +530,48 @@ fn hoist_container_operations(
     cap_item: &LoadedSchema,
     composed_container: &Value,
     defs: &mut BTreeMap<String, Value>,
+    sliced_base_names: &mut BTreeSet<String>,
 ) -> Result<(), CodegenError> {
     let Some(container_defs) = composed_container.get("$defs").and_then(Value::as_object) else {
         return Ok(());
     };
 
     for (op_key, op_schema) in container_defs {
+        let hoisted_name = cap_item
+            .container_def_names
+            .get(op_key)
+            .cloned()
+            .unwrap_or_else(|| qualify_def_name(&cap_item.stem_pascal, op_key));
         if !is_container_op_key(op_key) {
+            // Stage 2 already emitted unchanged helper/shape definitions with
+            // collision-qualified names and directional slices. Only re-emit
+            // shapes actually added or modified by an active contribution.
+            if cap_item
+                .schema
+                .get("$defs")
+                .and_then(|defs| defs.get(op_key))
+                != Some(op_schema)
+            {
+                insert_sliced_or_normalized_def(
+                    op_schema,
+                    &hoisted_name,
+                    &cap_item.stem_pascal,
+                    defs,
+                    sliced_base_names,
+                )?;
+            }
             continue;
         }
-        let hoisted_name = qualify_container_op_name(&cap_item.stem_pascal, op_key);
-        let opts = match op_key.strip_suffix("_request") {
-            Some(op_prefix) => ResolveOptions::new(Direction::Request, op_prefix),
-            None => ResolveOptions::new(Direction::Response, "read"),
+        let resolved = if let Some(op_prefix) = op_key.strip_suffix("_request") {
+            resolve(
+                op_schema,
+                &ResolveOptions::new(Direction::Request, op_prefix),
+            )?
+        } else if op_key.ends_with("_response") {
+            resolve(op_schema, &ResolveOptions::new(Direction::Response, "read"))?
+        } else {
+            op_schema.clone()
         };
-        let resolved = resolve(op_schema, &opts)?;
         defs.insert(
             hoisted_name.clone(),
             normalize_def_schema(&resolved, &hoisted_name, Some(&cap_item.stem_pascal)),
@@ -701,7 +772,7 @@ mod tests {
 
     #[test]
     fn compose_container_capability_supports_nested_defs_and_oneof_allof_extensions() {
-        let loaded = vec![
+        let mut loaded = vec![
             LoadedSchema::from_file(
                 "/schemas/shopping/catalog_lookup.json",
                 json!({
@@ -745,6 +816,12 @@ mod tests {
             ),
         ];
 
+        crate::codegen::reachability::select_extension_contributions(
+            &mut loaded,
+            &BTreeSet::from([0]),
+            &BTreeSet::from([1, 2]),
+        )
+        .unwrap();
         let mut root_raw_schemas = BTreeMap::new();
         let mut defs = BTreeMap::new();
         let mut inlined_mixin_defs = BTreeSet::new();
@@ -759,7 +836,7 @@ mod tests {
         .unwrap();
 
         assert!(inlined_mixin_defs.contains("ReqMixin"));
-        hoist_container_operations(&loaded[0], &composed, &mut defs).unwrap();
+        hoist_container_operations(&loaded[0], &composed, &mut defs, &mut BTreeSet::new()).unwrap();
 
         assert_eq!(
             defs["CatalogLookupRequest"]["properties"]["context"]["$ref"],
