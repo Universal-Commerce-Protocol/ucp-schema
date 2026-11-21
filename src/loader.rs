@@ -117,21 +117,12 @@ pub fn is_url(s: &str) -> bool {
 /// Returns the value at the given JSON Pointer path within the schema.
 /// The fragment should start with '#' (e.g., "#/$defs/foo").
 pub fn navigate_fragment(schema: &Value, fragment: &str) -> Result<Value, ResolveError> {
-    // Remove leading # and split by /
-    let path = fragment.trim_start_matches('#').trim_start_matches('/');
-    if path.is_empty() {
-        return Ok(schema.clone());
-    }
-
-    let mut current = schema;
-    for part in path.split('/') {
-        // Unescape JSON Pointer encoding (~1 = /, ~0 = ~)
-        let key = part.replace("~1", "/").replace("~0", "~");
-        current = current.get(&key).ok_or_else(|| ResolveError::BundleError {
+    schema
+        .pointer(fragment.strip_prefix('#').unwrap_or(fragment))
+        .cloned()
+        .ok_or_else(|| ResolveError::BundleError {
             message: format!("fragment not found: {}", fragment),
-        })?;
-    }
-    Ok(current.clone())
+        })
 }
 
 /// Collect all `.json` files in a path (file or directory), excluding generated
@@ -1207,6 +1198,38 @@ mod tests {
             "nothing qualifies, so anchoring must stay dormant"
         );
         assert_eq!(host["$id"], "https://example.test/a.json");
+    }
+
+    #[test]
+    fn navigate_fragment_resolves_json_pointer_tokens() {
+        let schema = serde_json::json!({
+            "": { "type": "integer" },
+            "$defs": { "a/b~c": { "type": "string" }, "": false },
+            "allOf": [{ "type": "number" }]
+        });
+        assert_eq!(navigate_fragment(&schema, "#").unwrap(), schema);
+        for (fragment, expected) in [
+            ("#/allOf/0", serde_json::json!({ "type": "number" })),
+            ("#/allOf/0/type", serde_json::json!("number")),
+            ("#/", serde_json::json!({ "type": "integer" })),
+            ("#//type", serde_json::json!("integer")),
+            ("#/$defs/", serde_json::json!(false)),
+            ("#/$defs/a~1b~0c", serde_json::json!({ "type": "string" })),
+        ] {
+            assert_eq!(navigate_fragment(&schema, fragment).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn navigate_fragment_rejects_missing_json_pointer_targets() {
+        let schema = serde_json::json!({ "allOf": [{ "type": "string" }] });
+        for fragment in ["#/", "#/missing", "#/allOf/1", "#/allOf/00", "#/allOf/-"] {
+            assert!(matches!(
+                navigate_fragment(&schema, fragment),
+                Err(ResolveError::BundleError { message })
+                    if message == format!("fragment not found: {fragment}")
+            ));
+        }
     }
 
     #[test]
