@@ -623,3 +623,92 @@ fn select_def_reserved_source_key_errors() {
     let err = select_operation_schema(&schema, &opts).unwrap_err();
     assert!(err.to_string().contains("reserved"), "got: {err}");
 }
+
+/// Write a container whose response body reaches a recursive schema in a
+/// sibling file. Bundling inlines that schema and keeps its `$id`, so its
+/// `$ref: "#"` recursion denotes the inlined schema, not the container.
+fn write_recursive_fixtures(dir: &Path) {
+    let shopping = dir.join("schemas/shopping");
+    std::fs::create_dir_all(&shopping).unwrap();
+
+    std::fs::write(
+        shopping.join("ask.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/ask.json",
+          "name": "dev.ucp.shopping.ask",
+          "type": "object",
+          "$defs": {
+            "ask_response": {
+              "type": "object",
+              "required": ["constraints"],
+              "properties": {
+                "constraints": { "$ref": "constraint_expression.json" }
+              }
+            }
+          }
+        }"##,
+    )
+    .unwrap();
+
+    std::fs::write(
+        shopping.join("constraint_expression.json"),
+        r##"{
+          "$schema": "https://json-schema.org/draft/2020-12/schema",
+          "$id": "https://ucp.dev/schemas/shopping/constraint_expression.json",
+          "type": "object",
+          "properties": {
+            "enum": { "type": "array", "items": { "type": "string" } },
+            "all_of": { "type": "array", "items": { "$ref": "#" } }
+          },
+          "additionalProperties": false
+        }"##,
+    )
+    .unwrap();
+}
+
+fn ask_payload(constraints: Value) -> Value {
+    json!({
+        "ucp": { "capabilities": {
+            "dev.ucp.shopping.ask": [
+                { "version": "2026-04-08", "schema": "https://ucp.dev/schemas/shopping/ask.json" }
+            ]
+        } },
+        "constraints": constraints
+    })
+}
+
+/// End to end through composition, container selection and validation: a
+/// recursive schema inlined into a container body must keep recursing into
+/// itself. Selection wraps the container, and anchoring the inlined schema's
+/// `#` to the container root (a bare `{"type": "object"}`) would make every
+/// nested level accept anything and reject nothing.
+#[test]
+fn container_body_with_bundled_recursive_schema_validates_nested_levels() {
+    let dir = tempfile::tempdir().unwrap();
+    write_recursive_fixtures(dir.path());
+    let cfg = config(dir.path());
+    let opts = ResolveOptions::new(Direction::Response, "ask");
+
+    let valid = ask_payload(json!({
+        "all_of": [ { "all_of": [ { "enum": ["card"] } ] } ]
+    }));
+    let schema = compose_from_payload(&valid, &cfg).unwrap();
+    let result = validate(&schema, &valid, &opts);
+    assert!(
+        result.is_ok(),
+        "a well-formed nested constraint must be VALID, got {:?}",
+        result
+    );
+
+    let invalid = ask_payload(json!({
+        "all_of": [ { "all_of": [ { "enum": { "bogus": true } } ] } ]
+    }));
+    let schema = compose_from_payload(&invalid, &cfg).unwrap();
+    let result = validate(&schema, &invalid, &opts);
+    assert!(
+        matches!(result, Err(ValidateError::Invalid { .. })),
+        "a malformed nested constraint must be INVALID, got {:?}",
+        result
+    );
+}
