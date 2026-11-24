@@ -10,9 +10,9 @@ use ucp_schema::{
     bundle_refs, bundle_refs_with_url_mapping, compose_from_payload, compose_schema,
     detect_direction, extract_capabilities, extract_capabilities_from_profile,
     extract_jsonrpc_payload, generate_openapi, generate_types, is_url, lint, load_schema,
-    load_schema_auto, resolve, select_operation_schema, validate, CodegenError, ComposeError,
-    DetectedDirection, Direction, FileStatus, GenerateOpenApiOptions, GenerateTypesOptions,
-    ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
+    load_schema_auto, load_schema_str, resolve, select_operation_schema, validate, CodegenError,
+    ComposeError, DetectedDirection, Direction, FileStatus, GenerateOpenApiOptions,
+    GenerateTypesOptions, ResolveError, ResolveOptions, SchemaBaseConfig, ValidateError,
 };
 
 /// Errors with associated CLI exit codes.
@@ -151,7 +151,7 @@ enum Commands {
 
     /// Validate a payload against a resolved schema
     Validate {
-        /// Payload file to validate
+        /// Payload file to validate, or '-' to read from stdin
         payload: PathBuf,
 
         /// Explicit schema (default: infer from payload's UCP metadata)
@@ -639,12 +639,16 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
         remote_base: schema_remote_base.as_deref(),
     };
 
-    // Load payload file
+    // Load payload file or stdin
     if verbose {
-        eprintln!("[load] reading payload {}", payload_path.display());
+        if payload_path.as_os_str() == "-" {
+            eprintln!("[load] reading payload from stdin");
+        } else {
+            eprintln!("[load] reading payload {}", payload_path.display());
+        }
     }
     let payload_file =
-        load_schema(&payload_path).map_err(cli_err_ctx(json_output, "loading payload"))?;
+        load_payload(&payload_path).map_err(cli_err_ctx(json_output, "loading payload"))?;
 
     // Determine validation mode and extract actual payload to validate:
     // 1. --profile: REST pattern, payload is raw object
@@ -823,6 +827,19 @@ fn run_validate(args: ValidateArgs) -> Result<(), u8> {
             Err(2)
         }
     }
+}
+
+fn load_payload(path: &Path) -> Result<serde_json::Value, ResolveError> {
+    if path.as_os_str() == "-" {
+        let content = std::io::read_to_string(std::io::stdin()).map_err(|source| {
+            ResolveError::ReadError {
+                path: PathBuf::from("-"),
+                source,
+            }
+        })?;
+        return load_schema_str(&content);
+    }
+    load_schema(path)
 }
 
 fn run_generate_types(

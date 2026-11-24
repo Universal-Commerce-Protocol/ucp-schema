@@ -459,6 +459,135 @@ mod validate_command {
             .stdout(predicate::str::contains(r#""valid":false"#))
             .stdout(predicate::str::contains(r#""errors":"#));
     }
+
+    fn validate_stdin(args: &[&str], stdin: &str) -> assert_cmd::assert::Assert {
+        cmd()
+            .args(["validate", "-"])
+            .args(args)
+            .write_stdin(stdin.to_owned())
+            .assert()
+    }
+
+    #[test]
+    fn validate_enforces_formats_and_supports_stdin_modes() {
+        let dir = TempDir::new().unwrap();
+        let fmt_schema = write_temp_file(
+            &dir,
+            "fmt.json",
+            r#"{"type":"object","properties":{"endpoint":{"type":"string","format":"uri"},"ts":{"type":"string","format":"date-time"},"email":{"type":"string","format":"email"}}}"#,
+        );
+        let fmt_args = [
+            "--schema",
+            fmt_schema.to_str().unwrap(),
+            "--request",
+            "-o",
+            "create",
+        ];
+        validate_stdin(
+            &fmt_args,
+            r#"{"endpoint":"https://ucp.dev/ucp","ts":"2026-08-25T10:00:00Z","email":"a@b.co"}"#,
+        )
+        .success();
+        for bad in [
+            r#"{"endpoint":"not a uri"}"#,
+            r#"{"ts":"not-a-timestamp"}"#,
+            r#"{"email":"bad-email"}"#,
+        ] {
+            validate_stdin(&fmt_args, bad)
+                .code(1)
+                .stderr(predicate::str::contains("Validation failed"));
+        }
+
+        let blob_schema = write_temp_file(
+            &dir,
+            "blob.json",
+            r#"{"type":"object","properties":{"blob":{"type":"string"}},"required":["blob"]}"#,
+        );
+        let blob_s = blob_schema.to_str().unwrap();
+        let large = format!(r#"{{"blob":"{}"}}"#, "x".repeat(80 * 1024));
+        validate_stdin(
+            &["--schema", blob_s, "--request", "-o", "create", "-v"],
+            &large,
+        )
+        .success()
+        .stderr(predicate::str::contains(
+            "[load] reading payload from stdin",
+        ));
+
+        let resp =
+            fs::read_to_string("tests/fixtures/compose/response_checkout_only.json").unwrap();
+        validate_stdin(
+            &[
+                "-o",
+                "read",
+                "--schema-local-base",
+                "tests/fixtures/compose",
+            ],
+            &resp,
+        )
+        .success();
+
+        let checkout_dir = dir.path().join("schemas/shopping");
+        fs::create_dir_all(&checkout_dir).unwrap();
+        fs::copy(
+            "tests/fixtures/compose/schemas/shopping/checkout.json",
+            checkout_dir.join("checkout.json"),
+        )
+        .unwrap();
+        write_temp_file(
+            &dir,
+            "profile.json",
+            r#"{"ucp":{"version":"2026-01-11","capabilities":{"dev.ucp.shopping.checkout":[{"version":"2026-01-11","schema":"https://ucp.dev/schemas/shopping/checkout.json"}]}}}"#,
+        );
+        let base = dir.path().to_str().unwrap();
+        let prof = "https://ucp.dev/profile.json";
+        validate_stdin(
+            &[
+                "--profile",
+                prof,
+                "-o",
+                "create",
+                "--schema-local-base",
+                base,
+            ],
+            r#"{"line_items":[{"sku":"SKU1","quantity":1}]}"#,
+        )
+        .success();
+        validate_stdin(
+            &["-o", "create", "--schema-local-base", base],
+            r#"{"meta":{"profile":"https://ucp.dev/profile.json"},"checkout":{"line_items":[{"sku":"SKU1","quantity":1}]}}"#,
+        )
+        .success();
+
+        validate_stdin(
+            &["--schema", blob_s, "--request", "-o", "create", "--json"],
+            "",
+        )
+        .code(2)
+        .stdout(predicate::str::contains(r#""valid":false"#));
+        validate_stdin(
+            &["--schema", blob_s, "--request", "-o", "create"],
+            "{invalid",
+        )
+        .code(2)
+        .stderr(predicate::str::contains("invalid JSON"));
+
+        write_temp_file(&dir, "-", r#"{"blob":"on-disk"}"#);
+        cmd()
+            .current_dir(dir.path())
+            .args([
+                "validate",
+                "./-",
+                "--schema",
+                blob_s,
+                "--request",
+                "-o",
+                "create",
+            ])
+            .write_stdin("not json")
+            .assert()
+            .success();
+    }
 }
 
 mod error_handling {

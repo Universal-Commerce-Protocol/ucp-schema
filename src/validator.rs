@@ -11,7 +11,8 @@ use crate::types::ResolveOptions;
 ///
 /// Resolves the schema for the given direction and operation, selects the
 /// operation shape for container-shaped capabilities, then validates the
-/// payload against the resulting schema.
+/// payload against the resulting schema with Draft 2020-12 syntactic `format`
+/// assertions enabled (unrecognized custom format names are ignored).
 ///
 /// # Errors
 ///
@@ -139,13 +140,17 @@ fn select_def(schema: &Value, name: &str, mode: SelectMode) -> Result<Value, Res
 /// Validate a payload against an already-resolved schema.
 ///
 /// Use this when you've already resolved the schema and want to validate
-/// multiple payloads against it.
+/// multiple payloads against it. Enforces Draft 2020-12 syntactic `format`
+/// assertions while ignoring unrecognized custom format names.
 pub fn validate_against_schema(schema: &Value, payload: &Value) -> Result<(), ValidateError> {
-    let validator = jsonschema::validator_for(schema).map_err(|e| {
-        ValidateError::Resolve(ResolveError::InvalidSchema {
-            message: e.to_string(),
-        })
-    })?;
+    let validator = jsonschema::options()
+        .should_validate_formats(true)
+        .build(schema)
+        .map_err(|e| {
+            ValidateError::Resolve(ResolveError::InvalidSchema {
+                message: e.to_string(),
+            })
+        })?;
 
     let errors: Vec<SchemaError> = validator
         .iter_errors(payload)
@@ -408,5 +413,45 @@ mod tests {
             result.is_ok(),
             "should allow unknown properties in non-strict mode"
         );
+    }
+
+    #[test]
+    fn validate_enforces_syntactic_format_assertions() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "endpoint": { "type": "string", "format": "uri" },
+                "timestamp": { "type": "string", "format": "date-time" },
+                "email": { "type": "string", "format": "email" },
+                "request_id": { "type": "string", "format": "uuid" },
+                "custom": { "type": "string", "format": "x-ucp-custom-token" }
+            }
+        });
+        let opts = ResolveOptions::new(Direction::Request, "create");
+
+        let valid = json!({
+            "endpoint": "https://merchant.example.com/ucp",
+            "timestamp": "2026-08-25T14:30:00+05:30",
+            "email": "buyer@example.com",
+            "request_id": "550e8400-e29b-41d4-a716-446655440000",
+            "custom": "arbitrary::extension-value"
+        });
+        assert!(validate(&schema, &valid, &opts).is_ok());
+
+        for bad in [
+            json!({ "endpoint": "not a valid uri" }),
+            json!({ "timestamp": "2026-99-99T00:00:00Z" }),
+            json!({ "email": "not-an-email" }),
+            json!({ "request_id": "not-a-uuid" }),
+        ] {
+            assert!(
+                matches!(
+                    validate(&schema, &bad, &opts),
+                    Err(ValidateError::Invalid { .. })
+                ),
+                "expected format validation failure for {bad}"
+            );
+        }
     }
 }

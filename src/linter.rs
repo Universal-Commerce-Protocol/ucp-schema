@@ -240,6 +240,7 @@ fn check_examples(
                     .ok()
                     .and_then(|registry| {
                         jsonschema::options()
+                            .should_validate_formats(true)
                             .with_registry(&registry)
                             .build(&serde_json::json!({
                                 "$ref": format!("{}#{}", ROOT_URI, path)
@@ -2032,5 +2033,32 @@ mod tests {
         let result = lint_file(&main_path, dir.path());
         assert_eq!(result.status, FileStatus::Error);
         assert!(result.diagnostics.iter().any(|d| d.code == "E003"));
+    }
+
+    #[test]
+    fn lint_examples_enforce_format_assertions() {
+        let mut valid_file = NamedTempFile::new().unwrap();
+        writeln!(
+            valid_file,
+            r#"{{"$id":"https://example.com/ok.json","properties":{{"endpoint":{{"type":"string","format":"uri","examples":["https://ucp.dev/ucp"]}}}}}}"#
+        )
+        .unwrap();
+        assert_eq!(
+            lint_file(valid_file.path(), valid_file.path().parent().unwrap()).status,
+            FileStatus::Ok
+        );
+
+        let mut bad_file = NamedTempFile::new().unwrap();
+        writeln!(
+            bad_file,
+            r#"{{"$id":"https://example.com/bad.json","properties":{{"endpoint":{{"type":"string","format":"uri","examples":["not a valid uri"]}}}}}}"#
+        )
+        .unwrap();
+        let bad = lint_file(bad_file.path(), bad_file.path().parent().unwrap());
+        assert_eq!(bad.status, FileStatus::Error);
+        assert!(bad
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "E008" && d.path == "/properties/endpoint/examples/0"));
     }
 }
