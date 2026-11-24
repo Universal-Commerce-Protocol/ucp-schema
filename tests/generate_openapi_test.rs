@@ -2,7 +2,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
-use ucp_schema::{generate_openapi, CodegenError, GenerateOpenApiOptions};
+use ucp_schema::{
+    generate_openapi, generate_types, CodegenError, GenerateOpenApiOptions, GenerateTypesOptions,
+};
 
 fn fixture_compose_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/compose")
@@ -274,7 +276,7 @@ fn assert_openapi_invariants(spec: &Value) {
 fn generate_openapi_fixture_closure_and_template_merge() {
     let compose_dir = fixture_compose_dir();
     let schema_dir = compose_dir.join("schemas");
-    let template_path = compose_dir.join("shopping_rest.openapi.json");
+    let template_path = compose_dir.join("services/shopping/rest.openapi.json");
     let s = |rel: &str| schema_dir.join(rel).to_string_lossy().into_owned();
 
     let tmp = tempfile::tempdir().unwrap();
@@ -1312,7 +1314,7 @@ fn generate_openapi_template_info_with_non_string_title_or_version_falls_back() 
     let compose_dir = fixture_compose_dir();
     let checkout_schema = compose_dir.join("schemas/shopping/checkout.json");
     let base: Value = serde_json::from_str(
-        &std::fs::read_to_string(compose_dir.join("shopping_rest.openapi.json")).unwrap(),
+        &std::fs::read_to_string(compose_dir.join("services/shopping/rest.openapi.json")).unwrap(),
     )
     .unwrap();
     let tmp = tempfile::tempdir().unwrap();
@@ -1358,5 +1360,182 @@ fn generate_openapi_template_info_with_non_string_title_or_version_falls_back() 
         assert_openapi_invariants(&spec);
         assert_eq!(spec["info"]["title"], "UCP REST Service", "case {i}");
         assert_eq!(spec["info"]["version"], "2026-01-11", "case {i}");
+    }
+}
+
+fn assert_types_bundle_parity(schema_dir: &Path, vertical: &str, spec: &Value) {
+    let opts = GenerateTypesOptions::new()
+        .schema_dir(schema_dir)
+        .vertical(vertical);
+    let bundle = generate_types(&opts).unwrap();
+    let raw = serde_json::to_string(&spec["components"]["schemas"])
+        .unwrap()
+        .replace("#/components/schemas/", "#/$defs/");
+    let remapped: std::collections::BTreeMap<String, Value> = serde_json::from_str(&raw).unwrap();
+    assert_eq!(remapped, bundle.defs);
+}
+
+#[test]
+fn schema_dir_fixture_retains_full_catalog_and_validates_errors() {
+    let compose_dir = fixture_compose_dir();
+    let fixture_schemas = compose_dir.join("schemas");
+
+    let auto_opts = GenerateOpenApiOptions::from_schema_dir(&fixture_schemas).vertical("shopping");
+    let auto_spec = generate_openapi(&auto_opts).unwrap();
+    assert_openapi_invariants(&auto_spec);
+    assert_eq!(auto_spec["info"]["title"], "UCP Shopping Service");
+    assert_eq!(auto_spec["info"]["version"], "1.0.0");
+    assert_types_bundle_parity(&fixture_schemas, "shopping", &auto_spec);
+    assert!(auto_spec["components"]["parameters"]["unused_query"].is_null());
+
+    let tmp = tempfile::tempdir().unwrap();
+    let schemas = tmp.path().join("schemas");
+    let write = |rel: &str, v: Value| {
+        let p = tmp.path().join(rel);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, v.to_string()).unwrap();
+    };
+    let cp = |rel: &str| {
+        let dst = tmp.path().join(rel);
+        std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        std::fs::copy(compose_dir.join(rel), dst).unwrap();
+    };
+    cp("schemas/shopping/checkout.json");
+    cp("services/shopping/rest.openapi.json");
+    let prop = |k: &str| json!({ "type": "object", "properties": { k: { "type": "string" } } });
+    let add_svc = |sub: &str, route: &str, k: &str, target: &str| {
+        let r = json!({ "description": "OK", "content": { "application/json": { "schema": { "$ref": format!("#/components/schemas/{k}") } } } });
+        let tpl = json!({ "openapi": "3.1.0", "info": { "title": sub }, "paths": { route: { "post": { "operationId": k, "responses": { "200": r } } } }, "components": { "schemas": { k: { "$ref": target } } } });
+        write(&format!("services/{sub}/rest.openapi.json"), tpl);
+    };
+    let ask_doc =
+        json!({ "name": "dev.ucp.common.ask", "type": "object", "$defs": { "ask": prop("a") } });
+    write("schemas/common/ask.json", ask_doc);
+    write("schemas/transports/jsonrpc.json", prop("id"));
+    let b_doc = json!({ "name": "dev.ucp.lodging.booking", "type": "object" });
+    write("schemas/lodging/booking.json", b_doc);
+    let m_doc = json!({ "name": "dev.ucp.food.menu", "type": "object" });
+    write("schemas/food/menu.json", m_doc);
+    write("isolated/schemas/shopping/checkout.json", prop("id"));
+    let ask_ref = "../../schemas/common/ask.json#/$defs/ask";
+    add_svc("common", "/ask", "ask", ask_ref);
+    let b_ref = "../../schemas/lodging/booking.json";
+    add_svc("lodging", "/bookings", "b", b_ref);
+
+    let shop_opts = GenerateOpenApiOptions::from_schema_dir(&schemas).vertical("shopping");
+    let spec = generate_openapi(&shop_opts).unwrap();
+    assert_openapi_invariants(&spec);
+    assert_eq!(spec["info"]["title"], "UCP Shopping Service");
+    assert_eq!(spec["info"]["version"], "1.0.0");
+    let has = |v: &Value, k: &str| v.get(k).is_some();
+    assert!(has(&spec["paths"], "/checkout-sessions") && has(&spec["paths"], "/ask"));
+    assert!(!has(&spec["paths"], "/bookings") && !has(&spec["components"]["schemas"], "Booking"));
+    assert!(has(&spec["components"]["schemas"], "Jsonrpc"));
+    assert_types_bundle_parity(&schemas, "shopping", &spec);
+
+    let url = "https://m.example/v1";
+    let mut svc_opts = shop_opts.clone();
+    svc_opts = svc_opts.service("dev.ucp.shopping").server_url(url);
+    let svc_spec = generate_openapi(&svc_opts).unwrap();
+    assert!(has(&svc_spec["paths"], "/checkout-sessions") && !has(&svc_spec["paths"], "/ask"));
+    assert_eq!(svc_spec["servers"], json!([{ "url": url }]));
+    assert_types_bundle_parity(&schemas, "shopping", &svc_spec);
+
+    let iso = tmp.path().join("isolated/schemas");
+    let iso_opts = GenerateOpenApiOptions::from_schema_dir(iso).vertical("shopping");
+    let no_tpl = generate_openapi(&iso_opts).unwrap_err();
+    assert!(matches!(no_tpl, CodegenError::NoRestServiceTemplate { .. }));
+    assert_eq!(no_tpl.exit_code(), 2);
+    let msg = no_tpl.to_string();
+    assert!(msg.contains("shopping/rest.openapi.json") && msg.contains("2026-04-08"));
+
+    let svc_err = generate_openapi(&shop_opts.clone().service("dev.ucp.lodging")).unwrap_err();
+    assert!(matches!(
+        svc_err,
+        CodegenError::UnmatchedServiceFilter { .. }
+    ));
+    assert!(svc_err.exit_code() == 2 && svc_err.to_string().contains("dev.ucp.shopping"));
+
+    let mcp_doc = json!({ "ucp": { "version": "2026-08-25", "services": { "dev.ucp.shopping": [{ "version": "2026-08-25", "transport": "mcp", "endpoint": url, "schema": "https://ucp.dev/2026-08-25/services/shopping/mcp.openrpc.json" }] }, "capabilities": { "dev.ucp.shopping.checkout": [{ "version": "2026-08-25", "schema": "/nonexistent/shopping/checkout.json" }] } }});
+    write("mcp.json", mcp_doc);
+    let mcp_p = tmp.path().join("mcp.json");
+    let mcp_opts = GenerateOpenApiOptions::new(mcp_p.to_str().unwrap());
+    let mcp_err = generate_openapi(&mcp_opts).unwrap_err();
+    assert!(matches!(mcp_err, CodegenError::NoRestServiceBinding { .. }));
+    assert_eq!(mcp_err.exit_code(), 2);
+
+    for bad_opts in ["common", "transports", "", "BadSlug", "missing", "food"]
+        .into_iter()
+        .map(|v| GenerateOpenApiOptions::from_schema_dir(&schemas).vertical(v))
+        .chain([
+            GenerateOpenApiOptions::from_schema_dir(&schemas),
+            GenerateOpenApiOptions::default(),
+            GenerateOpenApiOptions::from_profile("p.json").vertical("shopping"),
+        ])
+    {
+        assert_eq!(generate_openapi(&bad_opts).unwrap_err().exit_code(), 2);
+    }
+
+    let leak = json!({ "name": "dev.ucp.shopping.leak", "type": "object", "properties": { "b": { "$ref": "../lodging/booking.json" } } });
+    write("schemas/shopping/leak.json", leak);
+    let mut t_shop = GenerateTypesOptions::new().schema_dir(&schemas);
+    t_shop = t_shop.vertical("shopping");
+    assert_eq!(generate_types(&t_shop).unwrap_err().exit_code(), 2);
+    assert_eq!(generate_openapi(&shop_opts).unwrap_err().exit_code(), 2);
+    std::fs::remove_file(schemas.join("shopping/leak.json")).unwrap();
+
+    let bad_t = GenerateTypesOptions::from_profile("p.json").vertical("shopping");
+    assert_eq!(generate_types(&bad_t).unwrap_err().exit_code(), 2);
+    let exe = env!("CARGO_BIN_EXE_ucp-schema");
+    let run = |sub: &str, out: &Path| {
+        std::process::Command::new(exe)
+            .args([sub, "-s"])
+            .arg(&schemas)
+            .args(["--vertical", "shopping", "-o"])
+            .arg(out)
+            .status()
+            .unwrap()
+    };
+    let o_code = |rel: &str| run("generate-openapi", &schemas.join(rel)).code();
+    assert_eq!(o_code("inside.json"), Some(2));
+    assert_eq!(o_code("shopping/myopenapi.json"), Some(2));
+    assert_eq!(o_code("openapi.json"), Some(0));
+    assert_eq!(o_code("inside.openapi.json"), Some(0));
+    assert!(run("generate-types", &tmp.path().join("t.types.json")).success());
+    let no_arg = std::process::Command::new(exe)
+        .arg("generate-openapi")
+        .output()
+        .unwrap();
+    let err_s = String::from_utf8_lossy(&no_arg.stderr);
+    assert!(err_s.contains("--profile <PROFILE>|--schema-dir <SCHEMA_DIR>"));
+}
+
+#[test]
+fn ucp_verticals_schema_dir_matches_generate_types_catalog_parity() {
+    let Some(source_dir) =
+        require_ucp_source_dir("ucp_verticals_schema_dir_matches_generate_types_catalog_parity")
+    else {
+        return;
+    };
+    let schemas_root = source_dir.join("schemas");
+    for (vertical, expected_title) in [
+        ("shopping", "UCP Shopping Service"),
+        ("food", "UCP Food Service"),
+        ("lodging", "UCP Lodging Service"),
+    ] {
+        let opts = GenerateOpenApiOptions::from_schema_dir(&schemas_root).vertical(vertical);
+        let spec = generate_openapi(&opts).unwrap();
+        assert_openapi_invariants(&spec);
+        assert_eq!(spec["info"]["title"], expected_title);
+        assert_eq!(spec["info"]["version"], "1.0.0");
+        assert_types_bundle_parity(&schemas_root, vertical, &spec);
+        for k in [
+            "JsonrpcRequest",
+            "ProfileBusinessSchema",
+            "ErrorResponse",
+            "RequestConstraints",
+        ] {
+            assert!(spec["components"]["schemas"].get(k).is_some());
+        }
     }
 }

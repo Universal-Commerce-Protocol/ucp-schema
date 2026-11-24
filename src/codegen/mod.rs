@@ -4,7 +4,7 @@ mod compose;
 mod hoist;
 pub mod normalizer;
 pub mod profile;
-mod reachability;
+pub(crate) mod reachability;
 pub mod reify;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -20,18 +20,20 @@ use crate::codegen::normalizer::{
 };
 pub use crate::codegen::profile::{parse_profile_source, ParsedProfile, RestServiceBinding};
 use crate::codegen::reachability::{
-    compute_reachable_closure, load_all_schemas, select_active_schemas,
+    compute_reachable_closure, load_all_schemas, select_active_schemas, verify_vertical_ref_closure,
 };
 use crate::error::{ComposeError, ResolveError};
 use crate::loader::{for_each_schema_object, for_each_schema_object_mut};
 
 /// Configuration options for [`compile_types`] and [`generate_types`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct GenerateTypesOptions {
     pub profile: Option<String>,
     pub capabilities: Option<Vec<String>>,
     pub extensions: Option<Vec<String>>,
     pub schema_dir: Option<PathBuf>,
+    pub vertical: Option<String>,
     pub title: String,
     pub description: Option<String>,
 }
@@ -43,6 +45,7 @@ impl Default for GenerateTypesOptions {
             capabilities: None,
             extensions: None,
             schema_dir: None,
+            vertical: None,
             title: "UCP Schema Types".to_string(),
             description: None,
         }
@@ -63,6 +66,12 @@ impl GenerateTypesOptions {
     /// Set the local schema directory path.
     pub fn schema_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.schema_dir = Some(dir.into());
+        self
+    }
+
+    /// Scope directory-mode schema discovery to a single vertical (plus `common/` and `transports/`).
+    pub fn vertical(mut self, vertical: impl Into<String>) -> Self {
+        self.vertical = Some(vertical.into());
         self
     }
 
@@ -133,6 +142,18 @@ pub enum CodegenError {
     #[error("profile '{profile}' does not declare any service binding with transport 'rest'")]
     NoRestServiceBinding { profile: String },
     #[error(
+        "no REST OpenAPI service template ('{vertical}/rest.openapi.json') found for schema directory '{}' (requires UCP >= 2026-04-08)",
+        schema_dir.display()
+    )]
+    NoRestServiceTemplate {
+        schema_dir: PathBuf,
+        vertical: String,
+    },
+    #[error(
+        "REST service filter '{service}' did not match any discovered service in directory mode (available: {available})"
+    )]
+    UnmatchedServiceFilter { service: String, available: String },
+    #[error(
         "REST service binding '{service}' in profile '{profile}' is missing required 'schema' URL"
     )]
     MissingServiceSchema { profile: String, service: String },
@@ -153,6 +174,8 @@ impl CodegenError {
             Self::ResolveError(e) => e.exit_code(),
             Self::ComposeError(e) => e.exit_code(),
             Self::NoRestServiceBinding { .. }
+            | Self::NoRestServiceTemplate { .. }
+            | Self::UnmatchedServiceFilter { .. }
             | Self::MissingServiceSchema { .. }
             | Self::ConflictingServicePath { .. } => 2,
         }
@@ -174,10 +197,10 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
             .as_deref()
             .is_some_and(|s| !s.is_empty());
         let has_exts = options.extensions.as_deref().is_some_and(|s| !s.is_empty());
-        if options.schema_dir.is_some() || has_caps || has_exts {
+        if options.schema_dir.is_some() || options.vertical.is_some() || has_caps || has_exts {
             return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
                 message:
-                    "--profile cannot be combined with --schema-dir, --capability, or --extension"
+                    "--profile cannot be combined with --schema-dir, --vertical, --capability, or --extension"
                         .to_string(),
             }));
         }
@@ -193,7 +216,7 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
                 path: schema_dir.to_path_buf(),
             }));
         }
-        let loaded = load_all_schemas(schema_dir)?;
+        let loaded = load_all_schemas(schema_dir, options.vertical.as_deref())?;
         let cap_queries = options.capabilities.as_deref().filter(|s| !s.is_empty());
         let ext_queries = options.extensions.as_deref().filter(|s| !s.is_empty());
         let (active_cap_indices, active_ext_indices, active_capabilities) =
@@ -206,6 +229,9 @@ pub fn compile_types(options: &GenerateTypesOptions) -> Result<CompiledTypes, Co
             &active_capabilities,
             include_all,
         );
+        if options.vertical.is_some() {
+            verify_vertical_ref_closure(&loaded, &reachable_indices, &active_capabilities)?;
+        }
         (
             loaded,
             reachable_indices,

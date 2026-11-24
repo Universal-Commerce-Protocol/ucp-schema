@@ -1,14 +1,15 @@
-//! Layer 2 Profile-Driven OpenAPI 3.1.0 Generation (`generate-openapi`).
+//! Layer 2 OpenAPI 3.1.0 Generation (`generate-openapi`).
 //!
-//! Binds a UCP discovery profile's declared REST service OpenAPI 3.1 templates
-//! (`ucp.services[<service>][transport == "rest"].schema`) to Layer 1's compiled
-//! capability and extension schemas (`compile_types`), pruning inactive routes,
-//! replacing snake_case template wrapper aliases with canonical PascalCase
-//! `#/components/schemas/<Name>` references, and pruning `components` to the
-//! transitive reachability closure of the retained routes and webhooks.
+//! Binds UCP REST service OpenAPI 3.1 templates (declared in a discovery profile
+//! or discovered from `<schema_dir>/../services` for a `--vertical`) to Layer 1's
+//! compiled schemas (`compile_types`), pruning inactive routes, rewriting template
+//! wrapper aliases to canonical `#/components/schemas/<Name>` references, and
+//! pruning unused parameters and headers (`components.schemas` is pruned to route
+//! reachability in `--profile` mode and retained in full in `--schema-dir` mode).
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde_json::{json, Map, Value};
 
@@ -16,7 +17,9 @@ use crate::codegen::normalizer::ref_to_def_name;
 use crate::codegen::profile::{
     parse_profile_source, resolve_service_schema_target, RestServiceBinding,
 };
+use crate::codegen::reachability::validate_vertical_slug;
 use crate::codegen::{compile_types, CodegenError, GenerateTypesOptions};
+use crate::compose::Capability;
 use crate::error::ResolveError;
 use crate::loader::{load_schema_auto, INSTANCE_DATA_KEYWORDS};
 
@@ -27,9 +30,12 @@ const HTTP_METHODS: &[&str] = &[
 ];
 
 /// Configuration options for [`generate_openapi`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
+#[non_exhaustive]
 pub struct GenerateOpenApiOptions {
-    pub profile: String,
+    pub profile: Option<String>,
+    pub schema_dir: Option<PathBuf>,
+    pub vertical: Option<String>,
     pub service: Option<String>,
     pub server_url: Option<String>,
 }
@@ -38,15 +44,28 @@ impl GenerateOpenApiOptions {
     /// Create [`GenerateOpenApiOptions`] for a profile file path or URL.
     pub fn new(profile: impl Into<String>) -> Self {
         Self {
-            profile: profile.into(),
-            service: None,
-            server_url: None,
+            profile: Some(profile.into()),
+            ..Self::default()
         }
     }
 
     /// Create [`GenerateOpenApiOptions`] scoped to a UCP discovery profile path or URL.
     pub fn from_profile(profile: impl Into<String>) -> Self {
         Self::new(profile)
+    }
+
+    /// Create [`GenerateOpenApiOptions`] scoped to a local UCP schema directory.
+    pub fn from_schema_dir(schema_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            schema_dir: Some(schema_dir.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Scope directory-mode schema and service discovery to a single vertical (e.g. `"shopping"`).
+    pub fn vertical(mut self, vertical: impl Into<String>) -> Self {
+        self.vertical = Some(vertical.into());
+        self
     }
 
     /// Filter to a specific REST service FQDN (e.g. `"dev.ucp.shopping"`).
@@ -115,17 +134,41 @@ pub fn rewrite_defs_to_component_schemas(value: &mut Value) {
     }
 }
 
-/// Generate a self-contained OpenAPI 3.1.0 specification for the REST service bindings
-/// and active capabilities declared in a UCP discovery profile.
+/// Generate a self-contained OpenAPI 3.1.0 specification from a UCP discovery profile
+/// or a local vertical schema directory.
 pub fn generate_openapi(options: &GenerateOpenApiOptions) -> Result<Value, CodegenError> {
-    let parsed = parse_profile_source(&options.profile)?;
-    let selected_services = select_rest_services(&options.profile, &parsed.rest_services, options)?;
-    let compiled = compile_types(&GenerateTypesOptions::new().profile(&options.profile))?;
+    let inv =
+        |m: &str| CodegenError::ResolveError(ResolveError::InvalidSchema { message: m.into() });
+    let (profile_source, capabilities, selected_services, compiled) = if let Some(profile) =
+        options.profile.as_deref()
+    {
+        if options.schema_dir.is_some() || options.vertical.is_some() {
+            return Err(inv(
+                "--profile cannot be combined with --schema-dir or --vertical",
+            ));
+        }
+        let parsed = parse_profile_source(profile)?;
+        let selected = select_rest_services(Some(profile), parsed.rest_services, options)?;
+        let compiled = compile_types(&GenerateTypesOptions::new().profile(profile))?;
+        (Some(profile), parsed.capabilities, selected, compiled)
+    } else {
+        let (Some(dir), Some(vert)) = (options.schema_dir.as_deref(), options.vertical.as_deref())
+        else {
+            return Err(inv(
+                "either --profile or both --schema-dir and --vertical are required",
+            ));
+        };
+        validate_vertical_slug(dir, vert)?;
+        let selected =
+            select_rest_services(None, discover_directory_rest_services(dir, vert)?, options)?;
+        let compiled = compile_types(&GenerateTypesOptions::new().schema_dir(dir).vertical(vert))?;
+        (None, Vec::new(), selected, compiled)
+    };
 
     let mut merged = load_bind_and_merge_templates(
-        &options.profile,
+        profile_source,
         &selected_services,
-        &parsed,
+        &capabilities,
         &compiled,
         options,
     )?;
@@ -148,6 +191,7 @@ pub fn generate_openapi(options: &GenerateOpenApiOptions) -> Result<Value, Codeg
         &mut merged.parameters,
         &mut merged.headers,
         &mut components_schemas,
+        options.schema_dir.is_some(),
     );
 
     let servers = resolve_root_and_path_servers(
@@ -168,31 +212,72 @@ pub fn generate_openapi(options: &GenerateOpenApiOptions) -> Result<Value, Codeg
     ))
 }
 
-fn select_rest_services<'a>(
-    profile: &str,
-    rest_services: &'a [RestServiceBinding],
-    options: &GenerateOpenApiOptions,
-) -> Result<Vec<&'a RestServiceBinding>, CodegenError> {
-    let selected: Vec<&RestServiceBinding> = rest_services
-        .iter()
-        .filter(|b| {
-            options
-                .service
-                .as_deref()
-                .is_none_or(|svc| b.service_name == svc)
+fn discover_directory_rest_services(
+    schema_dir: &Path,
+    vertical: &str,
+) -> Result<Vec<RestServiceBinding>, CodegenError> {
+    let no_tpl = || CodegenError::NoRestServiceTemplate {
+        schema_dir: schema_dir.to_path_buf(),
+        vertical: vertical.to_string(),
+    };
+    let abs_dir = schema_dir
+        .canonicalize()
+        .unwrap_or_else(|_| schema_dir.to_path_buf());
+    let services_dir = abs_dir
+        .parent()
+        .map(|p| p.join("services"))
+        .filter(|p| p.is_dir())
+        .ok_or_else(no_tpl)?;
+    let primary_tpl = services_dir.join(format!("{vertical}/rest.openapi.json"));
+    if !primary_tpl.is_file() {
+        return Err(no_tpl());
+    }
+    Ok([vertical, "common"]
+        .into_iter()
+        .filter_map(|sub| {
+            let tpl = services_dir.join(format!("{sub}/rest.openapi.json"));
+            tpl.is_file().then(|| RestServiceBinding {
+                service_name: format!("dev.ucp.{sub}"),
+                version: String::new(),
+                endpoint: None,
+                schema_url: tpl.to_string_lossy().into_owned(),
+            })
         })
+        .collect())
+}
+
+fn select_rest_services(
+    profile: Option<&str>,
+    rest_services: Vec<RestServiceBinding>,
+    options: &GenerateOpenApiOptions,
+) -> Result<Vec<RestServiceBinding>, CodegenError> {
+    let available = rest_services
+        .iter()
+        .map(|b| b.service_name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let filter = options.service.as_deref();
+    let selected: Vec<_> = rest_services
+        .into_iter()
+        .filter(|b| filter.is_none_or(|s| b.service_name == s))
         .collect();
 
     if selected.is_empty() {
-        return Err(CodegenError::NoRestServiceBinding {
-            profile: profile.to_string(),
+        return Err(match profile {
+            Some(p) => CodegenError::NoRestServiceBinding {
+                profile: p.to_string(),
+            },
+            None => CodegenError::UnmatchedServiceFilter {
+                service: options.service.clone().unwrap_or_default(),
+                available,
+            },
         });
     }
 
     for binding in &selected {
         if binding.schema_url.trim().is_empty() {
             return Err(CodegenError::MissingServiceSchema {
-                profile: profile.to_string(),
+                profile: profile.unwrap_or_default().to_string(),
                 service: binding.service_name.clone(),
             });
         }
@@ -202,9 +287,9 @@ fn select_rest_services<'a>(
 }
 
 fn load_bind_and_merge_templates(
-    profile_source: &str,
-    selected_services: &[&RestServiceBinding],
-    parsed: &crate::codegen::ParsedProfile,
+    profile_source: Option<&str>,
+    selected_services: &[RestServiceBinding],
+    capabilities: &[Capability],
     compiled: &crate::codegen::CompiledTypes,
     options: &GenerateOpenApiOptions,
 ) -> Result<MergedTemplates, CodegenError> {
@@ -218,11 +303,14 @@ fn load_bind_and_merge_templates(
     let mut path_owners: BTreeMap<String, String> = BTreeMap::new();
 
     for (idx, binding) in selected_services.iter().enumerate() {
-        let target = resolve_service_schema_target(
-            profile_source,
-            &binding.schema_url,
-            &parsed.capabilities,
-        )?;
+        let target: Cow<'_, str> = match profile_source {
+            Some(src) => Cow::Owned(resolve_service_schema_target(
+                src,
+                &binding.schema_url,
+                capabilities,
+            )?),
+            None => Cow::Borrowed(binding.schema_url.as_str()),
+        };
         let doc = load_schema_auto(&target)?;
         let Some(root_obj) = doc.as_object() else {
             return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
@@ -652,6 +740,7 @@ fn prune_unreachable_components(
     parameters: &mut Map<String, Value>,
     headers: &mut Map<String, Value>,
     schemas: &mut BTreeMap<String, Value>,
+    retain_all_schemas: bool,
 ) {
     let mut reachable_params = BTreeSet::new();
     let mut reachable_headers = BTreeSet::new();
@@ -670,6 +759,9 @@ fn prune_unreachable_components(
     }
 
     headers.retain(|k, _| reachable_headers.contains(k));
+    if retain_all_schemas {
+        return;
+    }
     for header_val in headers.values() {
         collect_component_refs(header_val, "#/components/schemas/", &mut reachable_schemas);
     }
