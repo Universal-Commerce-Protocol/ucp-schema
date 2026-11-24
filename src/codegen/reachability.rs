@@ -8,7 +8,7 @@ use serde_json::{Map, Value};
 use crate::codegen::normalizer::{is_reverse_domain_name, to_pascal_case};
 use crate::codegen::{contains_ref, CodegenError};
 use crate::compose::is_container_schema;
-use crate::error::ComposeError;
+use crate::error::{ComposeError, ResolveError};
 use crate::loader::{collect_schema_files, for_each_schema_object, load_schema};
 
 pub(super) const AMBIENT_ROOT_STEMS: &[&str] = &[
@@ -87,11 +87,86 @@ impl LoadedSchema {
     }
 }
 
-pub(super) fn load_all_schemas(schema_dir: &Path) -> Result<Vec<LoadedSchema>, CodegenError> {
+pub(crate) fn validate_vertical_slug(dir: &Path, vertical: &str) -> Result<(), CodegenError> {
+    if !dir.exists() {
+        return Err(CodegenError::ResolveError(ResolveError::FileNotFound {
+            path: dir.to_path_buf(),
+        }));
+    }
+    let inv = |message| CodegenError::ResolveError(ResolveError::InvalidSchema { message });
+    let valid_chars = !vertical.is_empty()
+        && vertical
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+    if !valid_chars || matches!(vertical, "common" | "transports") {
+        return Err(inv(format!(
+            "invalid --vertical '{vertical}': expected a vertical slug (e.g. shopping, food, lodging)"
+        )));
+    }
+    if !dir.join(vertical).is_dir() {
+        return Err(inv(format!(
+            "vertical schema directory '{vertical}' not found under '{}'",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+pub(super) fn load_all_schemas(
+    schema_dir: &Path,
+    vertical: Option<&str>,
+) -> Result<Vec<LoadedSchema>, CodegenError> {
+    if let Some(v) = vertical {
+        validate_vertical_slug(schema_dir, v)?;
+    }
     collect_schema_files(schema_dir)
         .into_iter()
+        .filter(|p| {
+            let Some(v) = vertical else { return true };
+            let Ok(rel) = p.strip_prefix(schema_dir) else {
+                return false;
+            };
+            if rel.parent() == Some(Path::new("")) {
+                return true;
+            }
+            rel.components()
+                .next()
+                .and_then(|c| c.as_os_str().to_str())
+                .is_some_and(|top| top == "common" || top == "transports" || top == v)
+        })
         .map(|p| Ok(LoadedSchema::from_file(&p, load_schema(&p)?)))
         .collect()
+}
+
+pub(super) fn verify_vertical_ref_closure(
+    loaded: &[LoadedSchema],
+    reachable_indices: &BTreeSet<usize>,
+    active_capabilities: &BTreeSet<String>,
+) -> Result<(), CodegenError> {
+    let loaded_paths: BTreeSet<&Path> = loaded.iter().map(|s| s.path.as_path()).collect();
+    for &idx in reachable_indices {
+        let item = &loaded[idx];
+        let Some(parent_dir) = item.path.parent() else {
+            continue;
+        };
+        let inactive_locals = compute_inactive_local_defs(item, active_capabilities);
+        for ref_str in collect_active_external_refs(item, &inactive_locals) {
+            let file_part = ref_str.split('#').next().unwrap_or("");
+            if file_part.is_empty() || file_part.contains("://") {
+                continue;
+            }
+            let resolved_path = normalize_lexical_path(&parent_dir.join(file_part));
+            if !loaded_paths.contains(resolved_path.as_path()) {
+                return Err(CodegenError::ResolveError(ResolveError::InvalidSchema {
+                    message: format!(
+                        "schema '{}' references out-of-scope target '{ref_str}'",
+                        item.path.display()
+                    ),
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::type_complexity)]

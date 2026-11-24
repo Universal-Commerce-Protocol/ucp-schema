@@ -279,6 +279,10 @@ enum Commands {
         )]
         schema_dir: Option<PathBuf>,
 
+        /// Scope --schema-dir to one vertical (e.g. shopping, food, lodging) plus common/ and transports/
+        #[arg(long, conflicts_with = "profile", requires = "schema_dir")]
+        vertical: Option<String>,
+
         /// Output file path (emits JSON to stdout if omitted)
         #[arg(long, short = 'o')]
         output: Option<PathBuf>,
@@ -294,18 +298,29 @@ enum Commands {
         pretty: bool,
     },
 
-    /// Generate an OpenAPI 3.1.0 specification by binding a UCP profile's REST service schema to its compiled capability types
-    #[command(name = "generate-openapi")]
+    /// Generate an OpenAPI 3.1.0 specification from a UCP discovery profile or vertical schema directory
+    #[command(
+        name = "generate-openapi",
+        group(clap::ArgGroup::new("src").required(true).args(["profile", "schema_dir"]))
+    )]
     GenerateOpenapi {
-        /// Path or URL to a UCP discovery profile declaring a REST service binding (required)
+        /// Path or URL to a UCP discovery profile declaring a REST service binding
         #[arg(long, short = 'p')]
-        profile: String,
+        profile: Option<String>,
 
-        /// Optional service FQDN filter when a profile declares multiple REST services (e.g. dev.ucp.shopping)
+        /// Local directory containing UCP JSON schema files (mutually exclusive with --profile)
+        #[arg(long, short = 's', requires = "vertical")]
+        schema_dir: Option<PathBuf>,
+
+        /// Vertical directory slug to compile with --schema-dir (e.g. shopping, food, lodging)
+        #[arg(long, conflicts_with = "profile", requires = "schema_dir")]
+        vertical: Option<String>,
+
+        /// Optional service FQDN filter when multiple REST services are present (e.g. dev.ucp.shopping)
         #[arg(long)]
         service: Option<String>,
 
-        /// Base server URL injected into servers (overrides the profile's REST service endpoint)
+        /// Base server URL injected into servers (overrides the REST service endpoint)
         #[arg(long)]
         server_url: Option<String>,
 
@@ -415,6 +430,7 @@ fn main() -> ExitCode {
             capabilities,
             extensions,
             schema_dir,
+            vertical,
             output,
             pretty,
         } => run_generate_types(
@@ -422,17 +438,22 @@ fn main() -> ExitCode {
             capabilities,
             extensions,
             schema_dir,
+            vertical,
             output,
             pretty,
         ),
 
         Commands::GenerateOpenapi {
             profile,
+            schema_dir,
+            vertical,
             service,
             server_url,
             output,
             pretty,
-        } => run_generate_openapi(profile, service, server_url, output, pretty),
+        } => run_generate_openapi(
+            profile, schema_dir, vertical, service, server_url, output, pretty,
+        ),
     };
 
     match result {
@@ -830,39 +851,52 @@ fn run_generate_types(
     capabilities: Vec<String>,
     extensions: Vec<String>,
     schema_dir: Option<PathBuf>,
+    vertical: Option<String>,
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
     if let (Some(dir), Some(out)) = (&schema_dir, &output) {
-        validate_output_outside_schema_dir_or_types_json(dir, out)?;
+        validate_output_outside_schema_dir(dir, out, false)?;
     }
-    let options = GenerateTypesOptions {
-        profile,
-        capabilities: (!capabilities.is_empty()).then_some(capabilities),
-        extensions: (!extensions.is_empty()).then_some(extensions),
-        schema_dir,
-        ..GenerateTypesOptions::default()
-    };
+    let mut options = GenerateTypesOptions::new()
+        .capabilities(capabilities)
+        .extensions(extensions);
+    options.profile = profile;
+    options.schema_dir = schema_dir;
+    options.vertical = vertical;
     let bundle = generate_types(&options).map_err(cli_err(false))?;
     write_json_output(&bundle, output, pretty)
 }
 
-fn validate_output_outside_schema_dir_or_types_json(
+fn validate_output_outside_schema_dir(
     schema_dir: &Path,
     output: &Path,
+    openapi: bool,
 ) -> Result<(), u8> {
-    let is_types_json = output
+    let allowed = |n: &str| {
+        if openapi {
+            n == "openapi.json" || n.ends_with(".openapi.json")
+        } else {
+            n.ends_with(".types.json")
+        }
+    };
+    if output
         .file_name()
         .and_then(|n| n.to_str())
-        .is_some_and(|n| n.ends_with(".types.json"));
-    if is_types_json {
+        .is_some_and(allowed)
+    {
         return Ok(());
     }
+    let hint = if openapi {
+        ".openapi.json"
+    } else {
+        ".types.json"
+    };
     let resolved_dir = resolve_path_for_prefix_check(schema_dir);
     let resolved_out = resolve_path_for_prefix_check(output);
     if resolved_out.starts_with(&resolved_dir) {
         eprintln!(
-            "Error: output file inside --schema-dir must end with '.types.json' so subsequent directory scans ignore it: {}",
+            "Error: output file inside --schema-dir must end with '{hint}' so subsequent directory scans ignore it: {}",
             output.display()
         );
         return Err(2);
@@ -897,17 +931,27 @@ fn resolve_path_for_prefix_check(p: &Path) -> PathBuf {
 }
 
 fn run_generate_openapi(
-    profile: String,
+    profile: Option<String>,
+    schema_dir: Option<PathBuf>,
+    vertical: Option<String>,
     service: Option<String>,
     server_url: Option<String>,
     output: Option<PathBuf>,
     pretty: bool,
 ) -> Result<(), u8> {
-    let options = GenerateOpenApiOptions {
-        profile,
-        service,
-        server_url,
-    };
+    if let (Some(dir), Some(out)) = (&schema_dir, &output) {
+        validate_output_outside_schema_dir(dir, out, true)?;
+    }
+    let mut options = GenerateOpenApiOptions::default();
+    options.profile = profile;
+    options.schema_dir = schema_dir;
+    options.vertical = vertical;
+    if let Some(svc) = service {
+        options = options.service(svc);
+    }
+    if let Some(url) = server_url {
+        options = options.server_url(url);
+    }
     let spec = generate_openapi(&options).map_err(cli_err(false))?;
     write_json_output(&spec, output, pretty)
 }

@@ -127,10 +127,10 @@
     },
     "schemas": {
       "checkout": {
-        "$ref": "schemas/shopping/checkout.json"
+        "$ref": "../../schemas/shopping/checkout.json"
       },
       "cart": {
-        "$ref": "schemas/shopping/cart.json"
+        "$ref": "../../schemas/shopping/cart.json"
       }
     }
   }
