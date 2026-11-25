@@ -54,6 +54,7 @@
 //! { "ucp_request": { "create": "omit", "update": "required" } }
 //! ```
 
+mod ambient;
 pub mod codegen;
 mod compose;
 mod error;
@@ -65,6 +66,7 @@ mod resolver;
 mod types;
 mod validator;
 
+pub use ambient::resolve_with_ucp_members;
 pub use codegen::{
     compile_types, generate_types, parse_profile_source, CodegenError, CompiledTypes,
     GenerateTypesOptions, ParsedProfile, RestServiceBinding, TypesBundleDoc,
