@@ -1679,6 +1679,51 @@ mod lint_command {
     }
 
     #[test]
+    fn json_pointer_refs_resolve_in_local_and_sibling_schemas() {
+        let dir = TempDir::new().unwrap();
+        let target = serde_json::json!({
+            "$id": "https://example.com/target.json",
+            "allOf": [{ "type": "string" }],
+            "": { "type": "number" },
+            "$defs": { "a/b~c": { "type": "integer" } }
+        });
+        write_temp_file(&dir, "target.json", &target.to_string());
+
+        for reference in ["#/allOf/0", "#/", "#/$defs/a~1b~0c"] {
+            for prefix in ["", "target.json"] {
+                let mut schema = target.clone();
+                schema["$ref"] = serde_json::json!(format!("{prefix}{reference}"));
+                let path = write_temp_file(&dir, "schema.json", &schema.to_string());
+                let result = cmd()
+                    .args(["lint", path.to_str().unwrap(), "--format", "json"])
+                    .assert()
+                    .success();
+                let output: serde_json::Value =
+                    serde_json::from_slice(&result.get_output().stdout).unwrap();
+                assert_eq!(output["errors"], 0);
+            }
+        }
+    }
+
+    #[test]
+    fn json_pointer_refs_reject_missing_empty_keys_and_invalid_indexes() {
+        let dir = TempDir::new().unwrap();
+        for reference in ["#/", "#/allOf/1", "#/allOf/00", "#/allOf/-"] {
+            let schema = serde_json::json!({
+                "$id": "https://example.com/schema.json",
+                "allOf": [{ "type": "string" }],
+                "$ref": reference
+            });
+            let path = write_temp_file(&dir, "schema.json", &schema.to_string());
+            cmd()
+                .args(["lint", path.to_str().unwrap()])
+                .assert()
+                .code(1)
+                .stdout(predicate::str::contains("E003"));
+        }
+    }
+
+    #[test]
     fn json_output_is_parseable() {
         let dir = TempDir::new().unwrap();
         let schema = write_temp_file(
