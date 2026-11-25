@@ -133,7 +133,7 @@ ucp-schema resolve https://ucp.dev/2026-08-25/schemas/shopping/checkout.json --r
 ### `validate` — Validate payload against resolved schema
 
 ```bash
-ucp-schema validate <payload> --op <operation> [options]
+ucp-schema validate <payload|-> --op <operation> [options]
 
 Options:
   --schema <path|url>          Explicit schema (skips self-describing detection)
@@ -151,6 +151,8 @@ Options:
   --verbose, -v                Print pipeline stages to stderr
 ```
 
+Pass `-` as `<payload>` to read serialized JSON from standard input (pass `./-` to validate a literal file named `-`). Validation enforces JSON Schema Draft 2020-12 syntactic `format` assertions including `uri`, `date-time`, `email`, and `uuid`.
+
 The validator auto-detects how to find the schema based on what flags you provide and what metadata the payload contains (see [Validation Modes](#validation-modes) in Concepts):
 
 | Pattern                        | Command                                                       | Schema Source           | Direction |
@@ -166,6 +168,9 @@ ucp-schema validate response.json --op read --schema-local-base ./schemas
 
 # Explicit schema
 ucp-schema validate order.json --schema checkout.json --request --op create
+
+# Pipe serialized JSON from stdin
+cat order.json | ucp-schema validate - --schema checkout.json --request --op create
 
 # Machine-readable output for CI
 ucp-schema validate order.json --schema checkout.json --request --op create --json
