@@ -53,6 +53,7 @@ pub enum ComposeError {
     )]
     ContainerExtensionShape {
         extension: String,
+        /// The selected root- or parent-keyed entry under the extension's `$defs`.
         capability: String,
     },
 

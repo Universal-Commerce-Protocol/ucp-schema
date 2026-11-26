@@ -543,3 +543,89 @@ fn root_key_resolves_multiple_active_parents() {
         );
     }
 }
+
+// --- 5. Container diagnostics name the selected $defs key ---
+
+fn replace_ads_defs(dir: &Path, defs: Value) {
+    let path = dir.join("schemas/shopping/ads.json");
+    let mut schema: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    schema["$defs"] = defs;
+    std::fs::write(path, serde_json::to_string(&schema).unwrap()).unwrap();
+}
+
+#[test]
+fn malformed_parent_keyed_container_names_selected_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    replace_ads_defs(
+        dir.path(),
+        json!({
+            "dev.ucp.shopping.catalog.feed": {
+                "type": "object",
+                "properties": { "ads_eligible": { "type": "boolean" } }
+            }
+        }),
+    );
+    let payload = record_payload("dev.ucp.shopping.ads", "ads.json", json!({}));
+    let err = compose_from_payload(&payload, &config(dir.path())).unwrap_err();
+    assert!(matches!(
+        &err,
+        ucp_schema::ComposeError::ContainerExtensionShape { extension, capability }
+            if extension == "dev.ucp.shopping.ads"
+                && capability == "dev.ucp.shopping.catalog.feed"
+    ));
+    assert_eq!(err.exit_code(), 2);
+    assert!(err
+        .to_string()
+        .contains("its $defs['dev.ucp.shopping.catalog.feed'] must contain a nested $defs"));
+}
+
+#[test]
+fn malformed_root_keyed_container_names_root_even_with_valid_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    replace_ads_defs(
+        dir.path(),
+        json!({
+            "dev.ucp.common.feed": { "type": "object" },
+            "dev.ucp.shopping.catalog.feed": { "$defs": { "record": {} } }
+        }),
+    );
+    let payload = record_payload("dev.ucp.shopping.ads", "ads.json", json!({}));
+    let err = compose_from_payload(&payload, &config(dir.path())).unwrap_err();
+    assert!(matches!(
+        &err,
+        ucp_schema::ComposeError::ContainerExtensionShape { capability, .. }
+            if capability == "dev.ucp.common.feed"
+    ));
+    assert!(err
+        .to_string()
+        .contains("its $defs['dev.ucp.common.feed'] must contain a nested $defs"));
+}
+
+#[test]
+fn valid_root_keyed_container_ignores_malformed_parent() {
+    let dir = tempfile::tempdir().unwrap();
+    write_fixtures(dir.path());
+    replace_ads_defs(
+        dir.path(),
+        json!({
+            "dev.ucp.common.feed": {
+                "$defs": {
+                    "record": {
+                        "type": "object",
+                        "properties": { "ads_eligible": { "type": "boolean" } }
+                    }
+                }
+            },
+            "dev.ucp.shopping.catalog.feed": { "type": "object" }
+        }),
+    );
+    let payload = record_payload(
+        "dev.ucp.shopping.ads",
+        "ads.json",
+        json!({ "id": "p1", "title": "Widget", "ads_eligible": true }),
+    );
+    let schema = compose_from_payload(&payload, &config(dir.path())).unwrap();
+    assert!(validate(&schema, &payload, &record_opts()).is_ok());
+}
